@@ -74,3 +74,35 @@ def test_observation_exposes_top_grid_layer():
     )
     assert obs.depth == 2
     assert obs.grid == [[3, 4]]
+
+
+def test_observation_normalises_numpy_like_layers():
+    class FakeLayer:
+        def tolist(self):
+            return [[7, 8]]
+
+    class FakeFrame:
+        game_id = "g"
+        frame = [FakeLayer()]
+        state = "NOT_FINISHED"
+        levels_completed = 1
+        win_levels = 2
+        available_actions = [1, 6]
+
+    obs = Observation.from_frame_data(FakeFrame())
+    assert obs.frame == [[[7, 8]]]
+    assert obs.available_actions == (1, 6)
+
+
+def test_observation_tolerates_missing_frame():
+    class RawOnly:
+        game_id = "g"
+        state = "GAME_OVER"
+        levels_completed = 0
+        win_levels = 1
+        available_actions = []
+
+    obs = Observation.from_frame_data(RawOnly())
+    assert obs.frame == []
+    assert obs.grid == []
+    assert obs.needs_reset

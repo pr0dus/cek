@@ -60,6 +60,17 @@ PYTHONPATH=. pytest tests/ -q
 
 Python ≥3.12 is required by `arcengine`.
 
+Against a real game, on a machine with network access:
+
+```sh
+export ARC_API_KEY=...            # never commit this
+PYTHONPATH=. python -m newi_arc.run --list
+PYTHONPATH=. python -m newi_arc.run --game ls20 --core random --episodes 5
+```
+
+`--mode offline` uses only a populated `environment_files/` directory and
+needs no key.
+
 ## Status
 
 Harness works; 14 tests pass, 5 of them against the real engine.

@@ -56,13 +56,19 @@ class Observation:
 
     @classmethod
     def from_frame_data(cls, fd: object) -> "Observation":
+        # `frame` is absent from the declared FrameDataRaw model but present at
+        # runtime, and its layers arrive as numpy arrays rather than lists.
+        raw = getattr(fd, "frame", None) or []
+        frame = [
+            layer.tolist() if hasattr(layer, "tolist") else layer for layer in raw
+        ]
         state = getattr(fd, "state")
         return cls(
-            game_id=getattr(fd, "game_id"),
-            frame=getattr(fd, "frame"),
+            game_id=getattr(fd, "game_id", ""),
+            frame=frame,
             state=getattr(state, "value", str(state)),
-            levels_completed=getattr(fd, "levels_completed"),
-            win_levels=getattr(fd, "win_levels"),
+            levels_completed=getattr(fd, "levels_completed", 0),
+            win_levels=getattr(fd, "win_levels", 0),
             available_actions=tuple(getattr(fd, "available_actions", ()) or ()),
         )
 
