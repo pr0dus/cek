@@ -73,7 +73,8 @@ needs no key.
 
 ## Status
 
-Harness works; 14 tests pass, 5 of them against the real engine.
+Harness and engine adapter work; 16 tests pass, 5 of them against the real
+engine. The CLI runs correctly up to the first network call.
 
 **Blocked on environment files.** Real games need either an `ARC_API_KEY` or a
 populated `environment_files/` directory (the engine supports an `OFFLINE`
