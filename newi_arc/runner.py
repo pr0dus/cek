@@ -5,11 +5,14 @@ only thing standing between an unbounded search and an infinite run, and it is
 recorded in the result because a score is meaningless without it.
 """
 
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 from .contract import Action, Observation, RESET
 from .core import Core
 from .metrics import ActionCounter, EpisodeResult
+
+if TYPE_CHECKING:
+    from .trace import TraceRecorder
 
 
 class Environment(Protocol):
@@ -21,6 +24,7 @@ def run_episode(
     core: Core,
     env: Environment,
     max_actions: int = 200,
+    recorder: "TraceRecorder | None" = None,
 ) -> EpisodeResult:
     core.reset()
     counter = ActionCounter()
@@ -34,11 +38,16 @@ def run_episode(
         action = RESET if obs.needs_reset else core.act(obs, history)
 
         history.append(obs)
+        previous = obs
         obs = env.step(action)
+        if recorder is not None:
+            recorder.record(previous, action, obs)
         counter.record(was_reset=action.name == "RESET")
         counter.observe_progress(obs.levels_completed)
 
     counter.finish()
+    if recorder is not None:
+        recorder.close(final_state=obs.state, total_actions=counter.total)
     return EpisodeResult(
         core=core.name,
         game_id=obs.game_id,

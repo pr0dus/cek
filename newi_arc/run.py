@@ -9,6 +9,7 @@ stated against, so it prints the raw per-episode numbers, not just a mean.
 import argparse
 import statistics
 import sys
+from pathlib import Path
 
 from .agents import RandomCore
 from .runner import run_episode
@@ -27,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
         "--mode", default="normal", choices=("normal", "online", "offline")
     )
     parser.add_argument("--list", action="store_true", help="list games and exit")
+    parser.add_argument(
+        "--record",
+        metavar="DIR",
+        help="write a lossless JSONL trace per episode into DIR",
+    )
     args = parser.parse_args(argv)
 
     from .arc_env import ArcEnv
@@ -38,9 +44,22 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     for i in range(args.episodes):
-        env = ArcEnv(args.game, seed=args.seed + i, mode=args.mode)
+        seed = args.seed + i
+        env = ArcEnv(args.game, seed=seed, mode=args.mode)
+        core = CORES[args.core](seed=seed)
+        recorder = None
+        if args.record:
+            from .trace import TraceRecorder
+
+            recorder = TraceRecorder(
+                Path(args.record) / f"{args.game}-{core.name}-ep{i:03d}.jsonl",
+                game_id=args.game,
+                core=core.name,
+                seed=seed,
+                extra={"max_actions": args.max_actions, "mode": args.mode},
+            )
         result = run_episode(
-            CORES[args.core](seed=args.seed + i), env, max_actions=args.max_actions
+            core, env, max_actions=args.max_actions, recorder=recorder
         )
         results.append(result)
         print(

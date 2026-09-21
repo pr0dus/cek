@@ -63,6 +63,7 @@ score.
 - `metrics.py` — per-level action accounting and RHAE
 - `arc_env.py` — adapter to the real engine
 - `run.py` — baseline CLI
+- `trace.py` — lossless JSONL transition recording, no interpretation
 - `mock_env.py` — toy environment for testing wiring without a key
 - `agents/random_core.py` — the baseline every result is stated against
 
@@ -86,6 +87,22 @@ PYTHONPATH=. python -m newi_arc.run --game ls20 --core random --episodes 5
 
 `--mode offline` uses only a populated `environment_files/` directory and
 needs no key.
+
+### Recording traces
+
+Step 2 of the experimental sequence needs episodes recorded *without*
+perception assumptions, so record from the first run rather than re-running
+later:
+
+```sh
+PYTHONPATH=. python -m newi_arc.run --game ls20 --core random \
+    --episodes 5 --record traces/
+```
+
+Each episode writes one JSONL file: a header, one record per transition
+(raw frame before, action, raw frame after), and a footer. Nothing is derived
+and nothing is dropped — `tests/test_trace.py` pins that the only fields
+written are the raw ones, so a derived field cannot quietly appear later.
 
 ## A warning about the mock
 
