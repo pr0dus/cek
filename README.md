@@ -7,6 +7,10 @@ as an external interactive environment.
 continues independently. See [`CHARTER.md`](./CHARTER.md) for what this branch
 is for, what counts as a finding, and what must not be mistaken for one.
 
+[`PROCESS.md`](./PROCESS.md) states how the work is conducted and carries the
+claim ledger. Its governing rule: **no participant's confidence substitutes
+for evidence** — human, AI, or the developing system.
+
 ## Why ARC-AGI-3
 
 Every CEK result so far is measured on domains its author designed — PoC 4's
