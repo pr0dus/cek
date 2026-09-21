@@ -69,6 +69,7 @@ score.
 - `arc_env.py` — adapter to the real engine
 - `run.py` — baseline CLI
 - `trace.py` — lossless JSONL transition recording, no interpretation
+- `analyze.py` — descriptive characterisation of traces, no decomposition
 - `mock_env.py` — toy environment for testing wiring without a key
 - `agents/random_core.py` — the baseline every result is stated against
 
@@ -108,6 +109,25 @@ Each episode writes one JSONL file: a header, one record per transition
 (raw frame before, action, raw frame after), and a footer. Nothing is derived
 and nothing is dropped — `tests/test_trace.py` pins that the only fields
 written are the raw ones, so a derived field cannot quietly appear later.
+
+### Characterising traces
+
+Step 3 — what actually changes under each action:
+
+```sh
+PYTHONPATH=. python -m newi_arc.analyze traces/
+PYTHONPATH=. python -m newi_arc.analyze traces/ --json > characterisation.json
+```
+
+Reports frame shapes, the value alphabet, per-action change counts, whether a
+clicked cell changed, and whether the same action on the same frame ever gave
+different results — which would mean the frame is not the whole state.
+
+It performs **no** connected-component analysis, grouping, object tracking or
+segmentation. Each of those is a choice of decomposition, and which
+decomposition is useful is the open question; choosing one here would answer
+it by assumption. Candidate structures belong to step 4, built against these
+facts. `tests/test_analyze.py` pins the restraint.
 
 ## A warning about the mock
 
