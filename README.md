@@ -23,7 +23,12 @@ The harness exists and is measured; no reasoning core has been connected yet.
 
 - 16 tests pass, 5 of them verifying the contract against `arcengine` 0.9.3
 - The CLI runs correctly up to the first network call
-- No number from a real game has been produced yet
+- **No game has been run. No frame has been observed.**
+
+A pre-Phase-0 representational audit is recorded in
+[`docs/PRE_PHASE0_AUDIT.md`](./docs/PRE_PHASE0_AUDIT.md). It is an
+architectural finding from source reading, **not** a grounding result —
+Phase 0 is empirical and remains open.
 
 ## The contract (verified, not assumed)
 
