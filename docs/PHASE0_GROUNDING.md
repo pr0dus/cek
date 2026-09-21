@@ -66,6 +66,27 @@ This is the honest place to build, and it is a better starting position than a
 flat feature vector. But it relocates the problem rather than solving it,
 which is finding 5.
 
+### 3. No action in the representation
+
+`Observation` models `features → target`. ARC-AGI-3 is a POMDP requiring
+`(state, action) → next_state`. There is nowhere to record what was done, so
+action-conditioned dynamics cannot be expressed at all.
+
+### 4. PoC 4's grid is not a counterexample
+
+`poc4_adapters.py:194` — `GridAdapter.reconstruct` decodes a format that the
+same class's `project()` wrote. It knows row 0 is a legend, that rows 1/2/3
+carry demand/capacity/blocked, and it hardcodes `len(rows) != 4`.
+
+That is a hand-written decoder for a self-authored encoding. As a test of
+representation invariance it is sound and the `18/18` result stands for what
+it claims. It is not perception, and it does not indicate that CEK can ground
+an unknown grid.
+
+`CoreScene` (`poc4_core.py:14`) likewise hardcodes three named fields,
+`demand`/`capacity`/`blocked`, with domain validation (`blocked > capacity`
+raises).
+
 ### 5. The real gap is entity formation
 
 A triple store requires **entity tokens**. Something must decide what the
@@ -87,27 +108,6 @@ problem itself:
 So the gap is not "CEK lacks a target" or "CEK is flat". It is that CEK
 assumes entities already exist, and ARC-AGI-3 hands it undifferentiated
 pixels.
-
-### 3. No action in the representation
-
-`Observation` models `features → target`. ARC-AGI-3 is a POMDP requiring
-`(state, action) → next_state`. There is nowhere to record what was done, so
-action-conditioned dynamics cannot be expressed at all.
-
-### 4. PoC 4's grid is not a counterexample
-
-`poc4_adapters.py:194` — `GridAdapter.reconstruct` decodes a format that the
-same class's `project()` wrote. It knows row 0 is a legend, that rows 1/2/3
-carry demand/capacity/blocked, and it hardcodes `len(rows) != 4`.
-
-That is a hand-written decoder for a self-authored encoding. As a test of
-representation invariance it is sound and the `18/18` result stands for what
-it claims. It is not perception, and it does not indicate that CEK can ground
-an unknown grid.
-
-`CoreScene` (`poc4_core.py:14`) likewise hardcodes three named fields,
-`demand`/`capacity`/`blocked`, with domain validation (`blocked > capacity`
-raises).
 
 ## What this does and does not mean
 
