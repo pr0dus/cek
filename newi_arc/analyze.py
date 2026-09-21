@@ -99,7 +99,7 @@ def analyze(transitions: Iterable[dict[str, Any]]) -> dict[str, Any]:
     per_action: dict[str, ActionStats] = {}
     shapes: Counter = Counter()
     values: Counter = Counter()
-    # (before-frame, action) -> set of resulting frames, to test determinism
+    # (before-frame, action) -> set of resulting frames
     outcomes: dict[str, set[str]] = defaultdict(set)
     total = 0
 
@@ -127,6 +127,7 @@ def analyze(transitions: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
         shapes[frame_shape(before)] += 1
         values.update(_values(before))
+        values.update(_values(after))
 
         key = json.dumps([before, action], separators=(",", ":"), sort_keys=True)
         outcomes[key].add(json.dumps(after, separators=(",", ":")))
@@ -136,14 +137,17 @@ def analyze(transitions: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return {
         "transitions": total,
         "frame_shapes": {str(k): v for k, v in shapes.most_common()},
-        "value_alphabet": dict(values.most_common()),
+        # Counts values across before *and* after frames, so a value that only
+        # ever appears as a result of an action is not missed.
+        "value_alphabet_before_and_after": dict(values.most_common()),
         "actions": [s.summary() for s in per_action.values()],
-        "determinism": {
+        "predictability": {
             "distinct_before_action_pairs": len(outcomes),
             "pairs_with_conflicting_outcomes": ambiguous,
             "note": (
-                "conflicting outcomes mean the same action on the same frame "
-                "produced different results, so the frame is not the whole state"
+                "a conflicting pair means the observed frame plus the recorded "
+                "action is insufficient to uniquely predict the next frame. "
+                "the cause is not inferred here"
             ),
         },
     }
@@ -183,8 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"episodes={report['episodes']} transitions={report['transitions']} "
           f"games={','.join(report['games'])}")
     print(f"frame shapes (depth,rows,cols): {report['frame_shapes']}")
-    alphabet = report["value_alphabet"]
-    print(f"value alphabet: {len(alphabet)} distinct -> {sorted(alphabet)[:20]}")
+    alphabet = report["value_alphabet_before_and_after"]
+    print(f"value alphabet (before+after): {len(alphabet)} distinct -> {sorted(alphabet)[:20]}")
     print()
     print(f"{'action':<10}{'n':>6}{'changed':>9}{'no-change':>11}{'cells min/med/max':>22}{'clicked':>10}")
     for entry in report["actions"]:
@@ -195,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{entry['no_change']:>11}{cells_s:>22}"
             f"{entry.get('clicked_cell_changed', '-'):>10}"
         )
-    det = report["determinism"]
+    det = report["predictability"]
     print()
     print(f"distinct (frame, action) pairs: {det['distinct_before_action_pairs']}")
     print(f"pairs with conflicting outcomes: {det['pairs_with_conflicting_outcomes']}")

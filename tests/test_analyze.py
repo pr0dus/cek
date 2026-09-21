@@ -67,12 +67,13 @@ def test_clicked_cell_tracked_for_complex_actions():
 
 
 def test_conflicting_outcomes_detected():
-    """Same frame, same action, different result: frame is not the whole state."""
+    """Same frame+action, different result: frame+action does not
+    uniquely determine the next frame. No cause is inferred."""
     report = analyze([
         _t([[[0]]], [[[1]]], {"name": "ACTION1"}),
         _t([[[0]]], [[[2]]], {"name": "ACTION1"}),
     ])
-    assert report["determinism"]["pairs_with_conflicting_outcomes"] == 1
+    assert report["predictability"]["pairs_with_conflicting_outcomes"] == 1
 
 
 def test_consistent_outcomes_not_flagged():
@@ -80,20 +81,51 @@ def test_consistent_outcomes_not_flagged():
         _t([[[0]]], [[[1]]], {"name": "ACTION1"}),
         _t([[[0]]], [[[1]]], {"name": "ACTION1"}),
     ])
-    assert report["determinism"]["pairs_with_conflicting_outcomes"] == 0
+    assert report["predictability"]["pairs_with_conflicting_outcomes"] == 0
 
 
 def test_value_alphabet_collected():
     report = analyze([_t([[[3, 7], [7, 0]]], [[[3, 7], [7, 0]]], {"name": "ACTION1"})])
-    assert set(report["value_alphabet"]) == {0, 3, 7}
+    assert set(report["value_alphabet_before_and_after"]) == {0, 3, 7}
 
 
-def test_report_contains_no_derived_structure():
-    """Guards the no-decomposition rule at the report boundary."""
-    report = analyze([_t([[[0, 0]]], [[[1, 0]]], {"name": "ACTION1"})])
-    forbidden = {"objects", "regions", "components", "segments", "entities",
-                 "groups", "shapes"}
-    assert forbidden.isdisjoint(report)
+def _all_keys(node) -> set[str]:
+    """Every dict key at every depth of the report."""
+    keys: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(key)
+            keys |= _all_keys(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            keys |= _all_keys(item)
+    return keys
+
+
+def test_report_contains_no_derived_structure_at_any_depth():
+    """Guards the no-decomposition rule across the whole report, not just its
+    top level — a derived key could otherwise hide inside a nested section."""
+    report = analyze([
+        _t([[[0, 0]]], [[[1, 0]]], {"name": "ACTION1"}),
+        _t([[[0, 0]]], [[[1, 1]]], {"name": "ACTION6", "x": 1, "y": 0}),
+    ])
+    forbidden = {
+        "objects", "regions", "components", "segments", "entities", "groups",
+        "shapes", "clusters", "blobs", "sprites", "connected", "adjacency",
+        "neighbours", "neighbors", "tracked", "ontology",
+    }
+    assert forbidden.isdisjoint(_all_keys(report))
+
+
+def test_nested_key_guard_would_catch_a_violation():
+    """The guard itself must work, or it is decoration."""
+    assert "regions" in _all_keys({"a": {"b": [{"regions": 1}]}})
+
+
+def test_value_alphabet_includes_values_only_seen_after():
+    """A value produced only by an action must not be missed."""
+    report = analyze([_t([[[0]]], [[[9]]], {"name": "ACTION1"})])
+    assert set(report["value_alphabet_before_and_after"]) == {0, 9}
 
 
 def test_reads_real_trace_files(tmp_path):

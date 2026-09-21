@@ -119,9 +119,11 @@ PYTHONPATH=. python -m newi_arc.analyze traces/
 PYTHONPATH=. python -m newi_arc.analyze traces/ --json > characterisation.json
 ```
 
-Reports frame shapes, the value alphabet, per-action change counts, whether a
-clicked cell changed, and whether the same action on the same frame ever gave
-different results — which would mean the frame is not the whole state.
+Reports frame shapes, the value alphabet (across before *and* after frames),
+per-action change counts, whether a clicked cell changed, and whether the same
+action on the same frame ever gave different results — which would mean the
+observed frame plus the recorded action is insufficient to uniquely predict
+the next frame. The cause of that insufficiency is not inferred.
 
 It performs **no** connected-component analysis, grouping, object tracking or
 segmentation. Each of those is a choice of decomposition, and which
