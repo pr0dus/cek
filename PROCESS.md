@@ -14,8 +14,6 @@
 AI collaborators, and the developing system itself. That is CEK's own
 constitution — `USER_CONFIDENCE != TECHNICAL_VALIDATION`,
 `LLM_OUTPUT != EVIDENCE` — extended to the research process that builds CEK.
-The system is held to the epistemics it is built to embody, and so is everyone
-working on it.
 
 **It names the actual research target.** "Increasingly discovers its own
 useful structure" is precisely where current CEK stops: every mechanism
@@ -23,90 +21,128 @@ audited so far selects among a frozen, human-enumerated hypothesis space
 (`docs/PRE_PHASE0_AUDIT.md`). Moving from *selecting among given hypotheses*
 to *generating them from experience* is the concrete form of that sentence.
 
-**It survives its participants.** No individual participant persists. Claude
-sessions end and their context is gone. Codex sessions end. Human memory
-degrades and reconstructs. So the process cannot live in any participant — it
-has to live in artifacts: this repository, the charter, recorded findings,
-and retained negative results. **The repository is the persistent
-participant.** That is not bookkeeping; it is the mechanism.
+**It must survive its participants.** No participant persists. Claude sessions
+end and their context is gone. Codex sessions end. Human memory reconstructs
+rather than replays. Participants reason, propose and challenge; they do not
+carry state. **The repository is the persistent research state** — the carrier
+across participants, not a participant itself. That is not bookkeeping; it is
+the mechanism by which the process continues at all.
 
 ## The gap: challenges need a record
 
 The principle says participants propose *and challenge*. `CHARTER.md` defines
-a promotion path for mechanisms, but nothing records the fate of **claims** —
-so a challenge raised in one session is invisible to the next, and a
-confidently-stated error survives by being forgotten rather than by being
+a promotion path for mechanisms, but nothing recorded the fate of **claims** —
+so a challenge raised in one session was invisible to the next, and a
+confidently-stated error could survive by being forgotten rather than by being
 right.
 
-Every substantive claim about what the system is or does gets an entry:
-what was claimed, who claimed it, what would falsify it, and its current
-status.
+The ledger exists for one purpose: **to stop unsupported conclusions from
+silently becoming inherited assumptions.** It is not a process artifact to be
+maintained for its own sake. Keep entries short.
 
-**Status values:** `proposed` · `challenged` · `supported` · `retracted`
+### Fields
 
-**Rules**
+- **Status** — `proposed` · `challenged` · `supported` · `retracted`
+- **Source** — human, Claude, Codex, or the system
+- **Evidence** — what actually supports it, and by what method
+- **Scope** — the bounds within which that support holds
+- **Revision condition** — what would falsify it or require revision
 
-1. Retractions stay. A ledger that silently drops its errors cannot be
-   audited, and the error rate is itself evidence about how much weight a
-   participant's confidence deserves.
-2. Source is recorded — human, Claude, Codex, or the system — not to assign
-   blame but because a participant's track record is data.
-3. A claim with no stated falsifier is `proposed` at best, never `supported`.
+### Rules
+
+1. **`supported` is evidence-scoped, not true.** It means: this evidence
+   supports this claim within this scope. A claim whose scope is unstated
+   cannot be `supported`.
+2. **Retractions stay.** A ledger that drops its errors cannot be audited.
+3. **A claim with no revision condition is `proposed` at best.**
 4. Any participant may challenge any claim, including their own.
 
 ## Ledger
 
 ### C1 — CEK's general `Observation` is unsuitable as the direct ARC interface
-**Source:** Claude · **Status:** `supported`
-Flat `(name, int)` features plus a required integer `target`; ARC supplies no
-per-step target. Falsifier: a non-supervised path into the same machinery.
+**Status:** `supported` · **Source:** Claude
+**Evidence:** `model.py:93` — flat `(name, int)` features plus a required
+integer `target`; `arcengine` 0.9.3 introspection confirms ARC supplies no
+per-step target, only terminal `WIN`/`GAME_OVER`.
+**Scope:** `model.Observation` specifically, as a *direct* interface, at commit
+`40ffdf4`. Says nothing about other CEK entry points — see C2 — and nothing
+about what real frames would show.
+**Revision condition:** a non-supervised path into the same machinery, or a
+target derivable without game-specific semantics.
 
 ### C2 — CEK is purely flat and supervised
-**Source:** Claude · **Status:** `retracted`
-Missed `PrimitiveRelationObservation`, a relational triple substrate needing
-no target. Retracted on reading `_composition_primitives.py`. **Cause:
-asserted after reading 4 modules of 264.**
+**Status:** `retracted` · **Source:** Claude
+**Evidence:** contradicted by `_composition_primitives.py:49`,
+`PrimitiveRelationObservation` — a relational triple substrate requiring no
+target.
+**Cause:** asserted after reading four modules of 264.
 
 ### C3 — PoC 4's `GridAdapter` shows CEK can ground a grid
-**Source:** implied by prior framing · **Status:** `retracted`
-Its `reconstruct` decodes a format its own `project` wrote. Sound as a
-representation-invariance test; not perception.
+**Status:** `retracted` · **Source:** implied by prior framing
+**Evidence:** `poc4_adapters.py:194` — `reconstruct` decodes a format the same
+class's `project` wrote, hardcoding legend position and `len(rows) != 4`.
+Sound as a representation-invariance test; not perception.
 
 ### C4 — Phase 0 is answered
-**Source:** Claude · **Status:** `retracted`
-Source reading cannot settle an empirical question. Retracted on human
-challenge. **Cause: conclusion stated at a confidence the method could not
-support.**
+**Status:** `retracted` · **Source:** Claude
+**Evidence:** none available — source reading cannot settle an empirical
+question. Retracted on external challenge.
+**Cause:** conclusion stated at a confidence the method could not support.
 
 ### C5 — The missing layer is an object segmenter
-**Source:** Claude · **Status:** `retracted`
-Premature ontology; would inject human semantics into the experiment.
-Retracted on human challenge. **Cause: named a solution before the evidence
-that would constrain it.**
+**Status:** `retracted` · **Source:** Claude
+**Evidence:** none — a premature ontology that would inject human semantics
+into the experiment. Retracted on external challenge.
+**Cause:** named a solution before the evidence that would constrain it.
 
 ### C6 — Every audited CEK mechanism selects among a frozen, human-enumerated hypothesis space
-**Source:** Claude · **Status:** `proposed`
-PoC 3 ("frozen hypothesis space", four interpretations), PoC 5 (four
-enumerated transition laws), PoC 8 (predeclared finite meta-grammar).
-Falsifier: any CEK mechanism generating candidate hypotheses from raw
-experience without a human-specified space. **Unaudited modules remain; this
-is proposed, not supported.**
+**Status:** `proposed` · **Source:** Claude
+**Evidence:** PoC 3 spec ("frozen hypothesis space", four interpretations),
+PoC 5 spec (four enumerated transition laws, one survivor required), PoC 8
+spec (predeclared finite meta-grammar).
+**Scope:** the four PoC specs read. Most of 264 modules unexamined, so
+"every audited" must not be read as "every".
+**Revision condition:** any CEK mechanism generating candidate hypotheses from
+raw experience without a human-specified space.
 
 ### C7 — The PoC 5 / PoC 3 loop transfers to ARC; the enumerable-hypothesis assumption does not
-**Source:** Claude · **Status:** `proposed`
-Falsifier: the loop failing on real transitions for reasons unrelated to
-hypothesis-space size, or enumerable hypotheses proving sufficient on real
-frames. **Requires real frames. Untested.**
+**Status:** `proposed` · **Source:** Claude
+**Evidence:** none yet. Structural reading of specs only.
+**Scope:** untested. Requires real frames.
+**Revision condition:** the loop failing on real transitions for reasons
+unrelated to hypothesis-space size, or enumerable hypotheses proving
+sufficient on real frames.
 
-### C8 — A grounding/perception capability is missing from CEK
-**Source:** Claude, refined by human · **Status:** `proposed`
-No module transforms a raw frame into persistent entities or relations.
-Stated as missing *or unproven* — filename-level sweep only. Falsifier: such a
-module in unread code, or existing machinery handling real frames unmodified.
+### C8 — A grounding/perception capability is missing or unproven in CEK
+**Status:** `proposed` · **Source:** Claude, refined by human
+**Evidence:** no module found that transforms a raw frame into persistent
+entities or relations; filename-level sweep of 264 modules found no spatial,
+topological or perceptual machinery.
+**Scope:** filename-level sweep plus four specs read in full. Absence of
+evidence at this depth, not demonstrated absence.
+**Revision condition:** such a module in unread code, or existing machinery
+handling real frames unmodified.
 
 ---
 
-**Observed so far:** of six claims this session, three were retracted, two
-under human challenge. All three failures shared one cause — confidence
-outrunning the evidence the method could supply. That rate is the reason this
-ledger exists, and it is the concrete case for the principle above.
+## Observations on this session
+
+Eight claims were entered. Four were retracted — C2, C3, C4, C5 — two of those
+on external challenge. All four failed the same way: **confidence exceeding
+the evidence available to the method used.**
+
+This is not an error rate and must not be used to estimate participant
+reliability. One session is neither randomly sampled nor large enough to
+support that inference, and treating it quantitatively would repeat the exact
+failure it describes.
+
+The defensible finding is narrower and sufficient: *multiple substantive
+claims in a single research session required retraction after broader source
+inspection or external challenge, and the failures repeatedly involved
+confidence exceeding what the method could support.* That alone justifies
+persistent claim tracking.
+
+**The summary of this section was itself wrong on first writing** — it stated
+six claims and three retractions against a ledger containing eight and four.
+Caught in independent review, not by its author. The ledger demonstrated its
+own necessity before it had been used once.
