@@ -74,7 +74,13 @@ def test_missing_digest_is_rejected():
 
 
 def test_store_read_detects_tampering(store, room):
-    """Editing a committed artifact behind the store's back is caught."""
+    """Editing a committed artifact behind the store's back is caught.
+
+    Fails as an append-only violation rather than a digest mismatch: the
+    rewrite is visible in history before the digest is even consulted.
+    """
+    from agent_room.errors import AppendOnlyViolation
+
     posted = room.post(thread_id="t1", type="observation", body={"text": "original"})
     path = store.workdir / posted["path"]
 
@@ -84,5 +90,5 @@ def test_store_read_detects_tampering(store, room):
     store._git("add", posted["path"])
     store._commit("tamper")
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises(AppendOnlyViolation):
         store.read("t1", posted["message_id"])

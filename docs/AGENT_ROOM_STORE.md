@@ -43,19 +43,47 @@ sorted keys, `(",", ":")` separators, no insignificant whitespace,
 `ensure_ascii=False`. The digest covers every immutable envelope field except
 itself. `verify()` runs on **every read**.
 
-## Append-only rules
+## Append-only rules — enforced, not assumed
 
+A digest alone cannot catch a rewrite: whoever edits a message can recompute
+it. Only history shows that a message is not what was committed, so **history
+is the authority**.
+
+- Every message blob is read from **the commit that added it**, never from the
+  branch tip.
+- The whole message tree is scanned for later `M`/`D`/`R` events. A path must
+  appear exactly once as `A` and never mutate again. Any later modification,
+  deletion or rename raises `AppendOnlyViolation` and **fails the read closed**
+  — a deleted message is never silently skipped.
 - One immutable file per message; committed bytes are the canonical form.
-- Same id + **same** digest → idempotent, returns `{"status": "duplicate"}`.
-- Same id + **different** digest → `ConflictError`, nothing is written, no
-  commit is created, prior content stays authoritative.
+- Same id + **same** digest → idempotent, `{"status": "duplicate"}`.
+- Same id + **different** digest → `ConflictError`; nothing written, no commit.
 - Acknowledging never touches a message artifact or the branch.
-- Reads come from `git show`/`git log`, never the working tree.
 
-**Ordering** is commit-add order, via
-`git log --reverse --diff-filter=A -- <path>` — the same discovery the existing
-bridge uses. Independent of mtime and of filename sort; both are covered by
-tests that deliberately put them in conflict with commit order.
+`verify_append_only()` re-scans and returns the message count.
+
+**Ordering** is commit-add order — the same discovery the existing bridge uses.
+Independent of mtime and of filename sort; both are covered by tests that
+deliberately put them in conflict with commit order.
+
+## Branch pinning
+
+`assert_room_branch()` runs before **every** write, commit and rebase. A store
+configured for `agent-room` cannot commit onto `main`, onto another branch, or
+onto a detached HEAD — it raises `WrongBranchError` and changes nothing.
+
+`initialise()` never repurposes someone's checkout: it refuses if the room
+branch exists but is not checked out, and refuses to create room history inside
+an existing repository that has commits on another branch. Use a dedicated
+directory.
+
+## Trust boundary
+
+`append()` and every read validate **both** the digest and the structural
+schema. A correctly resealed but malformed envelope is refused — a valid digest
+is not a valid message. Reads validate with `agent_facing=False`, so the
+reserved Issue #5 `approval`/`rejection` types stay structurally readable while
+remaining un-authorable by an agent.
 
 ## Epistemic rules (from `PROCESS.md`)
 
@@ -66,12 +94,43 @@ Message lifecycle and claim state are separate machines:
   `validated`.
 
 `supported` requires a non-empty `scope`, a non-empty `revision_condition`, and
-a non-empty admissible `evidence_basis`. Evidence of kind `agent_output` is
-**not** admissible support and cannot close a challenge. Any assertion type may
+an `evidence_basis` in which **every entry resolves**. Any assertion type may
 cite evidence; citing it never promotes a claim.
+
+**Admissibility rule.** A basis entry resolves one of two ways:
+
+1. **In-message** — it names an `id` in this message's own `evidence[]`. That
+   entry must exist and its `kind` must not be `agent_output`.
+2. **Cross-message** — it names a `message_id` in the store. That message must
+   exist and must itself carry at least one evidence entry of an admissible
+   kind (`repo`, `run`, `external`). A message whose evidence is exclusively
+   `agent_output`, or which carries none, is **never** support.
+
+Anything that resolves to neither fails closed. This is what stops two agents
+citing each other into `supported` — `LLM_OUTPUT != EVIDENCE`, made mechanical.
+
+`repo`/`run` evidence must pin a **full** Git object ID (40 hex for SHA-1, 64
+for SHA-256). Abbreviations and branch-like strings are refused: an
+abbreviation is not an immutable identity.
+
+`decision_request` mechanically requires `human_approval_required: true`.
+`challenge` and `retraction` must reference the message they contest or
+withdraw. Every `parent_id` must resolve, and parent and child must share a
+thread; `reply()` refuses a conflicting explicit `thread_id`.
 
 Agent-facing `post`/`reply` refuse `approval` and `rejection` outright. The
 schema and `approvals/` path stay reserved for Issue #5.
+
+## Provenance
+
+`sender.agent` is fixed to the `AgentRoom`'s participant. A room opened as
+`claude-code` cannot post as `human` or `openai-research` — a mismatch raises
+`ForbiddenOperation`. Optional `model`/`operator` metadata stays configurable.
+Git authorship is deliberately not authority, which is exactly why `sender`
+must be reliable.
+
+`acknowledge()` requires the message to exist and, for directed messages, to be
+addressed to (or broadcast to) the acknowledging participant.
 
 ## CLI
 

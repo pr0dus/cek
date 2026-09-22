@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from . import canonical
 from .cursor import ParticipantCursor
-from .errors import AgentRoomError
+from .errors import AgentRoomError, ForbiddenOperation, UnresolvedReference
 from .gitstore import GitMessageStore
 from .ids import uuid7
 from .schema import SCHEMA_VERSION, validate_envelope
@@ -54,11 +54,25 @@ class AgentRoom:
         message_id: str | None = None,
         timestamp: str | None = None,
     ) -> dict:
+        # Provenance is not caller-supplied. Git authorship is deliberately
+        # not authority (design §7), which makes `sender` the only usable
+        # provenance for filtering and audit - so a room opened as one
+        # participant must not be able to sign as another. Model/operator
+        # metadata stays configurable; the identity itself does not.
+        sender_meta = dict(sender or {})
+        claimed = sender_meta.pop("agent", None)
+        if claimed is not None and claimed != self.participant:
+            raise ForbiddenOperation(
+                f"this room posts as {self.participant!r} and cannot post as "
+                f"{claimed!r}; participant identity is not forgeable"
+            )
+        sender_meta["agent"] = self.participant
+
         envelope: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "message_id": message_id or uuid7(),
             "timestamp": timestamp or _now_iso(),
-            "sender": sender or {"agent": self.participant},
+            "sender": sender_meta,
             "recipient": recipient or {"broadcast": True},
             "project": project or {},
             "thread_id": thread_id,
@@ -76,18 +90,34 @@ class AgentRoom:
         return envelope
 
     def post(self, **kwargs) -> dict:
-        """Validate, seal and append one message. Agent-facing."""
+        """Validate, seal and append one message. Agent-facing.
+
+        References are resolved against the store, so a parent or evidence
+        basis that does not exist fails closed rather than being written as a
+        dangling edge.
+        """
         envelope = self.build_envelope(**kwargs)
-        validate_envelope(envelope, agent_facing=True)
-        return self.store.append(canonical.seal(envelope))
+        validate_envelope(envelope, agent_facing=True, resolver=self.store)
+        return self.store.append(canonical.seal(envelope), resolver=self.store)
 
     def reply(self, parent_id: str, **kwargs) -> dict:
-        """Post a message linked to `parent_id`, inheriting its thread."""
-        if "thread_id" not in kwargs:
-            parent = self.find(parent_id)
-            if parent is None:
-                raise AgentRoomError(f"cannot reply: unknown parent {parent_id}")
-            kwargs["thread_id"] = parent["thread_id"]
+        """Post a message linked to `parent_id`, inheriting its thread.
+
+        A reply belongs to its parent's thread. An explicit `thread_id` that
+        disagrees is a caller error, not something to silently honour - it
+        would create a cross-thread parent edge and make thread
+        reconstruction incoherent.
+        """
+        parent = self.find(parent_id)
+        if parent is None:
+            raise UnresolvedReference(f"cannot reply: unknown parent {parent_id}")
+        supplied = kwargs.get("thread_id")
+        if supplied is not None and supplied != parent["thread_id"]:
+            raise AgentRoomError(
+                f"cannot reply into thread {supplied!r}: parent {parent_id} "
+                f"belongs to thread {parent['thread_id']!r}"
+            )
+        kwargs["thread_id"] = parent["thread_id"]
         return self.post(parent_id=parent_id, **kwargs)
 
     # -- read --------------------------------------------------------------
@@ -95,10 +125,7 @@ class AgentRoom:
         return self.store.read(thread_id, message_id)
 
     def find(self, message_id: str) -> dict | None:
-        for env in self.store.iter_messages():
-            if env["message_id"] == message_id:
-                return env
-        return None
+        return self.store.resolve_message(message_id)
 
     def thread(self, thread_id: str) -> list[dict]:
         """Complete thread in deterministic commit-add order."""
@@ -162,12 +189,34 @@ class AgentRoom:
                  or (env.get("recipient") or {}).get("agent") == self.participant)
         ]
 
+    def is_visible(self, envelope: dict) -> bool:
+        """Whether this participant is an addressee of `envelope`."""
+        recipient = envelope.get("recipient") or {}
+        return bool(
+            recipient.get("broadcast")
+            or recipient.get("agent") == self.participant
+            or envelope["sender"].get("agent") == self.participant
+        )
+
     def acknowledge(self, message_id: str) -> dict:
         """Record that this participant has seen a message.
 
         Acknowledgement is not agreement, and it never touches the artifact.
+        It also may not manufacture state: the message must exist, and a
+        directed message must actually be addressed to this participant,
+        otherwise the cursor would accumulate assertions about messages the
+        participant never received.
         """
         cursor = self._require_cursor()
+        envelope = self.store.resolve_message(message_id)
+        if envelope is None:
+            raise UnresolvedReference(
+                f"cannot acknowledge unknown message {message_id!r}"
+            )
+        if not self.is_visible(envelope):
+            raise AgentRoomError(
+                f"message {message_id!r} is not addressed to {self.participant!r}"
+            )
         cursor.acknowledge(message_id, at=_now_iso())
         return {"acknowledged": message_id, "participant": self.participant}
 

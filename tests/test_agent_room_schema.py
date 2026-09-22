@@ -90,7 +90,7 @@ def test_malformed_envelopes_fail_loudly(bad):
 def test_repo_evidence_must_pin_an_immutable_commit():
     with pytest.raises(SchemaError):
         validate_envelope(envelope(evidence=[{"kind": "repo", "path": "a.py"}]))
-    validate_envelope(envelope(evidence=[{"kind": "repo", "commit": "40ffdf46", "path": "a.py"}]))
+    validate_envelope(envelope(evidence=[{"kind": "repo", "commit": "40ffdf4617283f4accb3493a8a710c5025c5d3bc", "path": "a.py"}]))
 
 
 def test_challenge_must_reference_what_it_contests():
@@ -153,7 +153,7 @@ def test_supported_requires_revision_condition():
     """PROCESS.md rule 3 — no revision condition means proposed at best."""
     with pytest.raises(ClaimStateError, match="revision_condition"):
         validate_envelope(envelope(type="claim", claim={
-            "status": "supported", "scope": "at commit 40ffdf46",
+            "status": "supported", "scope": "at commit 40ffdf4617283f4accb3493a8a710c5025c5d3bc",
             "evidence_basis": ["e1"],
         }))
 
@@ -161,7 +161,7 @@ def test_supported_requires_revision_condition():
 def test_supported_requires_evidence_basis():
     with pytest.raises(ClaimStateError, match="evidence_basis"):
         validate_envelope(envelope(type="claim", claim={
-            "status": "supported", "scope": "at commit 40ffdf46",
+            "status": "supported", "scope": "at commit 40ffdf4617283f4accb3493a8a710c5025c5d3bc",
             "revision_condition": "a counterexample", "evidence_basis": [],
         }))
 
@@ -173,7 +173,7 @@ def test_agent_output_is_not_admissible_support():
             type="claim",
             evidence=[{"id": "e1", "kind": "agent_output", "note": "the other agent agreed"}],
             claim={
-                "status": "supported", "scope": "at commit 40ffdf46",
+                "status": "supported", "scope": "at commit 40ffdf4617283f4accb3493a8a710c5025c5d3bc",
                 "revision_condition": "a counterexample", "evidence_basis": ["e1"],
             },
         ))
@@ -182,9 +182,9 @@ def test_agent_output_is_not_admissible_support():
 def test_repo_evidence_is_admissible_support():
     validate_envelope(envelope(
         type="claim",
-        evidence=[{"id": "e1", "kind": "repo", "commit": "40ffdf46", "path": "x.py"}],
+        evidence=[{"id": "e1", "kind": "repo", "commit": "40ffdf4617283f4accb3493a8a710c5025c5d3bc", "path": "x.py"}],
         claim={
-            "status": "supported", "scope": "at commit 40ffdf46",
+            "status": "supported", "scope": "at commit 40ffdf4617283f4accb3493a8a710c5025c5d3bc",
             "revision_condition": "a counterexample", "evidence_basis": ["e1"],
         },
     ))
@@ -194,7 +194,7 @@ def test_citing_evidence_does_not_promote_a_hypothesis():
     """Evidence refs are allowed anywhere and upgrade nothing by themselves."""
     env = envelope(
         type="hypothesis",
-        evidence=[{"id": "e1", "kind": "repo", "commit": "40ffdf46", "path": "x.py"}],
+        evidence=[{"id": "e1", "kind": "repo", "commit": "40ffdf4617283f4accb3493a8a710c5025c5d3bc", "path": "x.py"}],
         claim={"status": "proposed"},
     )
     validate_envelope(env)
@@ -206,7 +206,7 @@ def test_any_assertion_type_may_cite_evidence(mtype):
     """Correction from the supervisor review: evidence is not evidence-only."""
     validate_envelope(envelope(
         type=mtype,
-        evidence=[{"kind": "repo", "commit": "40ffdf46", "path": "x.py"}],
+        evidence=[{"kind": "repo", "commit": "40ffdf4617283f4accb3493a8a710c5025c5d3bc", "path": "x.py"}],
     ))
 
 

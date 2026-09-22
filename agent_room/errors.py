@@ -44,3 +44,25 @@ class ForbiddenOperation(AgentRoomError):
 
 class PushRaceError(AgentRoomError):
     """Bounded fetch/rebase-or-retry exhausted against a moving branch ref."""
+
+
+class AppendOnlyViolation(AgentRoomError):
+    """A committed message path was later modified, deleted or renamed.
+
+    Reads fail closed on this rather than returning the rewritten content or
+    silently omitting the deleted message. A resealed rewrite is exactly the
+    attack the digest alone cannot catch: the digest will be valid, so only
+    history can show the message is not what was originally committed.
+    """
+
+
+class WrongBranchError(AgentRoomError):
+    """The checkout is not the dedicated room branch.
+
+    Refused before any write, so a mis-pointed store cannot commit room
+    traffic onto main or repurpose an unrelated developer checkout.
+    """
+
+
+class UnresolvedReference(SchemaError):
+    """A parent_id or evidence_basis entry does not resolve in the store."""

@@ -14,7 +14,14 @@ claim by itself — only a later message asserting the change can.
 
 from typing import Any, Mapping
 
-from .errors import ClaimStateError, ForbiddenOperation, SchemaError
+import re
+
+from .errors import (
+    ClaimStateError,
+    ForbiddenOperation,
+    SchemaError,
+    UnresolvedReference,
+)
 from .ids import is_uuid7
 
 SCHEMA_VERSION = 1
@@ -42,6 +49,13 @@ EVIDENCE_KINDS = frozenset({"repo", "run", "external", "agent_output"})
 #: LLM_OUTPUT != EVIDENCE. An agent's own output may be referenced, but it
 #: cannot be what supports a claim, nor can it close a challenge.
 INADMISSIBLE_FOR_SUPPORT = frozenset({"agent_output"})
+ADMISSIBLE_FOR_SUPPORT = EVIDENCE_KINDS - INADMISSIBLE_FOR_SUPPORT
+
+#: A pinned commit must be a full Git object ID: 40 hex for SHA-1, 64 for
+#: SHA-256. An abbreviation is not an immutable identity - it can become
+#: ambiguous as a repository grows, and it reads as a commit while not being
+#: one.
+FULL_COMMIT_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 REQUIRED_FIELDS = (
     "schema_version", "message_id", "timestamp", "sender", "recipient",
@@ -70,13 +84,35 @@ def validate_evidence(evidence: Any) -> None:
             f"evidence[{i}].kind {kind!r} not in {sorted(EVIDENCE_KINDS)}",
         )
         if kind in ("repo", "run"):
+            commit = ref.get("commit")
             _require(
-                bool(ref.get("commit")),
+                bool(commit),
                 f"evidence[{i}] of kind {kind!r} must pin an immutable commit",
+            )
+            _require(
+                isinstance(commit, str) and bool(FULL_COMMIT_RE.match(commit)),
+                f"evidence[{i}].commit {commit!r} is not a full Git object ID "
+                "(40 hex for SHA-1, 64 for SHA-256); an abbreviation is not an "
+                "immutable identity",
             )
 
 
-def validate_claim(claim: Any, evidence: list | None = None) -> None:
+def message_is_admissible_support(message: dict) -> bool:
+    """Documented cross-message admissibility rule.
+
+    A referenced message supports a claim only if it carries at least one
+    evidence entry of an admissible kind (`repo`, `run`, `external`). A message
+    whose evidence is exclusively `agent_output`, or which carries none at all,
+    is never support: that is `LLM_OUTPUT != EVIDENCE` made mechanical, and it
+    is what stops two agents citing each other into `supported`.
+    """
+    for ref in message.get("evidence") or []:
+        if isinstance(ref, dict) and ref.get("kind") in ADMISSIBLE_FOR_SUPPORT:
+            return True
+    return False
+
+
+def validate_claim(claim, evidence=None, resolver=None) -> None:
     """Apply PROCESS.md's ledger rules to a claim object."""
     _require(isinstance(claim, dict), "claim must be an object")
     status = claim.get("status")
@@ -105,24 +141,57 @@ def validate_claim(claim: Any, evidence: list | None = None) -> None:
             "claim.status 'supported' requires a non-empty evidence_basis"
         )
 
-    # An evidence_basis entry may name another message, or index into this
-    # message's own evidence[]. Only the latter is checkable here; agent_output
-    # is never admissible support.
-    by_id = {}
-    for ref in evidence or []:
-        if isinstance(ref, dict) and ref.get("id"):
-            by_id[ref["id"]] = ref
+    in_message = {
+        ref["id"]: ref
+        for ref in (evidence or [])
+        if isinstance(ref, dict) and ref.get("id")
+    }
+
     for entry in basis:
-        ref = by_id.get(entry)
-        if ref is not None and ref.get("kind") in INADMISSIBLE_FOR_SUPPORT:
+        # 1. An id naming evidence carried by this very message.
+        ref = in_message.get(entry)
+        if ref is not None:
+            if ref.get("kind") in INADMISSIBLE_FOR_SUPPORT:
+                raise ClaimStateError(
+                    f"evidence {entry!r} is of kind {ref.get('kind')!r}, which is "
+                    "not admissible support for 'supported' "
+                    "(LLM_OUTPUT != EVIDENCE)"
+                )
+            continue
+
+        # 2. Otherwise it must resolve to another message in the store.
+        if resolver is None:
+            raise UnresolvedReference(
+                f"evidence_basis {entry!r} names neither evidence carried by this "
+                "message nor anything resolvable; no resolver was available to "
+                "check it, so it fails closed"
+            )
+        referenced = resolver.resolve_message(entry)
+        if referenced is None:
+            raise UnresolvedReference(
+                f"evidence_basis {entry!r} does not resolve to evidence in this "
+                "message or to any message in the store"
+            )
+        if not message_is_admissible_support(referenced):
             raise ClaimStateError(
-                f"evidence of kind {ref.get('kind')!r} is not admissible support "
-                "for 'supported' (LLM_OUTPUT != EVIDENCE)"
+                f"message {entry!r} carries no admissible evidence "
+                f"({sorted(ADMISSIBLE_FOR_SUPPORT)}), so it cannot support a "
+                "claim; agent output alone is never support"
             )
 
 
-def validate_envelope(envelope: Mapping[str, Any], *, agent_facing: bool = True) -> None:
-    """Structural and epistemic validation. Raises rather than repairing."""
+def validate_envelope(
+    envelope: Mapping[str, Any],
+    *,
+    agent_facing: bool = True,
+    resolver: Any = None,
+) -> None:
+    """Structural and epistemic validation. Raises rather than repairing.
+
+    `resolver` supplies `resolve_message(message_id)`. When present, references
+    are resolved for real: a parent must exist and share the thread, and every
+    evidence basis entry must resolve and be admissible.
+    """
     _require(isinstance(envelope, dict), "envelope must be an object")
 
     missing = [f for f in REQUIRED_FIELDS if f not in envelope]
@@ -171,11 +240,36 @@ def validate_envelope(envelope: Mapping[str, Any], *, agent_facing: bool = True)
     if parent is not None:
         _require(is_uuid7(parent), f"parent_id {parent!r} is not a UUIDv7")
 
-    if mtype == "challenge":
+    # A challenge or retraction that references nothing cannot be audited
+    # back to what it contests or withdraws.
+    if mtype in ("challenge", "retraction"):
         _require(
             envelope.get("parent_id") is not None,
-            "a challenge must reference the message_id it contests",
+            f"a {mtype} must reference the message_id it "
+            f"{'contests' if mtype == 'challenge' else 'retracts'}",
         )
+
+    # The design says decision_request always implies human approval; accepting
+    # it with the flag false would let an agent request a decision that no
+    # gate is watching for.
+    if mtype == "decision_request":
+        _require(
+            envelope["human_approval_required"] is True,
+            "decision_request requires human_approval_required=true",
+        )
+
+    if parent is not None and resolver is not None:
+        parent_message = resolver.resolve_message(parent)
+        if parent_message is None:
+            raise UnresolvedReference(
+                f"parent_id {parent!r} does not resolve to a stored message"
+            )
+        if parent_message["thread_id"] != envelope["thread_id"]:
+            raise SchemaError(
+                f"parent {parent!r} belongs to thread "
+                f"{parent_message['thread_id']!r}, not {envelope['thread_id']!r}; "
+                "a reply may not cross threads"
+            )
 
     validate_evidence(envelope.get("evidence", []))
 
@@ -184,4 +278,4 @@ def validate_envelope(envelope: Mapping[str, Any], *, agent_facing: bool = True)
             mtype in ASSERTION_TYPES,
             f"message type {mtype!r} may not carry a claim object",
         )
-        validate_claim(envelope["claim"], envelope.get("evidence", []))
+        validate_claim(envelope["claim"], envelope.get("evidence", []), resolver)
