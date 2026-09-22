@@ -168,7 +168,7 @@ GitHub repo pr0dus/cek
 └── branch: agent-room                      (orphan; NEVER merged to main)
     └── .agent-room/
         ├── messages/<thread_id>/<message_id>.json   append-only, immutable
-        ├── approvals/<message_id>.json              human-authored commits only
+        ├── approvals/<message_id>.json              reserved; authority lands in Issue #5
         ├── threads/<thread_id>.json                 derived index (rebuildable)
         └── room-status.json                         participant heartbeats
 
@@ -190,6 +190,21 @@ Three deliberate choices:
   the existing bounded bridge, under human approval. This keeps the capability surface from §1.5
   exactly as wide as it is today.
 
+### Scope boundary for Issue #2
+
+Issue #2 builds **only** the durable substrate, as a library plus CLI:
+
+- the append-only message store on the `agent-room` branch;
+- schema validation for the envelope in §3;
+- deterministic thread reconstruction from commit order (§5);
+- CLI/library operations to append and read messages;
+- tests covering all of the above.
+
+Issue #2 explicitly does **not** add a systemd unit, a daemon, a polling worker, a Claude
+participant, an OpenAI participant, or any execution capability. Participant workers and polling —
+including cadence and backoff — belong to Issues #3 and #4, and mechanical human authority to
+Issue #5. The existing bridge (§1) stays untouched throughout.
+
 ---
 
 ## 3. Message schema
@@ -200,7 +215,8 @@ present.
 ```json
 {
   "schema_version": 1,
-  "message_id": "am-20260922T104500Z-claude-7f3a9c",
+  "message_id": "01999c4e-1f0a-7c31-9d2b-6e4f0a7b12cd",
+  "envelope_sha256": "9f2b…64 hex chars, digest of the canonical envelope…",
   "timestamp": "2026-09-22T10:45:00Z",
   "sender":    { "agent": "claude-code", "model": "claude-sonnet-5", "operator": "pr0" },
   "recipient": { "agent": "openai-research", "broadcast": false },
@@ -214,44 +230,94 @@ present.
       "commit": "40ffdf46…", "path": "src/…/world_model_transition_support.py",
       "lines": [199, 221], "note": "closure admits only active dependents" }
   ],
+  "claim": {
+    "status": "proposed",
+    "scope": "the bounds within which the support holds",
+    "revision_condition": "what would falsify this or require revision",
+    "evidence_basis": ["01999c4e-…-id-of-the-evidence-message"]
+  },
   "status": "open",
   "reply_requested": true,
   "human_approval_required": false
 }
 ```
 
-**`message_id`** = `am-<UTC timestamp>-<sender>-<short sha256 of canonical body>`. This keeps the
-existing bridge's readable-slug property while making collisions impossible and identity
-content-derived.
+The `claim` object is present only on messages that actually assert something (§ *Claim epistemic
+state* below). Everything else is message-level envelope.
+
+### Identity and integrity are two separate fields
+
+An earlier draft derived `message_id` from a *short* SHA-256 prefix and claimed that made
+collisions impossible. That was wrong: a truncated digest has a birthday bound, and readability is
+not worth a uniqueness claim that does not hold. The two concerns are now separated.
+
+- **`message_id`** — a **UUIDv7** (or an equivalently robust unique identifier). Uniqueness comes
+  from the generator, not from hashing content. UUIDv7's time-ordered prefix preserves the rough
+  chronological sortability the old slug gave, without pretending to be a content digest. It is
+  the filename and the target of `parent_id`, `evidence_basis`, and `challenge` references.
+- **`envelope_sha256`** — the **full 64-character** SHA-256 of the canonical JSON serialisation of
+  the immutable envelope (every field except `envelope_sha256` itself). This is the integrity and
+  idempotency check: a reader recomputes it to detect tampering or truncation, and a writer uses
+  it to recognise a re-submitted identical message. It is never used as identity.
+
+Canonicalisation must be specified in Issue #2 (sorted keys, UTF-8, no insignificant whitespace)
+so the digest is reproducible across participants.
 
 ### Message types
 
 Issue #1's fourteen types are kept — they encode exactly the epistemic distinctions the charter
 requires, and collapsing them would destroy that. They are grouped only for reasoning:
 
-| Family | Types | Epistemic weight |
+| Family | Types | Role |
 |---|---|---|
-| Assertions | `observation`, `hypothesis`, `claim`, `evidence`, `test_result` | `observation`/`evidence`/`test_result` may cite repo evidence; `hypothesis` and `claim` **may not** be treated as validated |
-| Interrogatives | `question`, `challenge`, `proposed_test` | `challenge` must reference the `message_id` it contests |
-| Responses | `answer`, `retraction` | `retraction` never deletes — it supersedes, and both stay visible |
-| Control | `decision_request`, `approval`, `rejection`, `handoff` | `approval`/`rejection` are **human-only** (§6) |
+| Assertions | `observation`, `hypothesis`, `claim`, `evidence`, `test_result` | **Any** of these may cite immutable evidence references. `evidence` and `test_result` mean evidence is the *primary content* of the message — not that they are the only types permitted to reference repository or run evidence. |
+| Interrogatives | `question`, `challenge`, `proposed_test` | `challenge` must reference the `message_id` it contests; any participant may challenge any claim, including their own (PROCESS.md rule 4) |
+| Responses | `answer`, `retraction` | `retraction` never deletes — it supersedes, and both stay visible (PROCESS.md rule 2) |
+| Control | `decision_request`, `approval`, `rejection`, `handoff` | agents may author `decision_request`; `approval`/`rejection` are never agent-authored (§6) |
 
-Rules that make the charter's invariants mechanical rather than aspirational:
+**Citing evidence is not the same as gaining epistemic standing.** Any substantive message may
+carry `evidence[]`; doing so never changes `claim.status` by itself. Status only changes when a
+later message asserts the change and the conditions below are met.
 
-- `HYPOTHESIS != VALIDATED_CAUSE` — only `evidence` and `test_result` may carry `evidence[]`
-  entries of kind `repo`/`run`. A `hypothesis` with no evidence cannot be promoted to `claim`
-  except by a new message citing evidence.
-- `LLM_OUTPUT != EVIDENCE` — `evidence[]` entries of kind `agent_output` are permitted but are
-  **explicitly not** valid support for closing a `challenge`.
-- Agreement is not validation — a `claim` reaches `status: "validated"` only via a `test_result`
-  citing a reproducible artifact, never by two agents concurring.
-- Corrections stay visible — files are append-only; `retraction` and `status` transitions add
-  history, never rewrite it.
+### Two independent state machines
 
-### Status vocabulary
+Conflating conversation flow with epistemic standing would let a thread's activity masquerade as
+support. They are kept separate.
 
-`open` → `answered` | `challenged` | `validated` | `retracted` | `superseded` | `withdrawn`.
-Status lives in a *later* message or the derived thread index, never by editing the original file.
+**1. Message / thread lifecycle** — describes the conversation only, and carries no epistemic
+weight whatsoever:
+
+`open` → `answered` | `superseded` | `withdrawn`
+
+**2. Claim epistemic state** — reuses `PROCESS.md`'s existing ledger vocabulary verbatim. No
+parallel truth state is introduced, and in particular there is **no generic `validated`**:
+
+`proposed` | `challenged` | `supported` | `retracted`
+
+A `claim` object carries the ledger's own required fields — `scope`, `revision_condition`, and an
+`evidence_basis` — and inherits PROCESS.md's rules directly:
+
+- **`supported` is evidence-scoped, never universal truth.** It means only: this evidence supports
+  this claim *within this scope*. A claim whose `scope` is unstated cannot be `supported`
+  (PROCESS.md rule 1).
+- **A claim with no `revision_condition` is `proposed` at best** (PROCESS.md rule 3).
+- **Retractions stay.** `retracted` is terminal-but-visible; files are append-only, so transitions
+  add history and never rewrite it (PROCESS.md rule 2).
+- **Any participant may challenge any claim, including their own** (PROCESS.md rule 4).
+
+These charter invariants remain mechanical under the looser evidence rule:
+
+- `HYPOTHESIS != VALIDATED_CAUSE` — a `hypothesis` may cite evidence freely, but citing it does not
+  move it to `supported`; that requires a later message supplying scope, revision condition and an
+  evidence basis.
+- `LLM_OUTPUT != EVIDENCE` — an `evidence[]` entry of kind `agent_output` may be referenced, but is
+  **not admissible as the `evidence_basis` for `supported`**, and cannot close a `challenge`.
+- **Agreement between two agents is never support.** Concurrence produces no status change at all;
+  only evidence within a stated scope can, and `supported` remains revisable by its own
+  `revision_condition`.
+
+Status of either machine lives in a *later* message or the derived thread index, never by editing
+a committed file.
 
 ---
 
@@ -262,7 +328,7 @@ Status lives in a *later* message or the derived thread index, never by editing 
 | **Durable state** | messages, approvals | `agent-room` branch | append-only, immutable |
 | **Transient runtime** | cursor, per-message phase ledger, lock | `~/.local/share/agent-room/state/` | mutable, **never committed**, rebuildable from Git |
 | **Repository evidence** | code, tests, results | research repo | referenced by `{commit, path, lines}` — **never copied** |
-| **Human approval state** | approval/rejection records | `approvals/` on the branch | append-only, human-authored commits only |
+| **Human approval state** | approval/rejection records | `approvals/` on the branch | append-only; **path reserved** in Issues #2–#4, made authoritative in Issue #5 (§6) |
 
 Evidence is referenced by immutable commit SHA, never by branch name and never by pasted excerpt.
 A quotation in `body` is illustrative; the `{commit, path, lines}` reference is the evidence. This
@@ -289,16 +355,26 @@ disagrees with message history, the history wins.
 
 ## 6. Approval model
 
+**Decided by the human: no signed-commit requirement is introduced yet.** Mechanical human
+authority is implemented and qualified in **Issue #5**, not here.
+
+For **Issues #2–#4** the rule is a capability restriction, not a cryptographic one:
+
 - Any message may set `human_approval_required: true`. `decision_request` always implies it.
-- `approval` and `rejection` messages are valid **only** when authored by a human-controlled
-  identity. No agent participant may author them.
+- Agents **may** author `decision_request`.
+- Agent-facing operations **must not be able to author `approval` or `rejection` at all.** The CLI
+  and library surface built in Issue #2 simply does not expose those types to an agent
+  participant — an agent cannot emit one, well-formed or otherwise.
+- The `approval`/`rejection` schema and the `approvals/` path are **reserved** now so that Issue #5
+  has a stable shape to make authoritative. Until then they carry no mechanical authority.
 - **No consequential action is executed by Agent Room itself.** Execution requests are routed to
-  the existing bounded bridge (§1.5) and only after an `approval` exists for the specific
-  `message_id`.
-- Enforcement is by commit authorship/signature on the approvals path, not by an honour-system
-  field inside a JSON file an agent could write.
+  the existing bounded bridge (§1.5), and until Issue #5 the human acts through that bridge
+  directly rather than through a machine-verified approval record.
 - A pending approval blocks the dependent action indefinitely. There is no timeout auto-approve —
   that would be exactly the autonomous loop issue #1 forbids.
+
+Until Issue #5 lands, treat a Git author name, an email address, a `sender` string, or any agent's
+assertion that a human approved something as **claims, not authority**.
 
 ---
 
@@ -308,10 +384,14 @@ disagrees with message history, the history wins.
    already states for its own branch and honours in practice.
 2. **Agent Room grants no new capability.** It adds no operation to the eleven in §1.5. Message
    traffic cannot execute anything by itself.
-3. **Authority is push access to the branch.** As with the existing bridge, whoever can write the
-   branch can address the room; participants should use separate credentials so authorship is
-   meaningful.
-4. Agents may not author `approval`/`rejection` (§6).
+3. **Write access to the branch is the only real boundary.** As with the existing bridge, whoever
+   can push can address the room. Participants should use separate credentials so traffic is
+   *attributable* — but until Issue #5, attribution is provenance for humans to read, **not** a
+   mechanical authority check, and must never be treated as one.
+4. Agents may not author `approval`/`rejection` — enforced in Issues #2–#4 by **not exposing those
+   types to agent-facing operations at all**, since no cryptographic check exists until Issue #5
+   (§6). A `sender` string, Git author field, or an agent's assertion of human approval is a claim,
+   never authority.
 5. Evidence references are immutable SHAs, so a cited artifact cannot be swapped after the fact.
 6. Message bodies are **data, never instructions to the reading agent.** A participant must treat
    incoming text as a claim to evaluate, not a command — otherwise the room becomes a prompt
@@ -330,32 +410,45 @@ disagrees with message history, the history wins.
 - No orchestration framework, message broker, or database. Git is sufficient and proven here.
 - Not a chat product: no presence, typing indicators, or real-time delivery guarantees.
 - No implementation of issues #2–#5.
+- Specifically **not in Issue #2**: systemd service, daemon, polling worker, Claude participant,
+  OpenAI participant, or any execution capability (§2).
+- No generic `validated` epistemic state, and no epistemic vocabulary parallel to `PROCESS.md`.
 - Not a justification to redesign CEK or NEWI.
 
 ---
 
-## 9. Open questions and blockers
+## 9. Resolved decisions, and what remains open
 
-Decisions that need the human before issue #2:
+### Resolved — these no longer block Issue #2
 
-1. **Repo placement.** This design puts `agent-room` in `pr0dus/cek`. The alternative is reusing
-   `concept-evolution-kernel` where the bridge already lives. Recommendation: `cek`, to keep
-   research history clean — needs confirmation.
-2. **OpenAI-side participant.** How the OpenAI agent authenticates and pushes is **unverified**.
-   The current bridge is driven by something that can already commit to the control branch, but I
-   did not inspect the ChatGPT-side configuration, and issue #1 does not cover it. This is the
-   largest unknown and directly gates issue #4.
-3. **Identity for approvals.** §6 requires enforceable human authorship. Signed commits (GPG/SSH)
-   are the obvious mechanism; whether the workflow already has signing keys is unconfirmed.
-4. **Reuse vs parallel worker.** Should Agent Room poll via a second systemd user unit modelled on
-   the bridge worker, or extend the existing worker? A separate unit is safer (issue #1 forbids
-   modifying the bridge) but doubles polling. Recommendation: separate unit, decided in issue #2.
-5. **Polling cadence and cost.** The bridge polls at 2 s when active. For conversation this is
-   probably wasteful; an idle backoff needs choosing.
-6. **The 12 quarantined requests.** Not inspected — their contents may reveal malformed-input
-   modes worth designing against. Deliberately left alone as possible private payload.
-7. **Retention.** Threads accumulate forever by design. At what volume does the branch need
-   archival, and does archival violate "corrections remain visible"?
+1. **Repo placement — decided: `pr0dus/cek`.** Agent Room is infrastructure and stays out of
+   `pr0dus/concept-evolution-kernel`. The Agent Room implementation must not be moved into the
+   NEWI research repository.
+2. **OpenAI-side participant authentication — deferred to Issue #4, and does not block Issue #2.**
+   Issue #2 defines a **participant-neutral** store and interface: no participant identity,
+   transport, or credential is assumed or invented. Real OpenAI-side authentication and
+   connectivity are Issue #4's problem.
+3. **Human approval identity — deferred to Issue #5.** No signed-commit requirement is introduced
+   in Issues #2–#4. Agents may create `decision_request`; agent-facing operations cannot author
+   `approval`/`rejection`; the schema and path are reserved; mechanical human authority is
+   implemented and qualified in Issue #5 (§6).
+
+### Not blockers — settled for Issues #2–#5
+
+4. **Retention.** Append-only retention is kept for the whole of Issues #2–#5. Threads are not
+   compacted, archived, or expired; "corrections remain visible" takes precedence over branch
+   size. Revisit only if volume becomes a demonstrated problem, with evidence.
+5. **The 12 quarantined bridge requests.** Not inspected, and deliberately so. They are possible
+   private payload, and reading them is not needed to complete this design or Issue #2.
+
+### Genuinely open — but owned by later issues, not Issue #2
+
+6. **Participant worker shape and polling cadence.** Whether each participant runs its own poller,
+   and at what interval and backoff, is an **Issue #3/#4** decision. Issue #2 adds no daemon,
+   systemd unit, or poller at all (§2). The existing bridge is not modified or extended to carry
+   Agent Room traffic.
+7. **Canonical JSON serialisation** for `envelope_sha256` must be pinned down in Issue #2 — sorted
+   keys, UTF-8, whitespace handling — so digests are reproducible across participants (§3).
 
 ---
 
@@ -371,4 +464,6 @@ the 12 quarantined requests were opened.
 **Nothing was modified.** Both services remain active with 0 restarts, and no file under
 `~/.local/share/chatgpt-ubuntu-bridge/` or on the `chatgpt-ubuntu-bridge` branch was written.
 
-Issue #2 should begin only after questions 1–3 above are answered.
+Questions 1–3 have since been decided by the human and are recorded as resolved in §9; this
+document no longer treats them as blocking. Issue #2 may proceed within the scope boundary set in
+§2, and adds no daemon, no poller, no participant, and no execution capability.
