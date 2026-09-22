@@ -110,7 +110,7 @@ def test_store_refuses_to_commit_onto_another_branch(repo_on_main, room):
 
 def test_initialise_refuses_to_repurpose_an_unrelated_repo(repo_on_main):
     head_before = git(repo_on_main, "rev-parse", "HEAD").strip()
-    with pytest.raises(WrongBranchError, match="unrelated checkout"):
+    with pytest.raises(WrongBranchError, match="refusing to repurpose"):
         GitMessageStore.initialise(repo_on_main, branch="agent-room")
     assert git(repo_on_main, "rev-parse", "HEAD").strip() == head_before
     assert git(repo_on_main, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"

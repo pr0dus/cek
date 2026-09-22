@@ -57,6 +57,15 @@ ADMISSIBLE_FOR_SUPPORT = EVIDENCE_KINDS - INADMISSIBLE_FOR_SUPPORT
 #: one.
 FULL_COMMIT_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
+#: A thread_id becomes a Git path segment and is parsed back out of
+#: `git log --name-status` output line by line. Anything Git would quote or
+#: escape - whitespace, control characters, separators, non-ASCII - could break
+#: that parse or make a committed message undiscoverable, so the vocabulary is
+#: deliberately narrow: ASCII letters/digits then letters/digits/./_/-, first
+#: character alphanumeric (excluding leading dots), bounded at 64 characters.
+THREAD_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+THREAD_ID_MAX = 64
+
 REQUIRED_FIELDS = (
     "schema_version", "message_id", "timestamp", "sender", "recipient",
     "project", "thread_id", "type", "body", "status",
@@ -76,8 +85,20 @@ def _require(condition: bool, message: str) -> None:
 
 def validate_evidence(evidence: Any) -> None:
     _require(isinstance(evidence, list), "evidence must be a list")
+    seen_ids: set = set()
     for i, ref in enumerate(evidence):
         _require(isinstance(ref, dict), f"evidence[{i}] must be an object")
+        ref_id = ref.get("id")
+        if ref_id is not None:
+            # Duplicate ids would collapse when basis entries are resolved,
+            # making admissibility depend on list order - an inadmissible
+            # entry could hide behind an admissible one with the same id.
+            _require(
+                ref_id not in seen_ids,
+                f"evidence[{i}].id {ref_id!r} is duplicated; evidence ids must "
+                "be unique within a message",
+            )
+            seen_ids.add(ref_id)
         kind = ref.get("kind")
         _require(
             kind in EVIDENCE_KINDS,
@@ -112,8 +133,14 @@ def message_is_admissible_support(message: dict) -> bool:
     return False
 
 
-def validate_claim(claim, evidence=None, resolver=None) -> None:
-    """Apply PROCESS.md's ledger rules to a claim object."""
+def validate_claim(claim, evidence=None, resolver=None, *, check_references: bool = True) -> None:
+    """Apply PROCESS.md's ledger rules to a claim object.
+
+    `check_references=False` performs structural checks only, skipping
+    cross-message resolution. It exists so a message can be loaded raw while
+    another message's references are being resolved, which is what keeps graph
+    validation from recursing without bound.
+    """
     _require(isinstance(claim, dict), "claim must be an object")
     status = claim.get("status")
     if status not in CLAIM_STATUS:
@@ -160,6 +187,8 @@ def validate_claim(claim, evidence=None, resolver=None) -> None:
             continue
 
         # 2. Otherwise it must resolve to another message in the store.
+        if not check_references:
+            continue
         if resolver is None:
             raise UnresolvedReference(
                 f"evidence_basis {entry!r} names neither evidence carried by this "
@@ -185,12 +214,17 @@ def validate_envelope(
     *,
     agent_facing: bool = True,
     resolver: Any = None,
+    check_references: bool = True,
 ) -> None:
     """Structural and epistemic validation. Raises rather than repairing.
 
     `resolver` supplies `resolve_message(message_id)`. When present, references
     are resolved for real: a parent must exist and share the thread, and every
     evidence basis entry must resolve and be admissible.
+
+    `check_references=False` restricts validation to this envelope alone. Reads
+    use it for the raw phase so that resolving one message's references cannot
+    recurse into resolving the referenced message's own references.
     """
     _require(isinstance(envelope, dict), "envelope must be an object")
 
@@ -225,8 +259,10 @@ def validate_envelope(
             f"{field} must be a non-empty string",
         )
     _require(
-        "/" not in envelope["thread_id"] and not envelope["thread_id"].startswith("."),
-        f"thread_id {envelope['thread_id']!r} must be a single safe path segment",
+        bool(THREAD_ID_RE.match(envelope["thread_id"])),
+        f"thread_id {envelope['thread_id']!r} is not a safe path segment: "
+        f"expected 1-{THREAD_ID_MAX} ASCII characters matching "
+        "[A-Za-z0-9][A-Za-z0-9._-]*",
     )
 
     for field in ("sender", "recipient", "project", "body"):
@@ -258,7 +294,7 @@ def validate_envelope(
             "decision_request requires human_approval_required=true",
         )
 
-    if parent is not None and resolver is not None:
+    if parent is not None and resolver is not None and check_references:
         parent_message = resolver.resolve_message(parent)
         if parent_message is None:
             raise UnresolvedReference(
@@ -278,4 +314,7 @@ def validate_envelope(
             mtype in ASSERTION_TYPES,
             f"message type {mtype!r} may not carry a claim object",
         )
-        validate_claim(envelope["claim"], envelope.get("evidence", []), resolver)
+        validate_claim(
+            envelope["claim"], envelope.get("evidence", []), resolver,
+            check_references=check_references,
+        )

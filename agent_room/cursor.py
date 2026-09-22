@@ -13,12 +13,19 @@ Acknowledgement is not agreement. It records only that a participant has seen
 a message.
 """
 
+import fcntl
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
+from .errors import LockTimeout
+
 SCHEMA_VERSION = 1
+LOCK_TIMEOUT_SECONDS = 10.0
+LOCK_POLL_SECONDS = 0.05
 
 
 class ParticipantCursor:
@@ -57,16 +64,54 @@ class ParticipantCursor:
             Path(tmp).unlink(missing_ok=True)
             raise
 
+    @contextmanager
+    def _file_lock(self):
+        """Exclusive lock over this cursor file, bounded by a deadline.
+
+        Without it, two processes acknowledging different messages would each
+        write back the state they loaded, and the later write would silently
+        drop the earlier acknowledgement.
+        """
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.state_dir / f"cursor-{self.participant}.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeout(
+                            f"another process holds the cursor lock for "
+                            f"{self.participant!r} (waited {LOCK_TIMEOUT_SECONDS}s)"
+                        )
+                    time.sleep(LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     def acknowledge(self, message_id: str, *, at: str) -> None:
-        """Mark one message seen. Never modifies the message artifact."""
-        self._state["acknowledged"][message_id] = {"acknowledged_at": at}
-        self._save()
+        """Mark one message seen. Never modifies the message artifact.
+
+        Re-reads under the lock before writing, so a concurrent
+        acknowledgement of a *different* message is preserved rather than
+        clobbered by this process's stale copy.
+        """
+        with self._file_lock():
+            self._state = self._load()
+            self._state["acknowledged"][message_id] = {"acknowledged_at": at}
+            self._save()
 
     def is_acknowledged(self, message_id: str) -> bool:
-        return message_id in self._state["acknowledged"]
+        return message_id in self._load()["acknowledged"]
 
     def acknowledged_ids(self) -> set[str]:
-        return set(self._state["acknowledged"])
+        return set(self._load()["acknowledged"])
 
     def unread(self, envelopes) -> list[dict]:
         """Messages addressed to this participant that it has not acknowledged."""

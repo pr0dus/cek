@@ -26,8 +26,12 @@ Writes are pinned to the configured branch. A store aimed at `agent-room` must
 be physically unable to commit onto `main` or repurpose someone's checkout.
 """
 
+import fcntl
 import json
+import os
 import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
@@ -36,6 +40,8 @@ from .errors import (
     AgentRoomError,
     AppendOnlyViolation,
     ConflictError,
+    DirtyCheckoutError,
+    LockTimeout,
     PushRaceError,
     WrongBranchError,
 )
@@ -45,6 +51,9 @@ MESSAGES_DIR = ".agent-room/messages"
 DEFAULT_BRANCH = "agent-room"
 GIT_TIMEOUT_SECONDS = 60
 DEFAULT_PUSH_RETRIES = 3
+DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+LOCK_POLL_SECONDS = 0.05
+WRITER_LOCK_NAME = "agent-room-writer.lock"
 
 
 class GitMessageStore:
@@ -62,6 +71,7 @@ class GitMessageStore:
         remote: str | None = None,
         *,
         push_retries: int = DEFAULT_PUSH_RETRIES,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
         author: tuple[str, str] = ("agent-room", "agent-room@localhost"),
     ) -> None:
         self.workdir = Path(workdir)
@@ -70,6 +80,9 @@ class GitMessageStore:
         self.push_retries = int(push_retries)
         if self.push_retries < 1:
             raise ValueError("push_retries must be >= 1")
+        self.lock_timeout = float(lock_timeout)
+        if self.lock_timeout < 0:
+            raise ValueError("lock_timeout must be >= 0")
         self.author = author
 
     # -- git plumbing ------------------------------------------------------
@@ -97,34 +110,40 @@ class GitMessageStore:
         must never be merged into main (design §7.1).
         """
         path = Path(workdir)
+        dir_existed = path.exists()
+        pre_existing_contents = sorted(p.name for p in path.iterdir()) if dir_existed else []
+        git_existed = (path / ".git").exists()
         path.mkdir(parents=True, exist_ok=True)
+
         store = cls(path, branch, **kwargs)
-        if not (path / ".git").exists():
-            store._git("init", "-q")
 
-        has_branch = store._git("rev-parse", "--verify", branch, check=False).returncode == 0
-        current = store.current_branch()
-
-        if has_branch:
-            # Never switch someone's checkout for them; just refuse.
-            if current != branch:
-                raise WrongBranchError(
-                    f"{path} already exists with {current or 'a detached HEAD'} "
-                    f"checked out; refusing to repurpose it for room branch "
-                    f"{branch!r}. Use a dedicated checkout."
-                )
-            return store
-
-        # Creating the branch is only safe in a repo that is not already
-        # somebody's working checkout.
-        has_commits = store._git("rev-parse", "--verify", "HEAD", check=False).returncode == 0
-        if has_commits:
+        if git_existed:
+            # A pre-existing repository is somebody's checkout. The only safe
+            # case is that it is *already* the room branch; anything else -
+            # including an unborn branch with untracked project files, where
+            # HEAD has no commits yet - is refused rather than repurposed.
+            on_branch = store.current_branch() == branch
+            has_branch = store._git(
+                "rev-parse", "--verify", branch, check=False
+            ).returncode == 0
+            if has_branch and on_branch:
+                return store
             raise WrongBranchError(
-                f"{path} is an existing repository on {current or 'a detached HEAD'} "
-                f"and has no {branch!r} branch; refusing to create room history "
-                "inside an unrelated checkout. Use a dedicated directory."
+                f"{path} is a pre-existing git repository with "
+                f"{store.current_branch() or 'an unborn/detached HEAD'} checked out; "
+                f"refusing to repurpose it as room branch {branch!r}. Only a "
+                "repository created by Agent Room may be initialised. Use a "
+                "dedicated empty directory."
             )
 
+        if dir_existed and pre_existing_contents:
+            raise WrongBranchError(
+                f"{path} already exists and is not empty ({pre_existing_contents[:5]}); "
+                f"refusing to create room history inside it. Use a dedicated "
+                "empty directory."
+            )
+
+        store._git("init", "-q")
         store._git("checkout", "-q", "--orphan", branch)
         store._git("rm", "-rq", "--cached", ".", check=False)
         readme = path / "README.agent-room.md"
@@ -139,19 +158,80 @@ class GitMessageStore:
         store._commit("agent-room: initialise append-only message branch")
         return store
 
-    def _commit(self, message: str) -> str:
+    def _commit(self, message: str, *pathspec: str) -> str:
         self.assert_room_branch()
-        self._git(
+        args = [
             "-c", f"user.name={self.author[0]}",
             "-c", f"user.email={self.author[1]}",
             "commit", "-q", "-m", message,
-        )
+        ]
+        if pathspec:
+            args += ["--", *pathspec]
+        self._git(*args)
         return self._git("rev-parse", "HEAD").stdout.strip()
 
     # -- paths -------------------------------------------------------------
     @staticmethod
     def message_path(thread_id: str, message_id: str) -> str:
         return f"{MESSAGES_DIR}/{thread_id}/{message_id}.json"
+
+    # -- single-writer lock ------------------------------------------------
+    def _git_dir(self) -> Path:
+        out = self._git("rev-parse", "--absolute-git-dir", check=False)
+        if out.returncode != 0:
+            raise AgentRoomError(f"{self.workdir} is not a git repository")
+        return Path(out.stdout.strip())
+
+    @contextmanager
+    def writer_lock(self):
+        """Exclusive lock over mutation of this one checkout.
+
+        Two processes sharing a checkout share a Git index, so without this one
+        can commit the other's staged message. `flock` is advisory but
+        sufficient here: every writer goes through this class.
+
+        The wait is bounded by `lock_timeout` and then raises - a stuck holder
+        must never hang a caller. This is a lock, not a poller: it acquires and
+        returns, and nothing runs in the background.
+        """
+        lock_path = self._git_dir() / WRITER_LOCK_NAME
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        deadline = time.monotonic() + self.lock_timeout
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeout(
+                            f"another process holds the Agent Room writer lock for "
+                            f"{self.workdir} (waited {self.lock_timeout}s)"
+                        )
+                    time.sleep(LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def assert_clean_checkout(self) -> None:
+        """Fail closed unless the dedicated checkout has nothing pending.
+
+        `git commit` takes the index, so a rewrite of an existing message that
+        someone already staged would ride along inside an otherwise innocent
+        message commit - and then be pushed as legitimate history.
+        """
+        proc = self._git("status", "--porcelain", check=False)
+        if proc.returncode != 0:
+            raise AgentRoomError(f"cannot inspect {self.workdir}: {proc.stderr.strip()}")
+        pending = [line for line in proc.stdout.splitlines() if line.strip()]
+        if pending:
+            raise DirtyCheckoutError(
+                f"{self.workdir} has uncommitted or staged changes and is not a "
+                f"clean room checkout: {pending[:5]}"
+            )
 
     # -- branch pinning ----------------------------------------------------
     def current_branch(self) -> str | None:
@@ -188,6 +268,7 @@ class GitMessageStore:
         cached = getattr(self, "_history_cache", None)
         if cached is not None and cached[0] == tip_sha:
             return cached[1]
+
 
         proc = self._git(
             "log", self.branch, "--reverse", "--format=%H",
@@ -227,8 +308,26 @@ class GitMessageStore:
                         "be modified, deleted or renamed"
                     )
 
-        self._history_cache = (tip_sha, added)
+        # A message_id must be unique across the whole room, not just within
+        # a thread path: resolve_message() looks up by id alone, so the same
+        # id under two threads would make every reference to it ambiguous.
+        by_id: dict[str, str] = {}
+        for path in added:
+            mid = path.rsplit("/", 1)[-1][: -len(".json")]
+            if mid in by_id:
+                raise ConflictError(
+                    f"message_id {mid} appears at more than one path "
+                    f"({by_id[mid]} and {path}); ids must be unique room-wide"
+                )
+            by_id[mid] = path
+
+        self._history_cache = (tip_sha, added, by_id)
         return added
+
+    def _id_index(self) -> dict:
+        """message_id -> path, for the whole room."""
+        self._history()
+        return self._history_cache[2]
 
     def verify_append_only(self) -> int:
         """Re-scan history. Raises on violation; returns the message count."""
@@ -239,8 +338,14 @@ class GitMessageStore:
         proc = self._git("show", f"{commit}:{path}", check=False)
         return proc.stdout if proc.returncode == 0 else None
 
-    def _load(self, path: str, commit: str) -> dict:
-        """Read one message as originally committed, fully validated."""
+    def _load_raw(self, path: str, commit: str) -> dict:
+        """Phase one: the message itself, with no reference resolution.
+
+        Structural validation at the trust boundary - a correctly resealed but
+        malformed artifact, or one written by another participant's library,
+        must still fail loudly. `agent_facing=False` so the reserved Issue #5
+        types stay structurally readable.
+        """
         raw = self._blob_at(commit, path)
         if raw is None:
             raise AppendOnlyViolation(
@@ -248,11 +353,46 @@ class GitMessageStore:
             )
         envelope = json.loads(raw)
         canonical.verify(envelope)
-        # Structural validation at the trust boundary: a correctly resealed
-        # but malformed artifact, or one written by another participant's
-        # library, must still fail loudly. agent_facing=False so the reserved
-        # Issue #5 types stay structurally readable.
-        validate_envelope(envelope, agent_facing=False)
+        validate_envelope(envelope, agent_facing=False, check_references=False)
+        return envelope
+
+    def _resolve_raw(self, message_id: str) -> dict | None:
+        """Resolve by id for *reference checking only* - phase-one load.
+
+        Returning a raw message is what bounds the recursion: validating A
+        resolves B structurally and stops, rather than validating B's own
+        references and so on around a cycle.
+        """
+        path = self._id_index().get(message_id)
+        if path is None:
+            return None
+        return self._load_raw(path, self._history()[path])
+
+    @property
+    def _raw_resolver(self):
+        store = self
+
+        class _Resolver:
+            @staticmethod
+            def resolve_message(message_id: str):
+                return store._resolve_raw(message_id)
+
+        return _Resolver()
+
+    def _load(self, path: str, commit: str) -> dict:
+        """Read one message as committed, with references resolved.
+
+        Phase two: a `supported` claim citing another message, or a reply whose
+        parent lives elsewhere in the room, is validated against history rather
+        than being rejected merely because reads had no resolver.
+        """
+        envelope = self._load_raw(path, commit)
+        validate_envelope(
+            envelope,
+            agent_facing=False,
+            resolver=self._raw_resolver,
+            check_references=True,
+        )
         return envelope
 
     def exists(self, thread_id: str, message_id: str) -> bool:
@@ -297,20 +437,20 @@ class GitMessageStore:
             yield self._load(path, history[path])
 
     def resolve_message(self, message_id: str) -> dict | None:
-        """Look a message up by id alone. Used to resolve references."""
-        history = self._history()
-        for path in history:
-            if path.rsplit("/", 1)[-1] == f"{message_id}.json":
-                return self._load(path, history[path])
-        return None
+        """Look a message up by id alone, room-wide."""
+        path = self._id_index().get(message_id)
+        if path is None:
+            return None
+        return self._load(path, self._history()[path])
 
     # -- append ------------------------------------------------------------
     def append(self, envelope: dict, *, resolver=None) -> dict:
         """Commit one sealed envelope.
 
         Returns `{"status": "created"|"duplicate", "commit": sha, ...}`.
-        Identical re-submission is idempotent; same id with different content
-        raises `ConflictError` and never overwrites.
+        Identical re-submission is idempotent; the same id with different
+        content — or under a different thread — raises `ConflictError` and
+        never overwrites.
 
         Validation happens here, not only in the caller: `append` is an
         exported trust boundary, so a malformed envelope with a correct digest
@@ -321,47 +461,60 @@ class GitMessageStore:
         validate_envelope(
             envelope,
             agent_facing=False,
-            resolver=resolver if resolver is not None else self,
+            resolver=resolver if resolver is not None else self._raw_resolver,
         )
 
         thread_id = envelope["thread_id"]
         message_id = envelope["message_id"]
         rel = self.message_path(thread_id, message_id)
 
-        history = self._history()
-        if rel in history:
-            existing = self._load(rel, history[rel])
-            if existing.get(canonical.DIGEST_FIELD) == envelope[canonical.DIGEST_FIELD]:
-                return {
-                    "status": "duplicate",
-                    "message_id": message_id,
-                    "thread_id": thread_id,
-                    "commit": history[rel],
-                    "path": rel,
-                }
-            raise ConflictError(
-                f"message_id {message_id} already exists with a different digest "
-                f"({existing.get(canonical.DIGEST_FIELD)} != "
-                f"{envelope[canonical.DIGEST_FIELD]}); refusing to overwrite"
-            )
+        with self.writer_lock():
+            # Whole checkout must be clean before we stage anything, or a
+            # rewrite someone already staged would be committed alongside.
+            self.assert_clean_checkout()
 
-        target = self.workdir / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Written in canonical form so the committed bytes are exactly what
-        # the digest covers.
-        target.write_text(canonical.canonical_text(envelope), encoding="utf-8")
-        self._git("add", rel)
-        commit = self._commit(f"agent-room: {envelope['type']} {message_id}")
+            existing_path = self._id_index().get(message_id)
+            if existing_path is not None:
+                if existing_path != rel:
+                    raise ConflictError(
+                        f"message_id {message_id} already exists at "
+                        f"{existing_path}; ids are unique room-wide and cannot "
+                        f"be reused under thread {thread_id!r}"
+                    )
+                existing = self._load_raw(existing_path, self._history()[existing_path])
+                if existing.get(canonical.DIGEST_FIELD) == envelope[canonical.DIGEST_FIELD]:
+                    return {
+                        "status": "duplicate",
+                        "message_id": message_id,
+                        "thread_id": thread_id,
+                        "commit": self._history()[existing_path],
+                        "path": rel,
+                    }
+                raise ConflictError(
+                    f"message_id {message_id} already exists with a different "
+                    f"digest ({existing.get(canonical.DIGEST_FIELD)} != "
+                    f"{envelope[canonical.DIGEST_FIELD]}); refusing to overwrite"
+                )
 
-        result = {
-            "status": "created",
-            "message_id": message_id,
-            "thread_id": thread_id,
-            "commit": commit,
-            "path": rel,
-        }
-        if self.remote:
-            result["push"] = self.push()
+            target = self.workdir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Written in canonical form so the committed bytes are exactly
+            # what the digest covers.
+            target.write_text(canonical.canonical_text(envelope), encoding="utf-8")
+            self._git("add", "--", rel)
+            # Commit this path only. Even if something else reached the index
+            # between the clean check and here, it cannot ride along.
+            commit = self._commit(f"agent-room: {envelope['type']} {message_id}", rel)
+
+            result = {
+                "status": "created",
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "commit": commit,
+                "path": rel,
+            }
+            if self.remote:
+                result["push"] = self._push_locked()
         return result
 
     # -- push with bounded retry -------------------------------------------
@@ -375,7 +528,15 @@ class GitMessageStore:
         if not self.remote:
             return {"pushed": False, "reason": "no remote configured"}
 
+        with self.writer_lock():
+            return self._push_locked()
+
+    def _push_locked(self) -> dict:
+        """Push body, assuming the writer lock is already held."""
         self.assert_room_branch()
+        # Never hand a violated history to the remote, and re-check after a
+        # rebase in case what we pulled in carries a rewrite.
+        self.verify_append_only()
         last_error = ""
         for attempt in range(1, self.push_retries + 1):
             proc = self._git("push", self.remote, f"{self.branch}:{self.branch}", check=False)
@@ -399,6 +560,7 @@ class GitMessageStore:
                     f"rebase onto {self.remote}/{self.branch} failed on attempt "
                     f"{attempt}: {rebase.stderr.strip() or last_error}"
                 )
+            self.verify_append_only()
         raise PushRaceError(
             f"push rejected after {self.push_retries} attempts: {last_error}"
         )

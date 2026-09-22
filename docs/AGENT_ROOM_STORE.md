@@ -60,7 +60,21 @@ is the authority**.
 - Same id + **different** digest → `ConflictError`; nothing written, no commit.
 - Acknowledging never touches a message artifact or the branch.
 
-`verify_append_only()` re-scans and returns the message count.
+`verify_append_only()` re-scans and returns the message count. It also runs
+**before every push attempt and again after any rebase**, so violated history
+is never handed to a remote.
+
+**Message ids are globally unique**, not merely unique within a thread path.
+The same id under two threads would make `resolve_message()` ambiguous, so it
+is refused on append and detected on read.
+
+**Reads are two-phase**, which is what bounds reference validation: phase one
+loads a message and validates it structurally with no resolution; phase two
+resolves its parent and evidence basis using *phase-one* loads of the
+referenced messages. Validating A therefore resolves B and stops — it never
+walks B's own references, so a cycle cannot recurse without bound. A valid
+cross-message `supported` claim reads back through `get`, `thread`,
+`iter_messages`, and a fresh store instance.
 
 **Ordering** is commit-add order — the same discovery the existing bridge uses.
 Independent of mtime and of filename sort; both are covered by tests that
@@ -72,10 +86,34 @@ deliberately put them in conflict with commit order.
 configured for `agent-room` cannot commit onto `main`, onto another branch, or
 onto a detached HEAD — it raises `WrongBranchError` and changes nothing.
 
-`initialise()` never repurposes someone's checkout: it refuses if the room
-branch exists but is not checked out, and refuses to create room history inside
-an existing repository that has commits on another branch. Use a dedicated
-directory.
+`initialise()` never repurposes someone's checkout. It refuses whenever `.git`
+already existed and the room branch is not already checked out — including an
+**unborn** repo with no commits and untracked files, which an earlier version
+would have switched to the orphan branch. It also refuses a pre-existing
+non-empty directory. Only a directory Agent Room creates may become a room
+branch.
+
+## Single-writer lock
+
+Two processes sharing one checkout share one Git index, so one could commit the
+other's staged message. `writer_lock()` takes an exclusive `fcntl` lock on
+`<git-dir>/agent-room-writer.lock`, held across the clean check, write, commit
+and any push/rebase. The wait is **bounded** by `lock_timeout` (default 10 s)
+and then raises `LockTimeout` — a stuck holder can never hang a caller. This is
+a lock, not a poller: nothing runs in the background.
+
+`ParticipantCursor` takes the same kind of lock on its own file and **re-reads
+under the lock before writing**, so two processes acknowledging different
+messages cannot lose each other's acknowledgements.
+
+## Clean checkout
+
+`append()` refuses to start unless `git status --porcelain` is empty
+(`DirtyCheckoutError`). Otherwise a rewrite of an already-committed message
+that someone had staged would be swept into the next message commit and then
+pushed as legitimate history. The commit is additionally restricted to the new
+message's pathspec, so nothing can ride along even if the index changes between
+the check and the commit.
 
 ## Trust boundary
 
@@ -111,7 +149,19 @@ citing each other into `supported` — `LLM_OUTPUT != EVIDENCE`, made mechanical
 
 `repo`/`run` evidence must pin a **full** Git object ID (40 hex for SHA-1, 64
 for SHA-256). Abbreviations and branch-like strings are refused: an
-abbreviation is not an immutable identity.
+abbreviation is not an immutable identity. Duplicate `evidence[].id` values are
+refused too — they would collapse during basis resolution and make
+admissibility depend on list order.
+
+## Safe identifiers
+
+`thread_id` becomes a Git path segment and is parsed back out of
+`git log --name-status` line by line, so it is restricted to
+`[A-Za-z0-9][A-Za-z0-9._-]{0,63}` — ASCII only, first character alphanumeric,
+at most 64 characters. Whitespace, tabs, newlines, control characters,
+separators, leading dots and non-ASCII are refused, since Git would quote or
+escape them and could break the parse or hide a committed message.
+`message_id` is a UUIDv7 and is path-safe by construction.
 
 `decision_request` mechanically requires `human_approval_required: true`.
 `challenge` and `retraction` must reference the message they contest or

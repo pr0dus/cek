@@ -66,3 +66,20 @@ class WrongBranchError(AgentRoomError):
 
 class UnresolvedReference(SchemaError):
     """A parent_id or evidence_basis entry does not resolve in the store."""
+
+
+class DirtyCheckoutError(AgentRoomError):
+    """The dedicated room checkout has uncommitted or staged changes.
+
+    Refused before an append, because `git commit` would otherwise sweep those
+    changes into the message commit - including a staged rewrite of an already
+    committed message, which would then be pushed as legitimate history.
+    """
+
+
+class LockTimeout(AgentRoomError):
+    """Another process holds the single-writer lock for this checkout.
+
+    Bounded by construction: the wait has a deadline and then fails, so a
+    stuck holder can never hang a caller indefinitely.
+    """
