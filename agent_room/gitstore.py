@@ -40,9 +40,12 @@ from .errors import (
     AgentRoomError,
     AppendOnlyViolation,
     ConflictError,
+    DeliveryError,
     DirtyCheckoutError,
     LockTimeout,
     PushRaceError,
+    SchemaError,
+    UnresolvedReference,
     WrongBranchError,
 )
 from .schema import validate_envelope
@@ -175,6 +178,14 @@ class GitMessageStore:
     def message_path(thread_id: str, message_id: str) -> str:
         return f"{MESSAGES_DIR}/{thread_id}/{message_id}.json"
 
+    @staticmethod
+    def identity_from_path(path: str) -> tuple[str, str]:
+        """The (thread_id, message_id) a committed path asserts."""
+        parts = path.split("/")
+        if len(parts) != 4 or not parts[3].endswith(".json"):
+            raise SchemaError(f"{path} is not a valid message path")
+        return parts[2], parts[3][: -len(".json")]
+
     # -- single-writer lock ------------------------------------------------
     def _git_dir(self) -> Path:
         out = self._git("rev-parse", "--absolute-git-dir", check=False)
@@ -279,6 +290,7 @@ class GitMessageStore:
             return {}
 
         added: dict[str, str] = {}
+        commit_seq: dict[str, int] = {}
         commit = ""
         for line in proc.stdout.splitlines():
             line = line.rstrip("\n")
@@ -288,6 +300,8 @@ class GitMessageStore:
                 c in "0123456789abcdef" for c in line.strip()
             ):
                 commit = line.strip()
+                if commit not in commit_seq:
+                    commit_seq[commit] = len(commit_seq)
                 continue
             parts = line.split("\t")
             status = parts[0].strip()
@@ -321,13 +335,22 @@ class GitMessageStore:
                 )
             by_id[mid] = path
 
-        self._history_cache = (tip_sha, added, by_id)
+        self._history_cache = (tip_sha, added, by_id, commit_seq)
         return added
 
     def _id_index(self) -> dict:
         """message_id -> path, for the whole room."""
         self._history()
         return self._history_cache[2]
+
+    def _commit_order(self) -> dict:
+        """commit sha -> position in the branch's commit order."""
+        self._history()
+        return self._history_cache[3]
+
+    def _position_of(self, path: str) -> int:
+        """Where `path` sits in commit order."""
+        return self._commit_order()[self._history()[path]]
 
     def verify_append_only(self) -> int:
         """Re-scan history. Raises on violation; returns the message count."""
@@ -354,6 +377,22 @@ class GitMessageStore:
         envelope = json.loads(raw)
         canonical.verify(envelope)
         validate_envelope(envelope, agent_facing=False, check_references=False)
+
+        # The path is how history indexes a message; the envelope is what
+        # consumers read. If they disagree, resolve_message() would hand back
+        # a body claiming an identity that is not indexed under it. Bind them
+        # before this artifact can take part in any reference resolution.
+        expected_thread, expected_id = self.identity_from_path(path)
+        if envelope["thread_id"] != expected_thread:
+            raise SchemaError(
+                f"{path} is committed under thread {expected_thread!r} but its "
+                f"envelope says {envelope['thread_id']!r}"
+            )
+        if envelope["message_id"] != expected_id:
+            raise SchemaError(
+                f"{path} is committed under message id {expected_id!r} but its "
+                f"envelope says {envelope['message_id']!r}"
+            )
         return envelope
 
     def _resolve_raw(self, message_id: str) -> dict | None:
@@ -370,6 +409,11 @@ class GitMessageStore:
 
     @property
     def _raw_resolver(self):
+        """Resolves against everything already committed.
+
+        Correct for `append`, where the new message is by definition later
+        than all existing history.
+        """
         store = self
 
         class _Resolver:
@@ -379,21 +423,66 @@ class GitMessageStore:
 
         return _Resolver()
 
+    def _resolver_as_of(self, position: int):
+        """Resolves only what existed strictly before `position`.
+
+        Historical causality: a message may rely only on state that existed
+        when it was committed. Without this, an out-of-band child could be
+        committed before its parent, or a `supported` claim before the evidence
+        it cites, and become retrospectively valid once the target was added -
+        which would make the audit trail meaningless.
+        """
+        store = self
+
+        class _AsOfResolver:
+            @staticmethod
+            def resolve_message(message_id: str):
+                path = store._id_index().get(message_id)
+                if path is None:
+                    return None
+                other = store._position_of(path)
+                if other >= position:
+                    raise UnresolvedReference(
+                        f"reference to {message_id} is not historically valid: it "
+                        f"was committed at position {other}, at or after the "
+                        f"referencing message at position {position}; a message "
+                        "may only rely on state that existed when it was committed"
+                    )
+                return store._load_raw(path, store._history()[path])
+
+        return _AsOfResolver()
+
     def _load(self, path: str, commit: str) -> dict:
         """Read one message as committed, with references resolved.
 
         Phase two: a `supported` claim citing another message, or a reply whose
         parent lives elsewhere in the room, is validated against history rather
-        than being rejected merely because reads had no resolver.
+        than being rejected merely because reads had no resolver - and only
+        against history that predates this message.
         """
         envelope = self._load_raw(path, commit)
         validate_envelope(
             envelope,
             agent_facing=False,
-            resolver=self._raw_resolver,
+            resolver=self._resolver_as_of(self._position_of(path)),
             check_references=True,
         )
         return envelope
+
+    def verify_store(self) -> int:
+        """Walk every committed message and check the whole contract.
+
+        Append-only history and global id uniqueness come from `_history()`;
+        path/envelope identity, digest, structure, parent/thread validity,
+        historical causality and evidence admissibility come from loading each
+        message. This is the gate delivery needs: `verify_append_only()` alone
+        would not notice a freshly fetched artifact that is malformed,
+        misfiled, or cites something that did not yet exist.
+        """
+        history = self._history()
+        for path, commit in history.items():
+            self._load(path, commit)
+        return len(history)
 
     def exists(self, thread_id: str, message_id: str) -> bool:
         return self.message_path(thread_id, message_id) in self._history()
@@ -508,13 +597,31 @@ class GitMessageStore:
 
             result = {
                 "status": "created",
+                "locally_committed": True,
+                "pushed": False,
                 "message_id": message_id,
                 "thread_id": thread_id,
                 "commit": commit,
                 "path": rel,
             }
             if self.remote:
-                result["push"] = self._push_locked()
+                # The message is already durable locally. If delivery fails the
+                # caller must learn *what was written*, or a naive retry of
+                # post() would mint a second UUID for the same logical message
+                # and duplicate it in permanent history.
+                try:
+                    result["push"] = self._push_locked()
+                    result["pushed"] = bool(result["push"].get("pushed"))
+                except AgentRoomError as exc:
+                    raise DeliveryError(
+                        f"message {message_id} is committed locally at {commit} "
+                        f"but was not delivered to {self.remote}: {exc}. "
+                        "Retry delivery with push(); do not repost.",
+                        message_id=message_id,
+                        commit=commit,
+                        path=rel,
+                        cause=exc,
+                    ) from exc
         return result
 
     # -- push with bounded retry -------------------------------------------
@@ -534,9 +641,11 @@ class GitMessageStore:
     def _push_locked(self) -> dict:
         """Push body, assuming the writer lock is already held."""
         self.assert_room_branch()
-        # Never hand a violated history to the remote, and re-check after a
-        # rebase in case what we pulled in carries a rewrite.
-        self.verify_append_only()
+        # Never hand invalid history to the remote. The full gate - not just
+        # append-only - because a rebase can pull in a freshly fetched artifact
+        # that is malformed, misfiled or cites something that did not yet
+        # exist, none of which an M/D/R scan would notice.
+        self.verify_store()
         last_error = ""
         for attempt in range(1, self.push_retries + 1):
             proc = self._git("push", self.remote, f"{self.branch}:{self.branch}", check=False)
@@ -560,7 +669,7 @@ class GitMessageStore:
                     f"rebase onto {self.remote}/{self.branch} failed on attempt "
                     f"{attempt}: {rebase.stderr.strip() or last_error}"
                 )
-            self.verify_append_only()
+            self.verify_store()
         raise PushRaceError(
             f"push rejected after {self.push_retries} attempts: {last_error}"
         )

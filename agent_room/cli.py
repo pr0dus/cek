@@ -83,7 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--thread-id", default=None)
 
     sub.add_parser("threads", help="list thread ids in commit order")
-    verify = sub.add_parser("verify", help="re-verify every stored digest")
+    verify = sub.add_parser(
+        "verify",
+        help="full-store integrity check (history, identity, schema, digests, "
+             "references, causality)",
+    )
     return p
 
 
@@ -130,10 +134,7 @@ def main(argv=None) -> int:
         elif args.command == "threads":
             _emit(room.store.thread_ids())
         elif args.command == "verify":
-            count = 0
-            for _ in room.store.iter_messages():   # read verifies each digest
-                count += 1
-            _emit({"verified": count})
+            _emit({"verified": room.store.verify_store()})
         elif args.command == "query":
             if args.participant_name:
                 _emit(room.by_participant(args.participant_name))

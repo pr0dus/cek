@@ -14,7 +14,7 @@ import subprocess
 import pytest
 
 from agent_room import AgentRoom, GitMessageStore, ParticipantCursor
-from agent_room.errors import PushRaceError
+from agent_room.errors import DeliveryError, PushRaceError
 from tests.conftest_agent_room import configure_identity, git
 
 
@@ -70,8 +70,16 @@ def test_retry_is_bounded_and_raises(tmp_path, bare_remote):
     store.push_retries = 2
     room = AgentRoom(store, "claude-code", None)
 
+    # push() itself reports the bounded exhaustion...
     with pytest.raises(PushRaceError, match="after 2 attempts"):
+        store.push()
+
+    # ...and post() surfaces it as a delivery failure, since by then the
+    # message is already committed locally.
+    with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "never lands"})
+    assert isinstance(exc.value.cause, PushRaceError)
+    assert "after 2 attempts" in str(exc.value.cause)
 
 
 def test_push_retries_must_be_at_least_one(tmp_path):
@@ -97,7 +105,10 @@ def test_a_failed_push_does_not_lose_the_local_commit(tmp_path, bare_remote):
     store.push_retries = 1
     room = AgentRoom(store, "claude-code", None)
 
-    with pytest.raises(PushRaceError):
+    with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "held locally"})
 
+    assert exc.value.locally_committed is True
+    assert exc.value.pushed is False
     assert [m["body"]["text"] for m in store.iter_messages()] == ["held locally"]
+    assert store.read("t1", exc.value.message_id)["body"]["text"] == "held locally"

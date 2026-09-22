@@ -77,6 +77,36 @@ class DirtyCheckoutError(AgentRoomError):
     """
 
 
+class DeliveryError(AgentRoomError):
+    """The message committed locally but could not be delivered to the remote.
+
+    Carries the identity of what was already written so a caller can retry
+    delivery instead of reposting under a fresh UUID — which would duplicate
+    the logical message in permanent history.
+    """
+
+    def __init__(self, message, *, message_id, commit, path, cause=None):
+        super().__init__(message)
+        self.locally_committed = True
+        self.pushed = False
+        self.message_id = message_id
+        self.commit = commit
+        self.path = path
+        self.cause = cause
+
+    def as_result(self) -> dict:
+        """The same facts in the shape `append()` returns on success."""
+        return {
+            "status": "created",
+            "locally_committed": True,
+            "pushed": False,
+            "message_id": self.message_id,
+            "commit": self.commit,
+            "path": self.path,
+            "error": str(self.cause or self),
+        }
+
+
 class LockTimeout(AgentRoomError):
     """Another process holds the single-writer lock for this checkout.
 

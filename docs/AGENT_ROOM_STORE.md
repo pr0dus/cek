@@ -60,13 +60,36 @@ is the authority**.
 - Same id + **different** digest → `ConflictError`; nothing written, no commit.
 - Acknowledging never touches a message artifact or the branch.
 
-`verify_append_only()` re-scans and returns the message count. It also runs
-**before every push attempt and again after any rebase**, so violated history
-is never handed to a remote.
+`verify_append_only()` is the cheap primitive: it re-scans history for M/D/R
+and duplicate ids and returns the message count.
+
+`verify_store()` is the **full gate**. It walks every committed message and
+checks append-only history, path/envelope identity, structural schema, digest,
+global id uniqueness, parent/thread validity, historical reference causality
+and evidence admissibility. It runs **before the first push attempt and again
+after every successful fetch/rebase**, so a writer never extends or delivers
+history that is append-only yet semantically corrupt. The CLI `verify` command
+uses the same gate and reports the verified count.
 
 **Message ids are globally unique**, not merely unique within a thread path.
 The same id under two threads would make `resolve_message()` ambiguous, so it
 is refused on append and detected on read.
+
+**Path and envelope identity are bound.** On every read the committed path
+must agree with the sealed body: `.agent-room/messages/<thread>/<id>.json`
+requires `envelope.thread_id == <thread>` and `envelope.message_id == <id>`.
+A valid digest is not enough — history indexes the path while consumers read
+the body, so a mismatch would let `resolve_message()` return an envelope
+claiming an identity it is not filed under. Checked before the artifact can
+participate in any reference resolution.
+
+**References obey historical causality.** A parent or cross-message
+`evidence_basis` entry must resolve to a message whose add commit is *strictly
+earlier* in commit order. Self-reference, forward reference, and two messages
+added in the same commit are all refused — a message may only rely on state
+that existed when it was committed, otherwise a claim could become
+retrospectively supported by evidence added later. In-message evidence ids are
+unaffected: they live inside the same envelope.
 
 **Reads are two-phase**, which is what bounds reference validation: phase one
 loads a message and validates it structurally with no resolution; phase two
@@ -220,6 +243,21 @@ rebase, **bounded** by `push_retries` (default 3), then raises `PushRaceError`.
 A failed push never loses the local commit. If the fetch itself fails there is
 nothing to rebase onto, so the attempt is retried within the bound rather than
 misreported as a rebase failure.
+
+## Delivery and partial failure
+
+`append()` commits locally and then pushes. If the commit succeeds but delivery
+fails, the message is **already durable locally**, so a naive retry of `post()`
+would mint a second UUID and duplicate the logical message in permanent
+history. That state is therefore explicit:
+
+- success returns `locally_committed: true, pushed: true`;
+- a local-only store returns `locally_committed: true, pushed: false`;
+- delivery failure raises **`DeliveryError`**, carrying `message_id`, `commit`,
+  `path`, the underlying `cause`, and `locally_committed=True` / `pushed=False`
+  (`as_result()` renders the same facts as a dict).
+
+The correct recovery is to retry `push()`, never to repost.
 
 ## Participant-local state
 
