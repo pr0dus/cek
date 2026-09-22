@@ -347,9 +347,11 @@ disagrees with message history, the history wins.
 - Threads are never deleted or compacted. A concluded thread gets a terminal `decision_request` →
   human `approval`/`rejection`.
 - Cross-thread references are by `message_id`; threads are not merged.
-- Ordering is commit order, reusing §1.6 item 2. Concurrent pushes from two participants are
-  resolved by Git; because every file is write-once with a content-derived name, **there are no
-  content conflicts** — only occasional non-fast-forward retries.
+- Ordering is commit order, reusing §1.6 item 2. Each message occupies a **unique immutable path
+  derived from its UUIDv7 `message_id`**, so two participants do not intentionally write the same
+  message path. They can still race on the Git branch ref: a concurrent push may be rejected as
+  non-fast-forward, and the loser must fetch and rebase-or-retry before pushing again. The full
+  `envelope_sha256` is integrity and idempotency metadata — it is never the filename.
 
 ---
 
