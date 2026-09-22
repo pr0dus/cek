@@ -10,9 +10,13 @@ import sys
 
 from . import canonical
 from .cursor import ParticipantCursor
-from .errors import AgentRoomError
+from .errors import AgentRoomError, DeliveryError
 from .gitstore import DEFAULT_BRANCH, GitMessageStore
 from .room import AgentRoom
+
+
+#: Distinguishes "committed locally, not delivered" from an ordinary failure.
+EXIT_PARTIAL_DELIVERY = 3
 
 
 def _room(args) -> AgentRoom:
@@ -83,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--thread-id", default=None)
 
     sub.add_parser("threads", help="list thread ids in commit order")
+    sub.add_parser(
+        "push",
+        help="retry delivery of already-committed messages to --remote "
+             "(one shot, bounded retry; not a daemon)",
+    )
     verify = sub.add_parser(
         "verify",
         help="full-store integrity check (history, identity, schema, digests, "
@@ -133,6 +142,8 @@ def main(argv=None) -> int:
             _emit(room.acknowledge(args.message_id))
         elif args.command == "threads":
             _emit(room.store.thread_ids())
+        elif args.command == "push":
+            _emit(room.store.push())
         elif args.command == "verify":
             _emit({"verified": room.store.verify_store()})
         elif args.command == "query":
@@ -145,6 +156,13 @@ def main(argv=None) -> int:
             else:
                 _emit(room.all_messages())
         return 0
+    except DeliveryError as exc:
+        # The message is already durable locally. Emit that as data on stdout
+        # so a CLI-only participant can retry `push` rather than reposting
+        # under a fresh UUID and duplicating the message permanently.
+        _emit(exc.as_result())
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_PARTIAL_DELIVERY
     except AgentRoomError as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

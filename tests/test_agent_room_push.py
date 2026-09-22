@@ -54,6 +54,14 @@ def test_non_fast_forward_race_is_resolved_by_rebase(tmp_path, bare_remote):
     assert result["push"]["pushed"] is True
     assert result["push"]["attempts"] >= 2, "expected at least one rejected attempt"
 
+    # The rebase rewrote our local commit, so the reported SHA must be the one
+    # that actually holds the message now - not the pre-rebase SHA.
+    current = second.store.current_add_commit(result["path"])
+    assert result["commit"] == current
+    assert second.store._git("cat-file", "-e", result["commit"]).returncode == 0
+    assert result["commit"] in second.store._git(
+        "log", "--format=%H", "agent-room").stdout.split()
+
     texts = {m["body"]["text"] for m in second.store.iter_messages()}
     assert texts == {"from claude", "claude again", "from openai"}
 

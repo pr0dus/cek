@@ -172,9 +172,15 @@ citing each other into `supported` — `LLM_OUTPUT != EVIDENCE`, made mechanical
 
 `repo`/`run` evidence must pin a **full** Git object ID (40 hex for SHA-1, 64
 for SHA-256). Abbreviations and branch-like strings are refused: an
-abbreviation is not an immutable identity. Duplicate `evidence[].id` values are
-refused too — they would collapse during basis resolution and make
-admissibility depend on list order.
+abbreviation is not an immutable identity.
+
+Identifier shapes are checked before they are used as lookup keys, so
+malformed input fails as `SchemaError`/`ClaimStateError` and never escapes as a
+raw Python `TypeError`: an `evidence[].id`, if present, must be a non-empty
+string, and every `evidence_basis` entry must be a non-empty string.
+Duplicates are refused on both — duplicate evidence ids would collapse during
+resolution and make admissibility depend on list order, and a duplicated basis
+entry is a redundant citation.
 
 ## Safe identifiers
 
@@ -223,6 +229,7 @@ python3 -m agent_room.cli --repo <dir> --participant <name> [--state-dir <dir>] 
 | `ack` | acknowledge (not agreement) |
 | `query` | `--participant-name` / `--project-repo` / `--thread-id` |
 | `threads` | thread ids in commit order |
+| `push` | retry delivery of already-committed messages (one shot, bounded) |
 | `verify` | re-verify every stored digest |
 
 Example:
@@ -258,6 +265,27 @@ history. That state is therefore explicit:
   (`as_result()` renders the same facts as a dict).
 
 The correct recovery is to retry `push()`, never to repost.
+
+**The reported `commit` is always current.** A non-fast-forward rebase rewrites
+local commit SHAs, so both the success result and `DeliveryError.commit` report
+the message's add commit *as it exists in room history after* any push/rebase
+processing — never the pre-rebase SHA.
+
+**From the CLI**, a partial delivery prints the same facts as JSON on stdout
+and exits **3** (`EXIT_PARTIAL_DELIVERY`), distinct from `2` for ordinary
+errors:
+
+```bash
+$ agent-room ... post --thread-id t1 --type observation --body '{"text":"..."}'
+{ "locally_committed": true, "pushed": false,
+  "message_id": "...", "commit": "...", "path": "...", "error": "..." }
+# exit 3 — then, once the remote accepts again:
+$ agent-room ... push
+{ "pushed": true, "attempts": 1 }
+```
+
+`push` is one shot: it calls the same bounded `store.push()` and exits. It does
+not wait, loop, or run anything in the background.
 
 ## Participant-local state
 

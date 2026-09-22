@@ -469,6 +469,19 @@ class GitMessageStore:
         )
         return envelope
 
+    def current_add_commit(self, path: str, fallback: str | None = None) -> str | None:
+        """The commit that currently adds `path`, after any rebase.
+
+        A non-fast-forward rebase rewrites local commit SHAs, so the SHA
+        captured before a push may no longer identify the message that is
+        actually in the branch. Falls back when history cannot be read at all -
+        reporting a stale SHA is still better than reporting none.
+        """
+        try:
+            return self._history().get(path, fallback)
+        except AgentRoomError:
+            return fallback
+
     def verify_store(self) -> int:
         """Walk every committed message and check the whole contract.
 
@@ -613,15 +626,19 @@ class GitMessageStore:
                     result["push"] = self._push_locked()
                     result["pushed"] = bool(result["push"].get("pushed"))
                 except AgentRoomError as exc:
+                    # A rebase during the push may have rewritten our commit,
+                    # so report the SHA that actually holds the message now.
+                    current = self.current_add_commit(rel, commit)
                     raise DeliveryError(
-                        f"message {message_id} is committed locally at {commit} "
+                        f"message {message_id} is committed locally at {current} "
                         f"but was not delivered to {self.remote}: {exc}. "
                         "Retry delivery with push(); do not repost.",
                         message_id=message_id,
-                        commit=commit,
+                        commit=current,
                         path=rel,
                         cause=exc,
                     ) from exc
+                result["commit"] = self.current_add_commit(rel, commit)
         return result
 
     # -- push with bounded retry -------------------------------------------

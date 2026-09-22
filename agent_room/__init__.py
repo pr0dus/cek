@@ -8,12 +8,18 @@ here executes anything, grants authority, or connects to NEWI cognition.
 
 from .errors import (
     AgentRoomError,
+    AppendOnlyViolation,
     ClaimStateError,
     ConflictError,
+    DeliveryError,
+    DirtyCheckoutError,
     ForbiddenOperation,
     IntegrityError,
+    LockTimeout,
     PushRaceError,
     SchemaError,
+    UnresolvedReference,
+    WrongBranchError,
 )
 from .room import AgentRoom
 from .gitstore import GitMessageStore
@@ -24,10 +30,16 @@ __all__ = [
     "GitMessageStore",
     "ParticipantCursor",
     "AgentRoomError",
+    "AppendOnlyViolation",
     "SchemaError",
     "IntegrityError",
     "ConflictError",
     "ClaimStateError",
+    "DeliveryError",
+    "DirtyCheckoutError",
     "ForbiddenOperation",
+    "LockTimeout",
     "PushRaceError",
+    "UnresolvedReference",
+    "WrongBranchError",
 ]

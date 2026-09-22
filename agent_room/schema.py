@@ -90,6 +90,14 @@ def validate_evidence(evidence: Any) -> None:
         _require(isinstance(ref, dict), f"evidence[{i}] must be an object")
         ref_id = ref.get("id")
         if ref_id is not None:
+            # Shape first: these ids are used as dict/set keys during basis
+            # resolution, so an array or object would escape as a raw
+            # TypeError instead of a controlled schema error.
+            _require(
+                isinstance(ref_id, str) and ref_id.strip() != "",
+                f"evidence[{i}].id must be a non-empty string, got "
+                f"{type(ref_id).__name__} {ref_id!r}",
+            )
             # Duplicate ids would collapse when basis entries are resolved,
             # making admissibility depend on list order - an inadmissible
             # entry could hide behind an admissible one with the same id.
@@ -167,6 +175,22 @@ def validate_claim(claim, evidence=None, resolver=None, *, check_references: boo
         raise ClaimStateError(
             "claim.status 'supported' requires a non-empty evidence_basis"
         )
+
+    # Same reasoning as evidence ids: a basis entry is used as a lookup key,
+    # so its shape must be checked before it is used as one.
+    seen_basis: set = set()
+    for i, entry in enumerate(basis):
+        if not isinstance(entry, str) or entry.strip() == "":
+            raise ClaimStateError(
+                f"claim.evidence_basis[{i}] must be a non-empty string, got "
+                f"{type(entry).__name__} {entry!r}"
+            )
+        if entry in seen_basis:
+            raise ClaimStateError(
+                f"claim.evidence_basis[{i}] {entry!r} is duplicated; a basis "
+                "entry must be cited once"
+            )
+        seen_basis.add(entry)
 
     in_message = {
         ref["id"]: ref

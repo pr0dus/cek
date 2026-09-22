@@ -233,6 +233,10 @@ def test_writer_refuses_to_push_on_top_of_corrupt_remote_history(tmp_path, bare_
         room_b.post(thread_id="t1", type="observation", body={"text": "mine"})
     if isinstance(exc.value, DeliveryError):
         assert isinstance(exc.value.cause, SchemaError)
+        # Delivery failed *after* a successful rebase, so the reported commit
+        # must be the post-rebase SHA that actually holds the message.
+        assert exc.value.commit == second.current_add_commit(exc.value.path)
+        assert second._git("cat-file", "-e", exc.value.commit).returncode == 0
 
 
 def test_cli_verify_uses_the_full_gate(store, room, capsys):
