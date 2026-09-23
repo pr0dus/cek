@@ -6,13 +6,20 @@ changed is a report, not a measurement. So nothing here is supplied by the
 builder. Every path is discovered from Git and every digest is computed from
 the bytes on disk.
 
-Four independent comparisons are recorded per path, because "changed" is not
+Five independent comparisons are recorded per path, because "changed" is not
 one question:
 
 - base vs worktree — what a reviewer would actually read;
-- base vs index — what is staged;
+- base vs index — how the index differs from the authorised baseline;
+- HEAD vs index — what is **staged but not committed**;
 - index vs worktree — what is staged but since edited again;
 - untracked — files Git is not yet tracking at all.
+
+The HEAD comparison earns its place: once HEAD has moved past the baseline,
+"base vs index" reports every committed change as staged, so it cannot answer
+"is anything uncommitted here?". A proof bound to a commit needs that answer
+exactly, because `git archive` builds from the commit and silently omits
+whatever is only in the index.
 
 Deletions, symlinks and mode changes are entries like any other. A symlink is
 hashed over its *target*, never followed: following it would silently hash a
@@ -33,7 +40,7 @@ from . import canonical
 from .errors import AgentRoomError
 from .process import run_bounded, sanitised_env
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 GIT_TIMEOUT_SECONDS = 60
 
 #: What this manifest does and does not bind, stated inside the hashed payload
@@ -189,7 +196,7 @@ def _ignored(workdir: Path) -> dict:
     }
 
 
-def _entry(workdir: Path, path: str, base_wt, base_index, index_wt,
+def _entry(workdir: Path, path: str, base_wt, base_index, head_index, index_wt,
            tracked: bool) -> dict:
     """Measure one path on disk. Never follows a symlink."""
     full = workdir / path
@@ -221,6 +228,7 @@ def _entry(workdir: Path, path: str, base_wt, base_index, index_wt,
         "tracked": tracked,
         "base_vs_worktree": base_wt,
         "base_vs_index": base_index,
+        "head_vs_index": head_index,
         "index_vs_worktree": index_wt,
         "kind": kind,
         "mode": mode,
@@ -265,13 +273,15 @@ def snapshot_manifest(workdir, base_commit: str) -> dict:
     untracked = _untracked(path)
 
     head = _git(path, "rev-parse", "HEAD", check=False).decode("ascii", "replace").strip()
-    tracked_paths = set(base_wt) | set(base_index) | set(index_wt)
+    head_index = _name_status(path, "--cached", "HEAD") if head else {}
+    tracked_paths = set(base_wt) | set(base_index) | set(head_index) | set(index_wt)
     entries = [
-        _entry(path, p, base_wt.get(p), base_index.get(p), index_wt.get(p), True)
+        _entry(path, p, base_wt.get(p), base_index.get(p), head_index.get(p),
+               index_wt.get(p), True)
         for p in sorted(tracked_paths)
     ]
     entries += [
-        _entry(path, p, None, None, None, False)
+        _entry(path, p, None, None, None, None, False)
         for p in sorted(set(untracked) - tracked_paths)
     ]
     entries.sort(key=lambda e: e["path"])
@@ -293,6 +303,9 @@ def snapshot_manifest(workdir, base_commit: str) -> dict:
         "counts": {
             "changed_vs_base": sum(1 for e in entries if e["base_vs_worktree"]),
             "staged": sum(1 for e in entries if e["base_vs_index"]),
+            # The one that answers "is anything uncommitted?": staged against
+            # HEAD, not against the baseline HEAD may have moved past.
+            "staged_vs_head": sum(1 for e in entries if e["head_vs_index"]),
             "unstaged": sum(1 for e in entries if e["index_vs_worktree"]),
             "deleted": sum(1 for e in entries if e["base_vs_worktree"] == "D"),
             "untracked": sum(1 for e in entries if not e["tracked"]),

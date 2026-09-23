@@ -50,6 +50,7 @@ from .errors import (
     LockTimeout,
     PushAmbiguous,
     PushRaceError,
+    ReceiptStateError,
     SchemaError,
     UnresolvedReference,
     WrongBranchError,
@@ -117,6 +118,9 @@ class GitMessageStore:
         if self.lock_timeout < 0:
             raise ValueError("lock_timeout must be >= 0")
         self.author = author
+        #: Depth of nested `writer_lock()` entries in this process. See the
+        #: re-entrancy note there.
+        self._lock_depth = 0
 
     # -- git plumbing ------------------------------------------------------
     def _git_bytes(self, *args: str) -> bytes:
@@ -369,7 +373,24 @@ class GitMessageStore:
         The wait is bounded by `lock_timeout` and then raises - a stuck holder
         must never hang a caller. This is a lock, not a poller: it acquires and
         returns, and nothing runs in the background.
+
+        **Re-entrant within one store instance.** A caller that must make a
+        decision and write the result atomically - `release.reserve` checking a
+        one-shot nonce and then consuming it - has to hold this across both,
+        and the append inside takes it again. `flock` is per file descriptor,
+        so a second `os.open` in the same process would block on itself
+        forever. Counting the depth and reusing the descriptor is what makes
+        the nesting safe; it changes nothing between processes, which is where
+        the actual exclusion matters.
         """
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+
         lock_path = self._git_dir() / WRITER_LOCK_NAME
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         deadline = time.monotonic() + self.lock_timeout
@@ -385,9 +406,11 @@ class GitMessageStore:
                             f"{self.workdir} (waited {self.lock_timeout}s)"
                         )
                     time.sleep(LOCK_POLL_SECONDS)
+            self._lock_depth = 1
             try:
                 yield
             finally:
+                self._lock_depth = 0
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -1085,6 +1108,59 @@ class GitMessageStore:
                     return token
         return fallback
 
+    RECEIPT_TERMINAL = frozenset({"executed", "failed"})
+
+    @staticmethod
+    def assert_receipt_state_machine(messages) -> dict:
+        """One-shot means one lifecycle per nonce, checked against history.
+
+        `unused -> uncertain -> executed|failed`, and nothing after a terminal
+        state. The write path enforces this under the writer lock; this is the
+        same rule applied to a history someone else produced, because a branch
+        that already contains two reservations for one nonce is evidence the
+        action was released twice and must not be read past.
+        """
+        sequences: dict = {}
+        for envelope in messages:
+            if envelope.get("type") != "execution_receipt":
+                continue
+            receipt = envelope["receipt"]
+            key = (envelope["thread_id"], receipt["request_message_id"],
+                   receipt["action_nonce"])
+            sequences.setdefault(key, []).append((envelope, receipt))
+
+        for (thread_id, request_id, nonce), entries in sequences.items():
+            where = f"nonce {nonce} on request {request_id} in thread {thread_id!r}"
+            first_env, first = entries[0][0], entries[0][1]
+            if first["status"] != "uncertain":
+                raise ReceiptStateError(
+                    f"the first receipt for {where} is {first['status']!r}; a "
+                    "one-shot action is reserved as 'uncertain' before it is "
+                    f"performed, so {first_env['message_id']} records an "
+                    "outcome for an action that was never reserved"
+                )
+            terminal = None
+            for envelope, receipt in entries[1:]:
+                if receipt["status"] == "uncertain":
+                    raise ReceiptStateError(
+                        f"{envelope['message_id']} is a second reservation for "
+                        f"{where}; a one-shot action cannot be reserved twice, "
+                        "and a history containing two reservations means it "
+                        "was released twice"
+                    )
+                if terminal is not None:
+                    raise ReceiptStateError(
+                        f"{envelope['message_id']} adds a second terminal "
+                        f"receipt for {where}, which already settled as "
+                        f"{terminal!r}; there is no transition out of a "
+                        "terminal state"
+                    )
+                terminal = receipt["status"]
+        return {
+            key: [r["status"] for _e, r in entries]
+            for key, entries in sequences.items()
+        }
+
     def verify_store(self) -> int:
         """Walk every committed message and check the whole contract.
 
@@ -1094,10 +1170,14 @@ class GitMessageStore:
         message. This is the gate delivery needs: `verify_append_only()` alone
         would not notice a freshly fetched artifact that is malformed,
         misfiled, or cites something that did not yet exist.
+
+        The receipt lifecycle is checked here too, because an impossible
+        sequence of receipts is a statement about the past that no later read
+        should be allowed to build on.
         """
         history = self._history()
-        for path, commit in history.items():
-            self._load(path, commit)
+        loaded = [self._load(path, commit) for path, commit in history.items()]
+        self.assert_receipt_state_machine(loaded)
         return len(history)
 
     def exists(self, thread_id: str, message_id: str) -> bool:

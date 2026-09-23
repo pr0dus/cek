@@ -48,6 +48,7 @@ from .limits import (
     LimitExceeded,
     assert_within,
 )
+from .snapshot import FULL_OID_RE, verify_manifest
 from .process import isolated_env, run_bounded, sanitised_env
 
 PROOF_SCHEMA_VERSION = 2
@@ -192,13 +193,9 @@ def _write_artifact(run_dir: Path, proof_id: str, record: dict,
     """Content-addressed, exclusive-create, read-only once written."""
     body = {k: v for k, v in record.items() if k not in UNHASHED_FIELDS}
     body["proof_sha256"] = record["proof_sha256"]
-    # Streams are stored whole only while they fit. The digests above always
-    # cover the complete output, so omitting the body never hides a result.
+    # Bounded at the source, so what is here is all that was ever accepted.
     for name, raw in (("stdout", stdout), ("stderr", stderr)):
-        if len(raw) <= MAX_PROOF_STREAM_BYTES:
-            body[name] = raw.decode("utf-8", "replace")
-        else:
-            body[f"{name}_omitted"] = True
+        body[name] = raw.decode("utf-8", "replace")
     payload = canonical.canonical_text(body).encode("utf-8")
     assert_within(len(payload), MAX_PROOF_ARTIFACT_BYTES, "proof artifact")
 
@@ -247,15 +244,27 @@ def run_proof(
     started, clock = _now_iso(), time.monotonic()
     status, exit_status, error, teardown = "completed", None, None, ""
     stdout, stderr = b"", b""
+    limited = False
     try:
         result = run_bounded(
             argv, cwd=cwd_path, timeout=timeout,
             env=env if env is not None else isolated_env(),
+            max_output_bytes=MAX_PROOF_STREAM_BYTES,
         )
         stdout, stderr, teardown = result.stdout, result.stderr, result.teardown
+        limited = result.output_limited
         if result.timed_out:
             status = "timeout"
             error = f"timed out after {timeout}s; process group {teardown}"
+        elif limited:
+            # Fail closed and say so. The command is never re-run with a
+            # looser bound: a proof that floods its output is a result.
+            status = "output_limited"
+            error = (
+                f"{', '.join(result.limited_streams)} exceeded the "
+                f"{MAX_PROOF_STREAM_BYTES} byte hard limit; the process group "
+                f"was {teardown}"
+            )
         else:
             exit_status = result.returncode
     except AgentRoomError as exc:
@@ -286,6 +295,11 @@ def run_proof(
         "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
         "stdout_tail": _tail(stdout, tail_bytes),
         "stderr_tail": _tail(stderr, tail_bytes),
+        # Says exactly what the digests cover. When a hard output bound was
+        # reached the process was killed mid-stream, so they cover the bytes
+        # that were accepted and there are no "complete" bytes to speak of.
+        "output_limited": limited,
+        "digest_covers": "captured-prefix" if limited else "complete-output",
     }
     record["proof_sha256"] = proof_digest(record)
     record.update(_write_artifact(out_dir, proof_id, record, stdout, stderr))
@@ -300,8 +314,27 @@ def isolated_checkout(repo, commit: str, dest) -> dict:
     files, no `sitecustomize.py` that happened to be sitting beside the source.
     That is what makes a proof reproducible from a binding instead of from
     whatever the builder's machine also had lying around.
+
+    The commit must be a full object id naming a commit. `HEAD`, `main~2` and
+    `v1.0^{}` are all things `git archive` would happily accept and none of
+    them is an immutable identity; a proof bound to one would be bound to
+    whatever that expression resolved to at the time.
     """
     repo_path, dest_path = Path(repo), Path(dest)
+    if not isinstance(commit, str) or not FULL_OID_RE.match(commit):
+        raise ProofError(
+            f"commit {commit!r} must be a full Git object id; revision syntax "
+            "is not an immutable identity and cannot bind a proof"
+        )
+    kind = run_bounded(
+        ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+         "cat-file", "-t", commit],
+        cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS, env=sanitised_env(),
+    )
+    if kind.stdout.decode("ascii", "replace").strip() != "commit":
+        raise ProofError(
+            f"{commit} is not a commit object in {repo_path}"
+        )
     result = run_bounded(
         ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
          "archive", "--format=tar", commit],
@@ -358,6 +391,9 @@ def run_isolated_proof(
     """
     validate_proof_id(proof_id)
     if manifest is not None:
+        # Verify before believing anything it says. A manifest is just a dict
+        # until its digest is recomputed from its own contents.
+        verify_manifest(manifest)
         if manifest.get("head_commit") != commit:
             raise ProofError(
                 f"the manifest was measured at head {manifest.get('head_commit')}, "
@@ -365,13 +401,33 @@ def run_isolated_proof(
                 "was measured"
             )
         counts = manifest.get("counts") or {}
-        dirty = {k: counts.get(k, 0) for k in ("unstaged", "untracked")}
+        # Staged counts too, and its omission was the hole: a staged change is
+        # not in the commit, so `git archive` silently leaves it out and the
+        # proof describes a state nobody measured.
+        dirty = {k: counts.get(k, 0)
+                 for k in ("staged_vs_head", "unstaged", "untracked")}
         if any(dirty.values()):
             raise ProofError(
                 f"the measured state has uncommitted content ({dirty}); commit "
                 "it before binding a proof to it, or the isolated checkout "
-                "cannot reproduce what was measured"
+                "cannot reproduce what was measured. A staged change counts: "
+                "the archive is built from the commit, not from the index."
             )
+        # The binding comes from the verified manifest, never from the caller.
+        supplied = kwargs.pop("snapshot_sha256", None)
+        if supplied is not None and supplied != manifest["manifest_sha256"]:
+            raise ProofError(
+                f"the supplied snapshot digest {supplied[:12]}… contradicts the "
+                f"manifest's own {manifest['manifest_sha256'][:12]}…; an "
+                "isolated proof derives its binding from the manifest it "
+                "verified"
+            )
+        kwargs["snapshot_sha256"] = manifest["manifest_sha256"]
+    elif kwargs.get("snapshot_sha256") is not None:
+        raise ProofError(
+            "a snapshot digest without the manifest it came from binds "
+            "nothing checkable; pass the manifest instead"
+        )
 
     parent = Path(run_dir).resolve().parent
     workdir = Path(tempfile.mkdtemp(prefix=f"agent-room-proof-{proof_id}-",

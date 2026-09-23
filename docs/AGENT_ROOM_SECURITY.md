@@ -30,6 +30,7 @@ Not protected against by S1:
 |---|---|---|
 | 1 | write access to the Agent Room Git remote | **S2** — participant and human signatures |
 | 2 | injected requests on the existing bridge control branch | **S3** — narrow transport |
+| — | a descendant that detaches from the process group | **S3** — cgroup/PID namespace |
 | 3 | a compromised Claude or Codex process | **S2** (partially; capability limits already apply) |
 | 4 | a compromised ChatGPT/GitHub connector credential | **S2 + S3** |
 | 9 | remote branch rollback or force replacement | **S2** — trust anchor and last-seen checkpoint |
@@ -68,13 +69,54 @@ produces a second artifact; it never rewrites the first. `verify_artifact`
 rehashes the stored bytes and checks them against both the record's digest and
 the one in its filename.
 
-### Timeouts kill the family
+### Timeouts kill the process group — and only the process group
 
 Proof and model invocations start their own session, and a timeout or an
-interrupt tears down the whole process group: SIGTERM, a bounded grace period,
-then SIGKILL. The previous `subprocess.run(timeout=…)` boundary reaped only the
-direct child; a `sleep` it had spawned survived. Regressions prove no
-descendant outlives a timeout for proof, Claude and Codex.
+interrupt tears down the whole process **group**: SIGTERM, a bounded grace
+period, then SIGKILL. The previous `subprocess.run(timeout=…)` boundary reaped
+only the direct child; a `sleep` it had spawned survived. Regressions prove no
+ordinary descendant outlives a timeout, for proof, Claude and Codex.
+
+**The guarantee stops at the group, and that was measured rather than assumed.**
+A descendant that calls `setsid()` has left the group by definition and survives
+`killpg`. `test_DETACHED_CHILD_TIMEOUT` asserts that it survives — observed pgid
+equal to its own pid — so the limit stays visible instead of being papered over.
+Closing it needs a cgroup or a PID namespace, which belongs to the S3 systemd
+transport boundary and is recorded there as a blocker. Do not read "the whole
+process tree is killed" into this section: what is enforced is every descendant
+that remains in the group.
+
+### Output is bounded while it is produced
+
+An earlier version set `MAX_PROOF_STREAM_BYTES` and then applied it to what got
+*stored*, after `communicate()` had already buffered the entire stream in
+memory. That is not a resource bound. Output is now read incrementally against a
+hard cap on each stream, and crossing it tears down the process group rather
+than continuing to read — for proofs, for Claude and for Codex. Codex's
+structured result arrives as a file, which the stream cap never sees, so its
+size is checked before it is read.
+
+When a cap is reached the result says so: a proof records
+`status: "output_limited"` and `digest_covers: "captured-prefix"`, because the
+process was killed mid-stream and the digest covers the bytes that were
+accepted, not bytes that were never read. A limited run is never retried with a
+looser bound.
+
+### A bound proof binds the commit it claims
+
+`run_isolated_proof` verifies a supplied manifest's digest before believing
+anything it says, requires the manifest to describe exactly the commit being
+archived, and rejects **staged**, unstaged and untracked state. Staged mattered
+and was missed: `git archive` builds from the commit, so a staged change is
+silently absent from the proof while the manifest suggests it was measured.
+Telling "staged but uncommitted" apart from "committed since the baseline" needs
+a HEAD↔index comparison, which the manifest now records as `staged_vs_head`.
+
+The commit must be a full object id naming a commit object — `HEAD`, `main~2`
+and a blob id are all refused, because a proof bound to a revision expression is
+bound to whatever it resolved to at the time. The snapshot binding is derived
+from the verified manifest, and a caller-supplied digest that contradicts it is
+refused rather than preferred.
 
 ### A bound proof does not depend on unmeasured state
 
@@ -116,23 +158,56 @@ For a consequential action the binding must carry `project.repo` and
 **structured parameters** from a fixed allowlist of action kinds. Prose scope is
 for the human; the parameters are what a later check compares, and they are
 inside the decision's binding digest. `authorise` verifies that the checkout's
-head is the approved commit, so an approval for one state cannot release
-another.
+head is the approved commit **and that the checkout is the approved
+repository**. Only checking the commit was a hole: a commit can be fetched into
+any number of repositories, so an approval for `pr0dus/cek` would have released
+against any clone or fork holding it. The observed identity is derived from the
+checkout's own remote configuration and normalised — `https://`, `ssh://` and
+`git@host:` spellings all reduce to `host/owner/name`, and a local path becomes
+`path:<realpath>`, which can never match a hosted identity. Missing, ambiguous
+and mismatched identities all fail closed.
 
-One-shot is enforced by receipts. `reserve` consumes the nonce as `uncertain`
-*before* a person acts; `reconcile` records `executed` or `failed` afterwards.
-Any receipt consumes the nonce permanently — a retry needs a new human
-decision, not a second use of the old one — and an unresolved `uncertain`
-receipt blocks until a human reconciles it, because the alternative is doing it
-twice.
+**Threat boundary for that identity.** It is read from the target checkout's
+`.git/config`. Anyone who can write there can make it claim anything, so this
+is not an authenticated binding — S2's signatures are. What it establishes is
+that a release is running against the repository the approval named, rather
+than a different checkout that merely contains the same commit.
 
-### There is no executor
+One-shot is enforced by receipts, and the check is atomic with the write. The
+earlier flow read "unconsumed" and then appended, holding the writer lock only
+during the append, so two callers could both pass the check. `reserve` and
+`reconcile` now hold the store's writer lock across the recheck *and* the
+receipt — the lock is re-entrant within a store instance, so the append inside
+does not deadlock on it — and `flock` still excludes between processes.
+
+The lifecycle is `unused → uncertain → executed|failed`: no second reservation,
+no second terminal receipt, no transition out of a terminal state. An
+unresolved `uncertain` receipt blocks until a human reconciles it, because the
+alternative is doing the action twice, and any terminal receipt consumes the
+nonce permanently — a retry needs a new human decision, not a second use of the
+old one. `verify_store()` enforces the same lifecycle against history, so a
+branch containing two reservations for one nonce fails closed rather than being
+read past: it is evidence the action was released twice.
+
+### There is no executor, and the operator sequence has one order
 
 Nothing in `release.py` performs a side effect. It imports no subprocess
-machinery, and a test asserts that by reading the source. The consequential
-action is carried out **manually** after `authorise` — the exact final recheck —
-and then recorded. Building a generic privileged executor is what the audit
-asked us not to do.
+machinery, and a test asserts that by reading the source. Building a generic
+privileged executor is what the audit asked us not to do.
+
+The sequence is exactly:
+
+1. `release-reserve` — rechecks everything and consumes the one-shot nonce as
+   `uncertain`, atomically;
+2. the human performs the action by hand;
+3. `release-reconcile` — records `executed` or `failed`.
+
+`release-authorise` is a **diagnostic**. An earlier version's output told the
+operator to carry the action out and then record it, which would have performed
+the real side effect while the nonce was still unconsumed — the exact window
+`reserve` exists to close. Its result now carries `action_permitted: false` and
+says plainly that nothing may be performed from it; its CLI help says the same.
+Both are asserted by tests, so the wording cannot quietly regress.
 
 ### Git and process environment
 
@@ -190,6 +265,15 @@ acceptable for a bound proof, and a proof run in-place (`run_proof` without
 isolation) records `binds_execution_state: false` rather than implying
 otherwise.
 
+**A detached descendant survives a timeout.** `killpg` cannot reach a process
+that left the group, and one that calls `setsid()` has. Measured, asserted by a
+test, and recorded as an S3 blocker rather than mitigated by something weaker
+that would read like a guarantee.
+
+**Repository identity is configuration, not authentication.** See the threat
+boundary above: it defends against acting on the wrong checkout, not against
+someone who already controls that checkout's config.
+
 ---
 
 ## 4. Keys and trust anchors
@@ -221,3 +305,7 @@ limitation worth stating:
   establishes what actually happened and calls `release.reconcile`.
 - **A suspect remote** — until the S2 trust anchor exists, compare a fresh
   clone's tip against a tip recorded out of band before trusting it.
+- **An impossible receipt history** — `verify_store()` fails closed with
+  `ReceiptStateError`, naming the nonce and the offending receipt. Establish out
+  of band whether the action happened, then rebuild the branch from the last
+  good tip; do not append a third receipt to "settle" it.

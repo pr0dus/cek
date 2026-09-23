@@ -222,9 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     auth = sub.add_parser(
         "release-authorise",
-        help="the exact final recheck for a consequential action. Derives "
-             "current snapshot and supervisor context itself; performs NO "
-             "side effect and accepts no digests.",
+        help="diagnostic recheck only - NOT PERMISSION TO ACT. Derives current "
+             "snapshot and supervisor context itself and accepts no digests, "
+             "but leaves the one-shot nonce unconsumed, so nothing may be "
+             "performed from its output. Use release-reserve before acting.",
     )
     auth.add_argument("--request-id", required=True)
     auth.add_argument("--target", required=True,
@@ -232,8 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     reserve = sub.add_parser(
         "release-reserve",
-        help="authorise and immediately consume the one-shot action nonce as "
-             "'uncertain', BEFORE a human performs the action manually",
+        help="the operator command: recheck and consume the one-shot action "
+             "nonce as 'uncertain' in one atomic step, BEFORE a human performs "
+             "the action manually. This - not release-authorise - is what "
+             "precedes the manual step.",
     )
     reserve.add_argument("--request-id", required=True)
     reserve.add_argument("--target", required=True)

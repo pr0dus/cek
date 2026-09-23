@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from . import tool_profiles
+from .limits import MAX_MODEL_OUTPUT_BYTES
 from .process import ProcessError, run_bounded, sanitised_env
 from .participant import (
     AGENT_MESSAGE_TYPES,
@@ -95,6 +96,7 @@ class ClaudeInvoker:
             result = run_bounded(
                 command, input=prompt.encode("utf-8"), cwd=self.cwd,
                 timeout=self.timeout, env=sanitised_env(),
+                max_output_bytes=MAX_MODEL_OUTPUT_BYTES,
             )
         except ProcessError as exc:
             raise ClaudeAdapterError(
@@ -106,6 +108,16 @@ class ClaudeInvoker:
             raise ClaudeAdapterError(
                 f"claude did not return within {self.timeout}s; its process "
                 f"group was {result.teardown}"
+            )
+        if result.output_limited:
+            # Read against the cap while it was produced, so nothing past it
+            # was ever held. Fail closed rather than parse a prefix: half a
+            # JSON document is not a smaller answer, it is a different one.
+            raise ClaudeAdapterError(
+                f"claude produced more than {MAX_MODEL_OUTPUT_BYTES} bytes on "
+                f"{', '.join(result.limited_streams)}; its process group was "
+                f"{result.teardown}. The turn is refused, not retried with a "
+                "looser bound."
             )
         stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode != 0:

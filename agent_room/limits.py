@@ -14,6 +14,14 @@ Where a limit is enforced matters as much as its value. Envelope limits are
 checked before the Git commit, packet limits before the packet leaves the
 process, and thread limits before a prompt is built — so an oversize input
 fails without a durable write or a model invocation behind it.
+
+Output limits are different in kind, and the difference caught us out once: a
+limit on what gets *stored* after a process exits is not a resource bound at
+all, because the bytes were already in memory. `MAX_PROOF_STREAM_BYTES` and
+`MAX_MODEL_OUTPUT_BYTES` are applied by `process.run_bounded` **while output is
+produced**, and crossing one tears down the process group. The consequence is
+stated rather than hidden: a digest over a limited stream covers the bytes that
+were accepted, not bytes that were never read.
 """
 
 from .errors import AgentRoomError
@@ -43,10 +51,15 @@ MAX_PROOF_STREAM_BYTES = 4 * 1024 * 1024
 #: One proof artifact on disk.
 MAX_PROOF_ARTIFACT_BYTES = 12 * 1024 * 1024
 
+#: A model client's stdout, and the structured result file it writes. Both are
+#: read against this while they are produced, not measured afterwards.
+MAX_MODEL_OUTPUT_BYTES = 8 * 1024 * 1024
+
 __all__ = [
     "MAX_ENVELOPE_BYTES", "MAX_BODY_TEXT_CHARS", "MAX_EVIDENCE_ITEMS",
     "MAX_THREAD_MESSAGES", "MAX_PACKET_BYTES", "MAX_PROOF_STREAM_BYTES",
-    "MAX_PROOF_ARTIFACT_BYTES", "LimitExceeded", "assert_within",
+    "MAX_PROOF_ARTIFACT_BYTES", "MAX_MODEL_OUTPUT_BYTES",
+    "LimitExceeded", "assert_within",
 ]
 
 

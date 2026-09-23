@@ -31,6 +31,8 @@ receipts blocks the release as unreviewed.
 import datetime as dt
 from pathlib import Path
 
+import re
+
 from . import canonical, supervisor
 from .decision import _decisions_for, _load_request, evaluate_gate
 from .errors import AgentRoomError
@@ -41,7 +43,7 @@ from .schema import (
     RECEIPT_UNRESOLVED,
     validate_action,
 )
-from .snapshot import snapshot_manifest
+from .snapshot import _git as _snapshot_git, snapshot_manifest
 
 #: Message types that may legitimately follow the review cutoff without making
 #: the release unreviewed: the request itself, the human's answer to it, and
@@ -50,8 +52,21 @@ POST_CUTOFF_ALLOWED = frozenset({
     "decision_request", "approval", "rejection", "execution_receipt",
 })
 
+#: The remote whose URL names the repository, when one exists.
+CANONICAL_REMOTE = "origin"
+
+#: `git@host:owner/name` — the scp-like spelling, which is not a URL and has
+#: to be recognised separately from `ssh://`.
+SCP_REMOTE_RE = re.compile(r"\A(?:(?P<user>[^@/]+)@)?(?P<host>[^:/]+):(?P<path>.+)\Z")
+
+#: The receipt lifecycle, as transitions rather than prose.
+#: `unused -> uncertain -> executed|failed`, and nothing after a terminal.
+RECEIPT_TERMINAL = frozenset({"executed", "failed"})
+
 __all__ = [
-    "POST_CUTOFF_ALLOWED", "ReleaseError", "ReleaseBlocked",
+    "POST_CUTOFF_ALLOWED", "CANONICAL_REMOTE", "RECEIPT_TERMINAL",
+    "ReleaseError", "ReleaseBlocked", "RepositoryIdentityError",
+    "canonical_repo_identity", "identity_matches",
     "derive_snapshot", "derive_context", "receipt_state",
     "authorise", "reserve", "reconcile",
 ]
@@ -67,6 +82,101 @@ class ReleaseBlocked(ReleaseError):
     def __init__(self, message, *, report: dict):
         super().__init__(message)
         self.report = report
+
+
+class RepositoryIdentityError(ReleaseError):
+    """The target checkout's repository identity is missing or ambiguous."""
+
+
+def _normalise_remote_url(url: str) -> str:
+    """One canonical spelling for the many ways a remote can be written.
+
+    `https://github.com/pr0dus/cek.git`, `git@github.com:pr0dus/cek` and
+    `ssh://git@github.com/pr0dus/cek/` all name the same repository, and a
+    comparison that treated them as different would fail closed on ordinary
+    checkouts until somebody "fixed" it by loosening the check.
+
+    A local path has no host, so it is spelled `path:<realpath>` — distinct by
+    construction from any hosted identity, which is what keeps a local clone
+    of a GitHub repository from claiming to be it.
+    """
+    raw = url.strip()
+    if not raw:
+        raise RepositoryIdentityError("empty remote URL")
+    for scheme in ("https://", "http://", "ssh://", "git://"):
+        if raw.lower().startswith(scheme):
+            rest = raw[len(scheme):]
+            authority, _, path = rest.partition("/")
+            host = authority.rpartition("@")[2].lower()
+            return f"{host}/{path.strip('/').removesuffix('.git')}"
+    if raw.lower().startswith("file://"):
+        return f"path:{Path(raw[len('file://'):]).resolve()}"
+    match = SCP_REMOTE_RE.match(raw)
+    if match and not raw.startswith("/") and not raw.startswith("."):
+        host = match.group("host").lower()
+        return f"{host}/{match.group('path').strip('/').removesuffix('.git')}"
+    return f"path:{Path(raw).resolve()}"
+
+
+def canonical_repo_identity(workdir, *, remote: str = CANONICAL_REMOTE) -> dict:
+    """Derive the target checkout's repository identity from the checkout.
+
+    **Threat boundary, stated because it is narrow.** This reads the
+    checkout's own remote configuration. Anyone who can write `.git/config`
+    there can make it claim any identity, so this is not an authenticated
+    binding — S2's signatures are. What it does establish is that a release is
+    being run against the repository the approval named, rather than against a
+    different checkout that merely happens to contain the same commit. That
+    was a real hole: a commit can exist in any number of repositories.
+
+    Fails closed on a missing identity, and on an ambiguous one — several
+    remotes with no `origin` to arbitrate between them.
+    """
+    raw = _snapshot_git(Path(workdir), "config", "-z", "--get-regexp",
+                        r"^remote\..*\.url", check=False)
+    remotes: dict = {}
+    for entry in raw.decode("utf-8", "surrogateescape").split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("\n")
+        name = key[len("remote."):-len(".url")]
+        if value.strip():
+            remotes[name] = value.strip()
+
+    if not remotes:
+        raise RepositoryIdentityError(
+            f"{Path(workdir).resolve()} has no configured remote, so its "
+            "repository identity cannot be derived. A consequential release "
+            "must know which repository it is acting on."
+        )
+    if remote in remotes:
+        chosen, url = remote, remotes[remote]
+    elif len(remotes) == 1:
+        chosen, url = next(iter(remotes.items()))
+    else:
+        raise RepositoryIdentityError(
+            f"{Path(workdir).resolve()} has {sorted(remotes)} but no "
+            f"{remote!r}; the repository identity is ambiguous and a release "
+            "must not guess which one the approval meant"
+        )
+    return {"remote": chosen, "url": url,
+            "identity": _normalise_remote_url(url), "source": "git-remote-url"}
+
+
+def identity_matches(bound: str, identity: str) -> bool:
+    """Does a bound `owner/name` (or full `host/owner/name`) name this checkout?
+
+    A bound value with no separator is refused rather than matched loosely: a
+    bare name would match any host's repository of that name.
+    """
+    if not isinstance(bound, str) or "/" not in bound.strip("/"):
+        raise RepositoryIdentityError(
+            f"bound project.repo {bound!r} is not a repository identity; it "
+            "needs at least 'owner/name', or a bare name would match any "
+            "host's repository with that name"
+        )
+    wanted, actual = bound.strip("/").lower(), identity.lower()
+    return actual == wanted or actual.endswith(f"/{wanted}")
 
 
 def _now_iso() -> str:
@@ -144,15 +254,30 @@ def derive_context(store, recipe: dict, *, request_message_id: str) -> tuple:
 
 
 def _assert_project(action: dict, manifest: dict, workdir) -> dict:
-    """The checkout must be the commit the decision named.
+    """The checkout must be the repository *and* the commit the decision named.
 
-    An approval for repo A must never release the same-looking snapshot in
-    repo B. The manifest's head is measured, not supplied, so this compares
-    the approved commit against what is actually checked out here.
+    Both halves matter, and only checking the commit was the hole: a commit
+    can exist in any number of repositories, so an approval for `pr0dus/cek`
+    would release against any clone or fork that had fetched it. The observed
+    repository is derived from the checkout, never copied out of the binding.
     """
     binding = action["binding"]["project"]
-    observed = {"repo": binding["repo"], "commit": manifest["head_commit"],
-                "workdir": str(Path(workdir).resolve())}
+    derived = canonical_repo_identity(workdir)
+    observed = {"repo": derived["identity"], "remote": derived["remote"],
+                "commit": manifest["head_commit"],
+                "workdir": str(Path(workdir).resolve()),
+                "source": derived["source"]}
+    if not identity_matches(binding["repo"], derived["identity"]):
+        raise ReleaseBlocked(
+            f"the approval names repository {binding['repo']!r}, but "
+            f"{Path(workdir).resolve()} is {derived['identity']!r} (from "
+            f"remote {derived['remote']!r}). A commit can exist in more than "
+            "one repository; an approval for one must not release another.",
+            report={"state": "blocked_wrong_repository", "releasable": False,
+                    "bound": binding, "observed": observed,
+                    "action_id": action["action_id"],
+                    "reasons": ["the checkout is not the approved repository"]},
+        )
     if manifest["head_commit"] != binding["commit"]:
         raise ReleaseBlocked(
             f"the approved commit {binding['commit'][:12]} is not the head of "
@@ -191,8 +316,53 @@ def receipt_state(store, request: dict) -> dict:
     }
 
 
+def assert_transition(state: dict, status: str) -> None:
+    """The one-shot lifecycle, checked against the receipts that exist now.
+
+    `unused -> uncertain -> executed|failed`. Callers hold the store's writer
+    lock across this check and the append that follows it, because a check
+    that is not atomic with its write is exactly how two callers both decide
+    the nonce is free.
+    """
+    statuses = [r["status"] for r in state["receipts"]]
+    nonce = state["action_nonce"]
+    if status == "uncertain":
+        if statuses:
+            raise ReleaseBlocked(
+                f"action nonce {nonce} is already reserved ({statuses}); a "
+                "one-shot action cannot be reserved twice, and a second "
+                "reservation would mean releasing it twice",
+                report={"state": "blocked_consumed", "releasable": False,
+                        "action_nonce": nonce, "receipts": statuses,
+                        "reasons": ["the nonce is already consumed"]},
+            )
+        return
+    if not statuses:
+        raise ReleaseError(
+            f"nothing to reconcile for nonce {nonce}: the action was never "
+            "reserved. Reserve it before performing it, or the side effect "
+            "happens while the nonce is still reusable."
+        )
+    if statuses[0] != "uncertain":
+        raise ReleaseError(
+            f"the receipt history for nonce {nonce} starts at {statuses[0]!r}, "
+            "not a reservation; refusing to extend an impossible sequence"
+        )
+    settled = [s for s in statuses if s in RECEIPT_TERMINAL]
+    if settled:
+        raise ReleaseBlocked(
+            f"action nonce {nonce} already settled as {settled[0]!r}; there is "
+            "no transition out of a terminal state, and a retry needs a new "
+            "human decision",
+            report={"state": "blocked_consumed", "releasable": False,
+                    "action_nonce": nonce, "receipts": statuses,
+                    "reasons": [f"the action already settled as {settled[0]!r}"]},
+        )
+
+
 def _write_receipt(store, request: dict, *, status: str, result: dict,
                    decision_id: str, receipt_id: str | None = None) -> dict:
+    """Append one receipt. The caller must already hold the writer lock."""
     if status not in RECEIPT_STATUS:
         raise ReleaseError(
             f"receipt status must be one of {sorted(RECEIPT_STATUS)}, got "
@@ -321,31 +491,55 @@ def authorise(store, request_message_id: str, *, workdir) -> dict:
         "decision_id": decision["decision_id"],
         "snapshot_entries": len(manifest["entries"]),
         "executor": None,
+        # The operator-facing contract, in the result rather than in prose
+        # somewhere else. An earlier wording told the operator to perform the
+        # action and then record it, which would have left the nonce reusable
+        # for the whole time the side effect was happening.
+        "action_permitted": False,
+        "next_step": "release.reserve",
         "note": (
-            "Nothing has been executed. This authorisation performs no side "
-            "effect; the action is carried out manually and then recorded with "
-            "release.reconcile()."
+            "NOT PERMISSION TO ACT. Nothing has been executed and nothing may "
+            "be performed from this result alone: the one-shot nonce is still "
+            "unconsumed, so the same approval could be authorised again in "
+            "parallel. The operator sequence is reserve() first - which "
+            "rechecks all of this and consumes the nonce atomically - then "
+            "perform the action by hand, then reconcile()."
         ),
     }
 
 
 def reserve(store, request_message_id: str, *, workdir,
             result: dict | None = None) -> dict:
-    """Authorise, then immediately consume the nonce as `uncertain`.
+    """The operator-facing command: recheck and consume the nonce, atomically.
 
-    Written *before* the side effect, on purpose. If the operator's action
-    half-happens, or nobody ever says what came of it, the action stays
-    blocked and needs a human to reconcile it — which is the safe direction.
-    Consuming the nonce afterwards instead would leave a window in which a
-    second authorisation could be obtained for the same approval.
+    This is the *only* thing that precedes a manual action. It runs the final
+    recheck and consumes the one-shot nonce as `uncertain` in a single
+    critical section, so two operators cannot both find the nonce free.
+
+    Written *before* the side effect, on purpose. If the action half-happens,
+    or nobody ever says what came of it, it stays blocked and needs a human to
+    reconcile — the safe direction. Consuming the nonce afterwards would leave
+    the whole duration of the side effect as a window for a second release.
     """
-    authorisation = authorise(store, request_message_id, workdir=workdir)
-    request = _load_request(store, request_message_id)
-    written = _write_receipt(
-        store, request, status="uncertain",
-        decision_id=authorisation["decision_id"],
-        result=result or {"stage": "reserved",
-                          "note": "no side effect has been attempted yet"},
+    # One critical section over check-and-consume. The append inside takes the
+    # same lock, which is why it is re-entrant within a store instance.
+    with store.writer_lock():
+        authorisation = authorise(store, request_message_id, workdir=workdir)
+        request = _load_request(store, request_message_id)
+        assert_transition(receipt_state(store, request), "uncertain")
+        written = _write_receipt(
+            store, request, status="uncertain",
+            decision_id=authorisation["decision_id"],
+            result=result or {"stage": "reserved",
+                              "note": "no side effect has been attempted yet"},
+        )
+    authorisation = dict(authorisation)
+    authorisation["action_permitted"] = True
+    authorisation["next_step"] = "perform the action manually, then reconcile()"
+    authorisation["note"] = (
+        "The nonce is now consumed as 'uncertain'. Perform the action by hand "
+        "and then record what happened with reconcile(). Nothing here "
+        "performed it."
     )
     return {"authorisation": authorisation, "receipt": written}
 
@@ -358,21 +552,21 @@ def reconcile(store, request_message_id: str, *, status: str, result: dict,
     the world has moved *because* the action was performed, and re-measuring
     would refuse every honest report of a completed action.
     """
-    request = _load_request(store, request_message_id)
-    _consequential_action(request)
-    receipts = receipt_state(store, request)
-    if not receipts["consumed"]:
-        raise ReleaseError(
-            "nothing to reconcile: this action has no receipt, so it was "
-            "never reserved. Call reserve() before performing it."
-        )
     if status in RECEIPT_UNRESOLVED:
         raise ReleaseError(
             f"reconciling with {status!r} would leave the action unresolved; "
             f"record one of {sorted(RECEIPT_STATUS - RECEIPT_UNRESOLVED)}"
         )
-    decisions, _foreign = _decisions_for(store, request)
-    decision_id = (decisions[-1]["decision"]["decision_id"] if decisions
-                   else receipts["latest"]["decision_id"])
-    return _write_receipt(store, request, status=status, result=result,
-                          decision_id=decision_id, receipt_id=receipt_id)
+    # Same critical section discipline as reserve(): the terminal transition is
+    # checked and written without a gap, so two concurrent reconciliations
+    # cannot both settle one action.
+    with store.writer_lock():
+        request = _load_request(store, request_message_id)
+        _consequential_action(request)
+        receipts = receipt_state(store, request)
+        assert_transition(receipts, status)
+        decisions, _foreign = _decisions_for(store, request)
+        decision_id = (decisions[-1]["decision"]["decision_id"] if decisions
+                       else receipts["latest"]["decision_id"])
+        return _write_receipt(store, request, status=status, result=result,
+                              decision_id=decision_id, receipt_id=receipt_id)

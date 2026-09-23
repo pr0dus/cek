@@ -130,6 +130,17 @@ class DeliveryError(AgentRoomError):
         return result
 
 
+class ReceiptStateError(AgentRoomError):
+    """The execution receipts for one action describe an impossible sequence.
+
+    A one-shot action has exactly one lifecycle: unused, then a single
+    `uncertain` reservation, then a single terminal `executed`/`failed`. Two
+    reservations for one nonce would mean the action was released twice, so a
+    history containing them is not a history to read past - it fails closed on
+    verification, not only at the write that would have created it.
+    """
+
+
 class HistoryUnavailable(AgentRoomError):
     """Required Git history could not be read, or is known to be incomplete.
 

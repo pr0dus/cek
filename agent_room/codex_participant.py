@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from . import tool_profiles
+from .limits import MAX_MODEL_OUTPUT_BYTES, assert_within
 from .process import ProcessError, run_bounded, sanitised_env
 from .participant import (
     AGENT_MESSAGE_TYPES,
@@ -214,6 +215,7 @@ class CodexInvoker:
                 result = run_bounded(
                     command, input=prompt.encode("utf-8"), cwd=self.cwd,
                     timeout=self.timeout, env=sanitised_env(),
+                    max_output_bytes=MAX_MODEL_OUTPUT_BYTES,
                 )
             except ProcessError as exc:
                 raise CodexAdapterError(
@@ -227,11 +229,29 @@ class CodexInvoker:
                     f"codex did not return within {self.timeout}s; its process "
                     f"group was {result.teardown}"
                 )
+            if result.output_limited:
+                raise CodexAdapterError(
+                    f"codex produced more than {MAX_MODEL_OUTPUT_BYTES} bytes "
+                    f"on {', '.join(result.limited_streams)}; its process "
+                    f"group was {result.teardown}. The turn is refused, not "
+                    "retried with a looser bound."
+                )
             stderr = result.stderr.decode("utf-8", "replace")
             if result.returncode != 0:
                 raise CodexAdapterError(
                     f"codex exited {result.returncode}: {stderr.strip()[:500]}"
                 )
+            # The structured result arrives as a file, so the streaming cap
+            # above never saw it. Check its size before reading: a read is
+            # where an unbounded file becomes unbounded memory.
+            try:
+                written = output_path.stat().st_size
+            except OSError as exc:
+                raise MalformedResponse(
+                    f"codex wrote no final message: {exc}"
+                ) from exc
+            assert_within(written, MAX_MODEL_OUTPUT_BYTES,
+                          "codex final message")
             try:
                 raw = output_path.read_text(encoding="utf-8")
             except OSError as exc:
