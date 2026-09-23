@@ -33,6 +33,25 @@ from .claude_participant import (
     TurnLockTimeout,
 )
 from .codex_participant import CodexInvoker, CodexParticipant
+from .decision import (
+    GATE_STATES,
+    DecisionError,
+    GateBlocked,
+    HumanDecisionAuthority,
+    assert_releasable,
+    binding_digest,
+    evaluate_gate,
+    pending_requests,
+)
+from .orchestrator import (
+    Assignment,
+    BoundExhausted,
+    Coordinator,
+    IndependenceViolation,
+    RoundBounds,
+)
+from .proof import ProofError, proof_evidence, run_proof, verify_proof
+from .snapshot import SnapshotError, snapshot_manifest, verify_manifest
 from .participant import ParticipantAdapter, ParticipantAdapterError
 from .supervisor import (
     MalformedSupervisorResponse,
@@ -59,6 +78,26 @@ __all__ = [
     "CodexInvoker",
     "ParticipantAdapter",
     "ParticipantAdapterError",
+    "HumanDecisionAuthority",
+    "DecisionError",
+    "GateBlocked",
+    "GATE_STATES",
+    "evaluate_gate",
+    "assert_releasable",
+    "binding_digest",
+    "pending_requests",
+    "Coordinator",
+    "Assignment",
+    "RoundBounds",
+    "BoundExhausted",
+    "IndependenceViolation",
+    "snapshot_manifest",
+    "verify_manifest",
+    "SnapshotError",
+    "run_proof",
+    "verify_proof",
+    "proof_evidence",
+    "ProofError",
     "SupervisorBoundary",
     "SupervisorError",
     "StaleSupervisorContext",

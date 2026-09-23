@@ -10,6 +10,7 @@ import pytest
 
 from agent_room.errors import ClaimStateError, ForbiddenOperation, SchemaError
 from agent_room.ids import is_uuid7, timestamp_ms, uuid7
+from agent_room.decision import binding_digest
 from agent_room.schema import CLAIM_STATUS, LIFECYCLE_STATUS, validate_envelope
 
 
@@ -29,6 +30,30 @@ def envelope(**overrides):
         "reply_requested": False,
         "human_approval_required": False,
     }
+    base.update(overrides)
+    return base
+
+
+def decision_envelope(mtype="approval", **overrides):
+    """A complete Issue #5 human decision record, bound to a request."""
+    request_id = uuid7()
+    decision = {
+        "decision_schema_version": 1,
+        "decision_id": "hd-test-1",
+        "decision": "approve" if mtype == "approval" else "reject",
+        "decided_at": "2026-09-23T12:00:00Z",
+        "request_message_id": request_id,
+        "request_envelope_sha256": "c" * 64,
+        "action_id": "activate-agent-room-transport",
+        "action_scope": "create the production agent-room transport branch",
+        "binding": {"snapshot_sha256": "a" * 64,
+                    "supervisor_context_sha256": "b" * 64},
+    }
+    decision["decision_binding_sha256"] = binding_digest(decision)
+    base = envelope(
+        type=mtype, sender={"agent": "human"}, parent_id=request_id,
+        decision=decision,
+    )
     base.update(overrides)
     return base
 
@@ -110,8 +135,69 @@ def test_agents_cannot_author_approval_or_rejection(mtype):
 
 @pytest.mark.parametrize("mtype", ["approval", "rejection"])
 def test_approval_schema_is_reserved_not_deleted(mtype):
-    """Reserved for Issue #5 — structurally valid, just not agent-authorable."""
-    validate_envelope(envelope(type=mtype), agent_facing=False)
+    """Authoritative in Issue #5 — valid only with a complete decision record."""
+    validate_envelope(decision_envelope(mtype), agent_facing=False)
+
+
+@pytest.mark.parametrize("mtype", ["approval", "rejection"])
+def test_a_decision_without_a_binding_record_is_refused(mtype):
+    """An approval that binds to nothing could never be checked against anything."""
+    bare = decision_envelope(mtype)
+    del bare["decision"]
+    with pytest.raises(SchemaError, match="must carry a 'decision' record"):
+        validate_envelope(bare, agent_facing=False)
+
+
+def test_an_ordinary_message_may_not_carry_a_decision_record():
+    with pytest.raises(SchemaError, match="may not carry a 'decision' record"):
+        validate_envelope(
+            envelope(decision=decision_envelope("approval")["decision"]),
+            agent_facing=False,
+        )
+
+
+def test_a_decision_verdict_must_agree_with_its_envelope_type():
+    """`approve` carried by a `rejection` is a contradiction, not a preference."""
+    mixed = decision_envelope("rejection")
+    mixed["decision"]["decision"] = "approve"
+    with pytest.raises(SchemaError, match="must be carried by a 'approval'"):
+        validate_envelope(mixed, agent_facing=False)
+
+
+def test_a_decision_must_reply_to_the_request_it_decides():
+    orphan = decision_envelope("approval")
+    orphan["parent_id"] = uuid7()
+    with pytest.raises(SchemaError, match="must reply to the decision_request"):
+        validate_envelope(orphan, agent_facing=False)
+
+
+def test_a_bound_action_needs_both_binding_digests():
+    for missing in ("snapshot_sha256", "supervisor_context_sha256"):
+        action = {
+            "action_id": "merge-infrastructure",
+            "scope": "merge PR #8",
+            "consequential": True,
+            "binding": {"snapshot_sha256": "a" * 64,
+                        "supervisor_context_sha256": "b" * 64},
+        }
+        del action["binding"][missing]
+        with pytest.raises(SchemaError, match=f"missing {missing}"):
+            validate_envelope(
+                envelope(type="decision_request", human_approval_required=True,
+                         action=action),
+                agent_facing=False,
+            )
+
+
+def test_only_a_decision_request_may_bind_an_action():
+    with pytest.raises(SchemaError, match="may not carry an 'action' binding"):
+        validate_envelope(
+            envelope(action={"action_id": "x", "scope": "y",
+                             "consequential": True,
+                             "binding": {"snapshot_sha256": "a" * 64,
+                                         "supervisor_context_sha256": "b" * 64}}),
+            agent_facing=False,
+        )
 
 
 def test_agents_may_author_decision_request():

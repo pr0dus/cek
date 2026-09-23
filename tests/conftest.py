@@ -12,9 +12,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.conftest_agent_room import (  # noqa: E402,F401
+    CONTEXT_SHA,
+    SNAPSHOT_SHA,
     bare_remote,
+    bound_action,
     configure_identity,
     git,
+    post_decision_request,
     room,
     store,
 )

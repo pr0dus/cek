@@ -43,6 +43,7 @@ from .errors import (
     ConflictError,
     DeliveryError,
     DirtyCheckoutError,
+    ForbiddenOperation,
     GitTimeout,
     InvalidBranchName,
     HistoryUnavailable,
@@ -54,7 +55,7 @@ from .errors import (
     WrongBranchError,
 )
 from .ids import is_uuid7
-from .schema import THREAD_ID_RE, validate_envelope
+from .schema import DECISION_TYPES, THREAD_ID_RE, validate_envelope
 
 MESSAGES_DIR = ".agent-room/messages"
 DEFAULT_BRANCH = "agent-room"
@@ -1092,7 +1093,41 @@ class GitMessageStore:
             agent_facing=True,
             resolver=self._write_resolver,
         )
+        return self._append_validated(envelope)
 
+    def append_decision(self, envelope: dict) -> dict:
+        """Append one human `approval` or `rejection`. Deliberately NOT agent-facing.
+
+        This is the whole mechanical trust boundary for Issue #5, and it is a
+        capability separation rather than a cryptographic one (design §6, which
+        explicitly defers signed commits). Nothing here proves a human pressed
+        a key. What it guarantees is that the two authority-bearing types are
+        unreachable from every agent surface — `AgentRoom.post`, the
+        participant adapters, the supervisor boundary and `append` all validate
+        `agent_facing=True` and refuse them — so the only way one enters
+        history is a caller that deliberately reached for this method.
+
+        `agent_room.decision.HumanDecisionAuthority` is that caller, and no
+        participant or orchestrator code may reference it.
+        """
+        self.assert_room_branch()
+        canonical.verify(envelope)
+        mtype = envelope.get("type")
+        if mtype not in DECISION_TYPES:
+            raise ForbiddenOperation(
+                f"append_decision carries human authority and accepts only "
+                f"{sorted(DECISION_TYPES)}, not {mtype!r}; ordinary messages "
+                "go through append()"
+            )
+        validate_envelope(
+            envelope,
+            agent_facing=False,
+            resolver=self._write_resolver,
+        )
+        return self._append_validated(envelope)
+
+    def _append_validated(self, envelope: dict) -> dict:
+        """Shared commit path. Validation has already happened above."""
         thread_id = envelope["thread_id"]
         message_id = envelope["message_id"]
         rel = self.message_path(thread_id, message_id)

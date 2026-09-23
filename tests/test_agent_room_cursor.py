@@ -38,7 +38,9 @@ def test_acknowledgement_is_per_participant(store, tmp_path):
     openai.acknowledge(posted["message_id"])
     assert openai.inbox() == []
 
-    third = AgentRoom(store, "human", ParticipantCursor(tmp_path / "human", "human"))
+    # NB: not "human" — that identity is reserved for the decision surface
+    # and an agent room refuses to post under it (Issue #5).
+    third = AgentRoom(store, "codex", ParticipantCursor(tmp_path / "codex", "codex"))
     assert [m["message_id"] for m in third.inbox()] == [posted["message_id"]]
 
 

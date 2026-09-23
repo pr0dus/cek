@@ -63,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--project", default=None, help="JSON object")
     post.add_argument("--evidence", default=None, help="JSON list")
     post.add_argument("--claim", default=None, help="JSON object")
+    post.add_argument("--action", default=None,
+                      help="JSON object: the bound consequential action a "
+                           "decision_request asks a human to release")
     post.add_argument("--status", default="open")
     post.add_argument("--reply-requested", action="store_true")
     post.add_argument("--human-approval-required", action="store_true")
@@ -75,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     reply.add_argument("--project", default=None)
     reply.add_argument("--evidence", default=None)
     reply.add_argument("--claim", default=None)
+    reply.add_argument("--action", default=None,
+                       help="JSON object: the bound consequential action a "
+                            "decision_request asks a human to release")
     reply.add_argument("--status", default="open")
     reply.add_argument("--reply-requested", action="store_true")
     reply.add_argument("--human-approval-required", action="store_true")
@@ -157,6 +163,77 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--message-id", default=None)
     imp.add_argument("--turn-timeout", type=float, default=None)
 
+    snap = sub.add_parser(
+        "snapshot",
+        help="deterministic manifest of the inspected state of a checkout "
+             "against a base commit (read-only; trusts no builder file list)",
+    )
+    snap.add_argument("--target", required=True,
+                      help="checkout to measure (NOT the room repo)")
+    snap.add_argument("--base-commit", required=True,
+                      help="full object id of the authorized baseline")
+    snap.add_argument("--out", default=None, help="write the manifest to a file")
+
+    gate = sub.add_parser(
+        "gate-status",
+        help="whether a bound consequential action is releasable right now "
+             "(read-only; fail-closed)",
+    )
+    gate.add_argument("--request-id", required=True,
+                      help="the decision_request message id")
+    gate.add_argument("--snapshot-sha256", default=None,
+                      help="inspected-state manifest digest observed NOW")
+    gate.add_argument("--context-sha256", default=None,
+                      help="supervisor packet context digest observed NOW")
+
+    pend = sub.add_parser(
+        "pending-decisions",
+        help="bound decision requests with no human decision recorded",
+    )
+    pend.add_argument("--thread-id", default=None)
+
+    decide = sub.add_parser(
+        "human-decide",
+        help="HUMAN ONLY: record one approval or rejection. This is the "
+             "separate authority surface; no participant or orchestrator "
+             "code may invoke it.",
+    )
+    decide.add_argument("--request-id", required=True)
+    decide.add_argument("--decision", required=True, choices=["approve", "reject"])
+    decide.add_argument("--decision-id", default=None)
+    decide.add_argument("--note", default=None)
+    decide.add_argument("--expect-action-id", default=None,
+                        help="refuse unless the request binds this action")
+    decide.add_argument("--expect-snapshot-sha256", default=None,
+                        help="refuse unless the request binds this snapshot")
+    decide.add_argument("--expect-context-sha256", default=None,
+                        help="refuse unless the request binds this context")
+    decide.add_argument("--show", action="store_true",
+                        help="print what would be decided and exit without "
+                             "recording anything")
+    decide.add_argument(
+        "--confirm-human", action="store_true",
+        help="required. Asserts a person is invoking this, which is exactly "
+             "what the capability boundary rests on.",
+    )
+
+    proof = sub.add_parser(
+        "proof",
+        help="run ONE agreed proof command and record what was observed "
+             "(exit status, output digests, immutable artifact)",
+    )
+    proof.add_argument("--proof-id", required=True)
+    proof.add_argument("--target", required=True, help="cwd for the command")
+    proof.add_argument("--run-dir", required=True,
+                       help="artifact directory, OUTSIDE the inspected checkout")
+    proof.add_argument("--repo-commit", default=None)
+    proof.add_argument("--snapshot-sha256", default=None)
+    proof.add_argument("--timeout", type=float, default=None)
+    # NB: dest is deliberately not "command" - the subparser already owns
+    # that name, and shadowing it would erase which subcommand ran.
+    proof.add_argument("command_argv", nargs="+", metavar="COMMAND",
+                       help="the command to run, after --")
+
     sub.add_parser(
         "push",
         help="retry delivery of already-committed messages to --remote "
@@ -178,6 +255,66 @@ def main(argv=None) -> int:
             _emit({"initialised": str(store.workdir), "branch": store.branch})
             return 0
 
+        # Surfaces that deliberately do NOT build an agent room: a room posts
+        # as a participant, and none of these five acts as one. `human-decide`
+        # in particular must never be reachable through a participant object.
+        if args.command == "snapshot":
+            from .snapshot import snapshot_manifest
+            manifest = snapshot_manifest(args.target, args.base_commit)
+            if args.out:
+                Path(args.out).write_text(
+                    canonical.canonical_text(manifest), encoding="utf-8")
+                _emit({"written": args.out,
+                       "manifest_sha256": manifest["manifest_sha256"]})
+            else:
+                _emit(manifest)
+            return 0
+        if args.command == "proof":
+            from .proof import run_proof
+            record = run_proof(
+                args.command_argv, cwd=args.target, run_dir=args.run_dir,
+                proof_id=args.proof_id, repo_commit=args.repo_commit,
+                snapshot_sha256=args.snapshot_sha256,
+                **({"timeout": args.timeout} if args.timeout else {}),
+            )
+            _emit(record)
+            return 0
+        if args.command in ("gate-status", "pending-decisions", "human-decide"):
+            from . import decision as decision_mod
+            store = GitMessageStore(args.repo, branch=args.branch,
+                                    remote=args.remote)
+            if args.command == "gate-status":
+                _emit(decision_mod.evaluate_gate(
+                    store, args.request_id,
+                    snapshot_sha256=args.snapshot_sha256,
+                    supervisor_context_sha256=args.context_sha256,
+                ))
+                return 0
+            if args.command == "pending-decisions":
+                _emit(decision_mod.pending_requests(store, args.thread_id))
+                return 0
+            authority = decision_mod.HumanDecisionAuthority(store)
+            if args.show:
+                _emit(authority.describe(args.request_id))
+                return 0
+            if not args.confirm_human:
+                print(
+                    "Refusing to record a decision without --confirm-human. "
+                    "This surface carries human authority and is never invoked "
+                    "automatically; run with --show first to see exactly what "
+                    "would be decided.",
+                    file=sys.stderr,
+                )
+                return 2
+            _emit(authority.record(
+                args.request_id, args.decision,
+                decision_id=args.decision_id, note=args.note,
+                expect_action_id=args.expect_action_id,
+                expect_snapshot_sha256=args.expect_snapshot_sha256,
+                expect_supervisor_context_sha256=args.expect_context_sha256,
+            ))
+            return 0
+
         room = _room(args)
 
         if args.command == "post":
@@ -188,6 +325,7 @@ def main(argv=None) -> int:
                 project=_json_arg(args.project, None),
                 evidence=_json_arg(args.evidence, None),
                 claim=_json_arg(args.claim, None),
+                action=_json_arg(args.action, None),
                 status=args.status,
                 reply_requested=args.reply_requested,
                 human_approval_required=args.human_approval_required,
@@ -200,6 +338,7 @@ def main(argv=None) -> int:
                 project=_json_arg(args.project, None),
                 evidence=_json_arg(args.evidence, None),
                 claim=_json_arg(args.claim, None),
+                action=_json_arg(args.action, None),
                 status=args.status,
                 reply_requested=args.reply_requested,
                 human_approval_required=args.human_approval_required,

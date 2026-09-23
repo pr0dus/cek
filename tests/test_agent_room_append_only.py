@@ -11,9 +11,18 @@ import json
 import pytest
 
 from agent_room import GitMessageStore, canonical
-from agent_room.errors import AppendOnlyViolation, SchemaError, WrongBranchError
+from agent_room.errors import (
+    AppendOnlyViolation,
+    ForbiddenOperation,
+    SchemaError,
+    WrongBranchError,
+)
 from agent_room.ids import uuid7
-from tests.conftest_agent_room import configure_identity, git
+from tests.conftest_agent_room import (
+    configure_identity,
+    git,
+    post_decision_request,
+)
 
 
 # -- 1. append-only is mechanical -------------------------------------------
@@ -183,17 +192,16 @@ def test_read_rejects_a_malformed_artifact_committed_out_of_band(store, room):
 
 
 def test_reserved_issue5_types_remain_readable_at_the_store_layer(store, room):
-    """agent_facing=False on reads: approval must stay structurally readable."""
-    mid = uuid7()
-    envelope = room.build_envelope(thread_id="t1", type="observation",
-                                   body={"text": "x"}, message_id=mid)
-    envelope["type"] = "approval"
-    sealed = canonical.seal(envelope)
+    """agent_facing=False on reads: an approval stays readable once written."""
+    from agent_room.decision import HumanDecisionAuthority
 
-    path = store.workdir / store.message_path("t1", mid)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(canonical.canonical_text(sealed), encoding="utf-8")
-    store._git("add", str(path.relative_to(store.workdir)))
-    store._commit("human approval record")
+    request = post_decision_request(room)
+    recorded = HumanDecisionAuthority(store).record(
+        request["message_id"], "approve")
 
-    assert store.read("t1", mid)["type"] == "approval"
+    stored = store.read("t1", recorded["message_id"])
+    assert stored["type"] == "approval"
+    # The store writes it; every AGENT path still refuses to.
+    with pytest.raises(ForbiddenOperation):
+        store.append(canonical.seal({k: v for k, v in stored.items()
+                                     if k != canonical.DIGEST_FIELD}))

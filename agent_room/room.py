@@ -20,7 +20,7 @@ from .errors import (
 )
 from .gitstore import GitMessageStore
 from .ids import uuid7
-from .schema import SCHEMA_VERSION, validate_envelope
+from .schema import RESERVED_PARTICIPANTS, SCHEMA_VERSION, validate_envelope
 
 
 def _now_iso() -> str:
@@ -36,6 +36,11 @@ class AgentRoom:
         participant: str,
         cursor: ParticipantCursor | None = None,
     ) -> None:
+        if participant in RESERVED_PARTICIPANTS:
+            raise ForbiddenOperation(
+                f"{participant!r} is reserved for the human decision surface; "
+                "an agent room cannot post under it"
+            )
         self.store = store
         self.participant = participant
         self.cursor = cursor
@@ -52,6 +57,7 @@ class AgentRoom:
         parent_id: str | None = None,
         evidence: list | None = None,
         claim: dict | None = None,
+        action: dict | None = None,
         status: str = "open",
         reply_requested: bool = False,
         human_approval_required: bool = False,
@@ -105,6 +111,11 @@ class AgentRoom:
             envelope["parent_id"] = parent_id
         if claim is not None:
             envelope["claim"] = claim
+        if action is not None:
+            # The bound, consequential thing a human is being asked to
+            # release. Agents may author this; they may never author the
+            # decision that releases it.
+            envelope["action"] = action
         return envelope
 
     def post(self, **kwargs) -> dict:

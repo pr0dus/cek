@@ -26,7 +26,11 @@ from agent_room.errors import (
     UnresolvedReference,
 )
 from agent_room.ids import is_uuid7, uuid7
-from tests.conftest_agent_room import configure_identity, git
+from tests.conftest_agent_room import (
+    configure_identity,
+    git,
+    post_decision_request,
+)
 
 REPO = "pr0dus/concept-evolution-kernel"
 FULL_SHA = "40ffdf4617283f4accb3493a8a710c5025c5d3bc"
@@ -268,14 +272,22 @@ def test_low_level_append_cannot_author_reserved_types(store, room, mtype):
 
 @pytest.mark.parametrize("mtype", ["approval", "rejection"])
 def test_reserved_types_remain_readable(store, room, mtype):
-    """Issue #5 records must still parse once that path exists."""
-    mid = uuid7()
-    envelope = room.build_envelope(thread_id="t1", type="observation",
-                                   body={"text": "x"}, message_id=mid)
-    envelope["type"] = mtype
-    write_raw(store, store.message_path("t1", mid),
-              canonical.canonical_text(canonical.seal(envelope)), "human record")
-    assert store.read("t1", mid)["type"] == mtype
+    """Issue #5 records round-trip through the store as real decisions.
+
+    Written through the authority surface rather than forged: since Issue #5
+    an `approval` is only structurally valid with a complete binding record,
+    so a forged one would prove nothing about what the store will read back.
+    """
+    from agent_room.decision import HumanDecisionAuthority
+
+    request = post_decision_request(room)
+    verdict = "approve" if mtype == "approval" else "reject"
+    recorded = HumanDecisionAuthority(store).record(
+        request["message_id"], verdict)
+    stored = store.read("t1", recorded["message_id"])
+    assert stored["type"] == mtype
+    assert stored["sender"]["agent"] == "human"
+    assert stored["decision"]["request_message_id"] == request["message_id"]
 
 
 # ===== E. git timeouts stay in the error contract ==========================

@@ -89,6 +89,156 @@ ASSERTION_TYPES = frozenset({
     "observation", "hypothesis", "claim", "evidence", "test_result",
 })
 
+#: The identity reserved for the only participant that is not an AI. Agent
+#: surfaces refuse to post under it, so a `sender.agent` of "human" cannot be
+#: worn by a model — attribution is still provenance rather than proof, but it
+#: is at least not forgeable through the ordinary post path.
+HUMAN_PARTICIPANT = "human"
+RESERVED_PARTICIPANTS = frozenset({HUMAN_PARTICIPANT})
+
+#: The two message types that carry mechanical human authority (Issue #5).
+#: They are the only types allowed to carry a `decision` record, and the only
+#: types agent-facing operations may never author.
+DECISION_TYPES = frozenset({"approval", "rejection"})
+
+DECISION_SCHEMA_VERSION = 1
+
+#: approve/reject spelled once, mapped to the envelope type that carries it.
+#: A record whose verdict disagrees with its envelope type is refused rather
+#: than resolved in favour of either.
+DECISION_VERDICTS = {"approve": "approval", "reject": "rejection"}
+
+#: An action identifier is a stable slug, not prose: it is compared exactly
+#: when a decision is matched to the action it releases.
+ACTION_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+#: A decision id must survive being read back out of an artifact or a log
+#: line, so the same narrow grammar applies.
+DECISION_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+#: What a consequential action must be bound to before a human decision about
+#: it can mean anything. Both are full SHA-256: the inspected-state manifest
+#: (snapshot.py) and the supervisor packet context (supervisor.py).
+BINDING_FIELDS = ("snapshot_sha256", "supervisor_context_sha256")
+
+
+def _require_sha256(value, label: str) -> str:
+    _require(
+        isinstance(value, str) and bool(SHA256_RE.match(value)),
+        f"{label} must be a full lower-case SHA-256 hex digest, got "
+        f"{type(value).__name__} {value!r}",
+    )
+    return value
+
+
+def validate_binding(binding, label: str = "binding") -> None:
+    """The snapshot/context pair a decision is bound to.
+
+    Both are mandatory. A decision bound to only one of them would release an
+    action after the other had moved, which is precisely the stale-approval
+    failure this exists to prevent.
+    """
+    _require(isinstance(binding, dict), f"{label} must be an object")
+    for field in BINDING_FIELDS:
+        _require(field in binding, f"{label} is missing {field}")
+        _require_sha256(binding[field], f"{label}.{field}")
+    if binding.get("project") is not None:
+        _require(
+            isinstance(binding["project"], dict),
+            f"{label}.project must be an object",
+        )
+        _validate_project(binding["project"])
+
+
+def validate_action(action, label: str = "action") -> None:
+    """The bound, consequential thing a `decision_request` is asking about.
+
+    Optional by design. A `decision_request` may legitimately ask a human an
+    open question, and one without a bound action simply can never release
+    anything: `agent_room.decision.evaluate_gate` refuses it. What is refused
+    here is a *malformed* binding masquerading as a real one.
+    """
+    _require(isinstance(action, dict), f"{label} must be an object")
+    action_id = action.get("action_id")
+    _require(
+        isinstance(action_id, str) and bool(ACTION_ID_RE.match(action_id)),
+        f"{label}.action_id {action_id!r} must match "
+        "[a-z0-9][a-z0-9._-]{0,63}",
+    )
+    _require_str(action.get("scope"), f"{label}.scope")
+    _require_bool(action.get("consequential"), f"{label}.consequential")
+    validate_binding(action.get("binding"), f"{label}.binding")
+
+
+def validate_decision(decision, envelope: Mapping[str, Any]) -> None:
+    """A human decision record, bound to exactly what was decided.
+
+    Every binding field is required, and the envelope type must agree with the
+    verdict. Nothing here proves a human authored it — that is capability
+    separation's job (`decision.HumanDecisionAuthority`), not the schema's.
+    What the schema guarantees is that an approval names, immutably, the
+    request, the inspected state and the reviewed context it approved.
+    """
+    _require(isinstance(decision, dict), "decision must be an object")
+    version = decision.get("decision_schema_version")
+    _require(
+        type(version) is int and version == DECISION_SCHEMA_VERSION,
+        f"decision.decision_schema_version must be the integer "
+        f"{DECISION_SCHEMA_VERSION}, got {type(version).__name__} {version!r}",
+    )
+    decision_id = decision.get("decision_id")
+    _require(
+        isinstance(decision_id, str) and bool(DECISION_ID_RE.match(decision_id)),
+        f"decision.decision_id {decision_id!r} must match "
+        "[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+    )
+    verdict = _require_enum(
+        decision.get("decision"), frozenset(DECISION_VERDICTS), "decision.decision"
+    )
+    expected_type = DECISION_VERDICTS[verdict]
+    _require(
+        envelope["type"] == expected_type,
+        f"decision.decision {verdict!r} must be carried by a "
+        f"{expected_type!r} message, not {envelope['type']!r}",
+    )
+    decided_at = _require_str(decision.get("decided_at"), "decision.decided_at")
+    try:
+        dt.datetime.strptime(decided_at, TIMESTAMP_FORMAT)
+    except ValueError as exc:
+        raise SchemaError(
+            f"decision.decided_at {decided_at!r} is not canonical UTC "
+            f"({TIMESTAMP_FORMAT}): {exc}"
+        ) from exc
+    request_id = decision.get("request_message_id")
+    _require(
+        is_uuid7(request_id),
+        f"decision.request_message_id {request_id!r} is not a UUIDv7",
+    )
+    # Lineage is not optional for a decision: the record must hang off the
+    # request in the thread as well as name it, so a reader walking the thread
+    # cannot miss it.
+    _require(
+        envelope.get("parent_id") == request_id,
+        f"a {envelope['type']} must reply to the decision_request it decides "
+        f"({request_id!r}), got parent_id {envelope.get('parent_id')!r}",
+    )
+    _require_sha256(
+        decision.get("request_envelope_sha256"), "decision.request_envelope_sha256"
+    )
+    action_id = decision.get("action_id")
+    _require(
+        isinstance(action_id, str) and bool(ACTION_ID_RE.match(action_id)),
+        f"decision.action_id {action_id!r} must match "
+        "[a-z0-9][a-z0-9._-]{0,63}",
+    )
+    _require_str(decision.get("action_scope"), "decision.action_scope")
+    validate_binding(decision.get("binding"), "decision.binding")
+    _require_sha256(
+        decision.get("decision_binding_sha256"), "decision.decision_binding_sha256"
+    )
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
@@ -632,6 +782,29 @@ def validate_envelope(
         _require(
             envelope["human_approval_required"] is True,
             "decision_request requires human_approval_required=true",
+        )
+        if envelope.get("action") is not None:
+            validate_action(envelope["action"])
+    elif envelope.get("action") is not None:
+        raise SchemaError(
+            f"message type {mtype!r} may not carry an 'action' binding; only "
+            "a decision_request names an action a human may release"
+        )
+
+    # A decision record belongs to exactly the two authority-bearing types,
+    # and both of them require one. An approval that binds to nothing could
+    # not be checked against anything later.
+    if mtype in DECISION_TYPES:
+        _require(
+            envelope.get("decision") is not None,
+            f"a {mtype} must carry a 'decision' record binding it to the "
+            "request, snapshot and supervisor context it decides",
+        )
+        validate_decision(envelope["decision"], envelope)
+    elif envelope.get("decision") is not None:
+        raise SchemaError(
+            f"message type {mtype!r} may not carry a 'decision' record; only "
+            f"{sorted(DECISION_TYPES)} carry mechanical human authority"
         )
 
     if parent is not None and resolver is not None and check_references:
