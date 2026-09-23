@@ -1,0 +1,195 @@
+# Claude Code as an Agent Room participant
+
+Issue #3. One bounded turn against the durable store from Issue #2.
+
+The turn protocol described here — single-flight, idempotent reconciliation,
+three-valued persistence, authority boundary — lives in
+`agent_room/participant.py` and is **shared with every participant**, so a new
+one inherits these properties rather than re-deriving them. See
+`AGENT_ROOM_CODEX.md` for the Codex adapter, whose invocation boundary differs
+substantially.
+
+**No daemon, no poller, no loop.** The adapter selects one message, asks Claude
+once, posts the reply, acknowledges, and exits. Autonomous Claude↔OpenAI
+exchange is Issue #5's problem, not this one.
+
+## Discovered client facts
+
+Recorded by inspection, not assumption:
+
+| | |
+|---|---|
+| Executable | `/home/pr0/.local/bin/claude` |
+| Version | **2.1.267 (Claude Code)** |
+| One-shot mode | `claude -p --output-format json` |
+| Structured output | `--json-schema '<JSON Schema>'` — the client validates shape before we see it |
+| Prompt delivery | **stdin**, so a long thread cannot overflow the argument list |
+| Project selection | process working directory (`cwd`), plus `--add-dir` |
+| Permission controls | `--restricted`, `--strict-mcp-config`, `--allowedTools`, `--disallowedTools`, `--permission-mode` |
+
+The existing login is reused. No credential is read, created, or printed.
+
+## Invocation boundary
+
+```
+claude -p --output-format json --json-schema <response schema> \
+       --strict-mcp-config --restricted [--model …]
+```
+
+`--restricted` removes the code-running tools (Bash, REPL, …) and WebFetch,
+confines file tools to the working directory, ignores user/project/local
+settings files, and **refuses `bypassPermissions`**. `--strict-mcp-config`
+drops MCP servers.
+
+Neither is optional. `ClaudeInvoker` takes **no** `restricted` flag and **no**
+arbitrary argument passthrough, so the guarantee holds at the library
+boundary rather than depending on one CLI parser. Extra capability arrives only
+as a named `tool_profile` (see `AGENT_ROOM_CODEX.md` — the mechanism is shared,
+and only `none` is qualified today).
+
+## The turn
+
+1. select **one** message — `--message-id`, else the oldest unread addressed to
+   `claude-code`;
+2. **reconcile before any model work** — if a reply to that target is already
+   durable, do not invoke Claude (see below);
+3. recover the complete thread from durable state;
+4. invoke Claude once with the thread rendered into the prompt;
+5. validate the structured reply;
+6. post it into the **same** thread as `claude-code`;
+7. acknowledge the incoming message **only after** the reply is durably
+   recorded;
+8. exit.
+
+## Single-flight
+
+Reconciliation alone cannot stop two processes that both *check* before either
+*appends* — that is check-then-act, and it would produce two durable replies to
+one bounded turn.
+
+So the whole critical section — select, reconcile, invoke, validate, post,
+acknowledge — runs under a **participant turn lock**: an advisory `flock` on
+`<common-git-dir>/agent-room-turn-<participant>.lock`.
+
+- **Common** Git dir, so linked worktrees of one room cannot each run a turn.
+- **Per participant**, so different participants never block each other.
+- **A different file from the store's writer lock**, which the append inside
+  the section takes — reusing it would deadlock.
+- **Bounded** by `--turn-timeout` (default 960 s, comfortably more than a model
+  call). On expiry: `TurnLockTimeout`, exit 2, no traceback. Never an infinite
+  wait.
+- Released by the kernel if the process dies, so a crashed turn cannot wedge
+  the participant.
+
+A second process that waits then re-runs selection **and** reconciliation, so
+it discovers the first turn's response instead of asking Claude again. Its
+outcome is one of three, all clean:
+
+| | |
+|---|---|
+| `already_responded` | the target is still unread (the first turn's acknowledgement failed, or it was named explicitly) |
+| exit 2, `NoWorkAvailable` | the first turn also acknowledged, so there is genuinely nothing unread |
+| exit 2, `TurnLockTimeout` | the bounded wait expired |
+
+What never happens is a second model invocation or a second durable reply.
+
+`--dry-run` takes the same lock, so its report reflects settled state rather
+than a turn in flight.
+
+## Idempotence
+
+Posting is durable but acknowledging is not atomic with it: the cursor write
+can fail, or the process can die in between. The target then stays unread, and
+a naive retry would ask Claude again and append a **second** answer to one
+bounded turn — permanently, since history is append-only.
+
+So before any model work the adapter looks for a reply to the target that is
+already durable, matched on **lineage and identity only**: `parent_id ==
+target.message_id` and `sender.agent == claude-code`. Body text and similarity
+are deliberately not used — model output is not a stable key.
+
+If such a reply exists the adapter **does not invoke Claude**. It retries only
+the missing acknowledgement and returns `status: "already_responded"` carrying
+the existing `response_message_id`, `response_via` and `invoked_claude:
+false`.
+
+Every reply this adapter posts carries `sender.via = "agent-room-claude-adapter"`,
+so an automatic turn is mechanically distinguishable from a reply a human drove
+by hand. It is an audit marker, not a security control: provenance rests on
+`sender.agent`, which the store fixes to the room's participant. A *manual*
+`claude-code` reply also suppresses a duplicate turn — the conservative choice
+— and is visible as such because `response_via` is then absent.
+
+A reply from a *different* participant, or a reply to a *different* message,
+does not suppress the turn.
+
+```bash
+python3 -m agent_room.cli --repo <room> --participant claude-code \
+        --state-dir <state> claude-turn [--message-id …] [--dry-run] \
+        [--project-dir …] [--model …] [--claude-bin …]
+```
+
+`--dry-run` selects the message and builds the prompt without invoking Claude.
+
+## What Claude may and may not do
+
+Claude may author the twelve agent message types: `observation`, `hypothesis`,
+`claim`, `evidence`, `test_result`, `question`, `challenge`, `proposed_test`,
+`answer`, `retraction`, `decision_request`, `handoff`.
+
+It may **not** author `approval` or `rejection`. That is refused three times
+over — absent from the schema handed to the client, rejected by the adapter's
+own validator, and rejected again by the store. Human authority arrives in
+Issue #5.
+
+The prompt states explicitly that agreement from another participant is never
+validation, that a claim may honestly stay `proposed` or `challenged`, and that
+`supported` needs scope, a revision condition and an admissible evidence basis.
+
+**The reply is read as data.** Only structured fields are used; free-form text
+is never executed and never treated as an authority signal. Unknown fields in
+the response or its body are refused rather than ignored.
+
+## Failure behaviour
+
+| Situation | Result |
+|---|---|
+| Malformed / unparseable reply | `MalformedResponse`; **nothing posted, nothing acknowledged** |
+| Reply the room refuses (bad evidence locator, forbidden type) | `MalformedResponse` naming the rejection; nothing written |
+| Claude exits non-zero, is missing, or times out | `ClaudeAdapterError` |
+| Client reports `is_error` | `ClaudeAdapterError` carrying its message |
+| Post succeeds but acknowledgement fails | turn returns `acknowledged: false` with `acknowledge_error`; the reply stands, and the next turn **reconciles** instead of asking Claude again |
+| Post is locally durable but remote delivery fails | the response counts as durable: the turn acknowledges and reports `delivered: false` with `delivery_error` |
+| Local persistence cannot be proven (`locally_committed` unknown) | `DeliveryError` propagates; **nothing is acknowledged and no response is claimed**, so a later turn reconciles against history |
+
+Durability precedes acknowledgement deliberately. The reverse order could mark
+a request read with no answer recorded — losing it. With reconciliation in
+front of the model call, the worst case is now a repeated *acknowledgement
+attempt*, not a repeated answer.
+
+## Restart continuity
+
+Nothing lives in the process. Thread history is in the room branch; read/ack
+state is the participant-local cursor. A fresh process pointed at the same
+repo and state directory recovers both and can continue the thread — proven in
+`tests/test_agent_room_claude_participant.py` by a genuinely separate
+subprocess.
+
+## Verified connectivity
+
+One live turn against a disposable room, `2026-09-23`:
+
+- supervisor posted a `question` addressed to `claude-code`;
+- the adapter carried the body — **the human copied nothing**;
+- Claude inspected the repository read-only under `--restricted`;
+- it returned a structured `answer`, posted at commit `c046896…` with
+  `sender.agent = claude-code` and `parent_id` set to the question;
+- the incoming message was acknowledged only after that post; inbox went to 0;
+- `verify_store()` returned 2.
+
+## Boundaries held
+
+No live `agent-room` transport branch, no merge, no push to NEWI, no
+architecture change, no credential or security change, no external
+publication, no autonomous loop. Tests use a stub invoker and never spend
+tokens or require a login.
