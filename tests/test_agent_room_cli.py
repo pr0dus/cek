@@ -98,7 +98,7 @@ def test_cli_supported_claim_rules_apply(cli):
         "--claim", '{"status": "supported", "evidence_basis": ["e1"]}', expect=2)
 
     ok = cli("post", "--thread-id", "t1", "--type", "claim", "--body", '{"text": "c"}',
-             "--evidence", '[{"id":"e1","kind":"repo","commit":"40ffdf4617283f4accb3493a8a710c5025c5d3bc","path":"x.py"}]',
+             "--evidence", '[{"id":"e1","kind":"repo","repo":"pr0dus/concept-evolution-kernel","commit":"40ffdf4617283f4accb3493a8a710c5025c5d3bc","path":"x.py"}]',
              "--claim", '{"status":"supported","scope":"at 40ffdf4617283f4accb3493a8a710c5025c5d3bc",'
                         '"revision_condition":"a counterexample","evidence_basis":["e1"]}')
     assert ok["status"] == "created"

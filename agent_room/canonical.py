@@ -16,10 +16,30 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-from .errors import IntegrityError
+from .errors import IntegrityError, SchemaError
 
 DIGEST_FIELD = "envelope_sha256"
 SEPARATORS = (",", ":")
+
+
+def _reject_duplicate_keys(pairs):
+    """Object hook that refuses repeated keys.
+
+    Python's decoder silently keeps the last value, so `{"type":"claim",
+    "type":"approval"}` would hash and validate as one thing while a different
+    reader saw another. At an audited boundary that ambiguity is a defect.
+    """
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise SchemaError(f"duplicate JSON key {key!r} in stored artifact")
+        seen.add(key)
+    return dict(pairs)
+
+
+def strict_loads(text: str):
+    """Parse JSON, rejecting duplicate object keys."""
+    return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
 
 
 def canonical_bytes(obj: Any) -> bytes:

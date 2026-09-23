@@ -107,6 +107,19 @@ class DeliveryError(AgentRoomError):
         }
 
 
+class GitTimeout(AgentRoomError):
+    """A Git subprocess exceeded its timeout.
+
+    Kept inside the Agent Room error contract so a caller — and the CLI —
+    never sees a bare `subprocess.TimeoutExpired` leak out of the library.
+    """
+
+    def __init__(self, message, *, command=None, timeout=None):
+        super().__init__(message)
+        self.command = command
+        self.timeout = timeout
+
+
 class LockTimeout(AgentRoomError):
     """Another process holds the single-writer lock for this checkout.
 

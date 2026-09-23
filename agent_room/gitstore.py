@@ -42,13 +42,15 @@ from .errors import (
     ConflictError,
     DeliveryError,
     DirtyCheckoutError,
+    GitTimeout,
     LockTimeout,
     PushRaceError,
     SchemaError,
     UnresolvedReference,
     WrongBranchError,
 )
-from .schema import validate_envelope
+from .ids import is_uuid7
+from .schema import THREAD_ID_RE, validate_envelope
 
 MESSAGES_DIR = ".agent-room/messages"
 DEFAULT_BRANCH = "agent-room"
@@ -90,13 +92,21 @@ class GitMessageStore:
 
     # -- git plumbing ------------------------------------------------------
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=self.workdir,
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-        )
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=self.workdir,
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitTimeout(
+                f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s "
+                f"in {self.workdir}",
+                command=("git", *args),
+                timeout=GIT_TIMEOUT_SECONDS,
+            ) from exc
         if check and proc.returncode != 0:
             raise AgentRoomError(
                 f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
@@ -265,12 +275,44 @@ class GitMessageStore:
             )
 
     # -- history (the authority for what was actually committed) -----------
+    def _assert_linear(self) -> None:
+        """Refuse merge commits anywhere in the branch.
+
+        This transport resolves concurrency by rebase, so a merge adds no
+        capability. It does add a hiding place: a merge commit's own A/M/D
+        changes are not reported by default `git log` traversal, so a message
+        could be rewritten or deleted inside one and never appear in the scan.
+        Linear history is what makes the scan complete.
+        """
+        proc = self._git("rev-list", "--merges", self.branch, check=False)
+        if proc.returncode != 0:
+            return
+        merges = [line for line in proc.stdout.split() if line]
+        if merges:
+            raise AppendOnlyViolation(
+                f"{self.branch} contains merge commits ({merges[:3]}); the room "
+                "branch must be linear so that every message change is visible "
+                "to history verification"
+            )
+
+    @staticmethod
+    def _is_canonical_message_path(path: str) -> bool:
+        parts = path.split("/")
+        if len(parts) != 4 or parts[0] != ".agent-room" or parts[1] != "messages":
+            return False
+        if not parts[3].endswith(".json"):
+            return False
+        return bool(THREAD_ID_RE.match(parts[2])) and is_uuid7(parts[3][: -len(".json")])
+
     def _history(self) -> dict:
         """Map message path -> add commit, rejecting any later mutation.
 
-        One `git log` over the message tree. A path must appear exactly once
-        as an addition and never again: a later M/D/R means committed history
-        was rewritten, which the append-only model forbids.
+        One NUL-delimited `git log` over the message tree. `-z` matters:
+        without it Git quotes paths containing spaces or non-ASCII, and a
+        quoted path would not match the prefix test and would silently vanish
+        from verification. A path must appear exactly once as an addition and
+        never again; a path that is not a canonical message path fails closed
+        rather than being skipped.
         """
         tip = self._git("rev-parse", self.branch, check=False)
         if tip.returncode != 0:
@@ -280,10 +322,11 @@ class GitMessageStore:
         if cached is not None and cached[0] == tip_sha:
             return cached[1]
 
+        self._assert_linear()
 
         proc = self._git(
             "log", self.branch, "--reverse", "--format=%H",
-            "--name-status", "--no-renames", "--", MESSAGES_DIR,
+            "--name-status", "-z", "--no-renames", "--", MESSAGES_DIR,
             check=False,
         )
         if proc.returncode != 0:
@@ -292,35 +335,46 @@ class GitMessageStore:
         added: dict[str, str] = {}
         commit_seq: dict[str, int] = {}
         commit = ""
-        for line in proc.stdout.splitlines():
-            line = line.rstrip("\n")
-            if not line.strip():
+        tokens = [t for t in proc.stdout.split("\0")]
+        i = 0
+        while i < len(tokens):
+            token = tokens[i].strip()
+            i += 1
+            if not token:
                 continue
-            if "\t" not in line and len(line) >= 40 and all(
-                c in "0123456789abcdef" for c in line.strip()
-            ):
-                commit = line.strip()
+            if len(token) >= 40 and all(c in "0123456789abcdef" for c in token):
+                commit = token
                 if commit not in commit_seq:
                     commit_seq[commit] = len(commit_seq)
                 continue
-            parts = line.split("\t")
-            status = parts[0].strip()
-            paths = [p for p in parts[1:] if p]
-            for path in paths:
-                if not (path.startswith(f"{MESSAGES_DIR}/") and path.endswith(".json")):
-                    continue
-                if status.startswith("A"):
-                    if path in added:
-                        raise AppendOnlyViolation(
-                            f"{path} was added twice (second add in {commit})"
-                        )
-                    added[path] = commit
-                else:
+            # Otherwise this is a status token; the path is the next token.
+            status = token
+            if i >= len(tokens):
+                raise AppendOnlyViolation(
+                    f"malformed git status output near {status!r} in {commit}"
+                )
+            path = tokens[i]
+            i += 1
+            if not path.startswith(f"{MESSAGES_DIR}/"):
+                continue
+            if not self._is_canonical_message_path(path):
+                raise AppendOnlyViolation(
+                    f"{path!r} (in commit {commit}) is under {MESSAGES_DIR}/ but "
+                    "is not a canonical <thread_id>/<uuid7>.json message path; "
+                    "refusing to verify a history containing unrecognised paths"
+                )
+            if status.startswith("A"):
+                if path in added:
                     raise AppendOnlyViolation(
-                        f"{path} was {status!r} in commit {commit} after being "
-                        "committed; message history is append-only and must not "
-                        "be modified, deleted or renamed"
+                        f"{path} was added twice (second add in {commit})"
                     )
+                added[path] = commit
+            else:
+                raise AppendOnlyViolation(
+                    f"{path} was {status!r} in commit {commit} after being "
+                    "committed; message history is append-only and must not "
+                    "be modified, deleted or renamed"
+                )
 
         # A message_id must be unique across the whole room, not just within
         # a thread path: resolve_message() looks up by id alone, so the same
@@ -343,14 +397,24 @@ class GitMessageStore:
         self._history()
         return self._history_cache[2]
 
-    def _commit_order(self) -> dict:
-        """commit sha -> position in the branch's commit order."""
-        self._history()
-        return self._history_cache[3]
+    def is_strict_ancestor(self, earlier: str, later: str) -> bool:
+        """True iff `earlier` is an ancestor of `later` and not the same commit.
 
-    def _position_of(self, path: str) -> int:
-        """Where `path` sits in commit order."""
-        return self._commit_order()[self._history()[path]]
+        Ancestry, not log position: `git log` order is a traversal artifact and
+        would call two sibling commits ordered when neither can see the other.
+        Causality has to mean "this already existed on the path that led here".
+        """
+        if earlier == later:
+            return False
+        cache = getattr(self, "_ancestry_cache", None)
+        if cache is None:
+            cache = self._ancestry_cache = {}
+        key = (earlier, later)
+        if key not in cache:
+            cache[key] = self._git(
+                "merge-base", "--is-ancestor", earlier, later, check=False
+            ).returncode == 0
+        return cache[key]
 
     def verify_append_only(self) -> int:
         """Re-scan history. Raises on violation; returns the message count."""
@@ -374,7 +438,7 @@ class GitMessageStore:
             raise AppendOnlyViolation(
                 f"{path} is missing from its own add commit {commit}"
             )
-        envelope = json.loads(raw)
+        envelope = canonical.strict_loads(raw)
         canonical.verify(envelope)
         validate_envelope(envelope, agent_facing=False, check_references=False)
 
@@ -423,14 +487,12 @@ class GitMessageStore:
 
         return _Resolver()
 
-    def _resolver_as_of(self, position: int):
-        """Resolves only what existed strictly before `position`.
+    def _resolver_as_of(self, commit: str):
+        """Resolves only messages whose add commit is a strict ancestor.
 
-        Historical causality: a message may rely only on state that existed
-        when it was committed. Without this, an out-of-band child could be
-        committed before its parent, or a `supported` claim before the evidence
-        it cites, and become retrospectively valid once the target was added -
-        which would make the audit trail meaningless.
+        Historical causality: a message may rely only on state that existed on
+        the history leading to it. Self-reference, same-commit and sibling
+        references all fail, because none of them satisfies strict ancestry.
         """
         store = self
 
@@ -440,17 +502,35 @@ class GitMessageStore:
                 path = store._id_index().get(message_id)
                 if path is None:
                     return None
-                other = store._position_of(path)
-                if other >= position:
+                other = store._history()[path]
+                if not store.is_strict_ancestor(other, commit):
                     raise UnresolvedReference(
-                        f"reference to {message_id} is not historically valid: it "
-                        f"was committed at position {other}, at or after the "
-                        f"referencing message at position {position}; a message "
-                        "may only rely on state that existed when it was committed"
+                        f"reference to {message_id} is not historically valid: "
+                        f"its add commit {other[:8]} is not a strict ancestor of "
+                        f"the referencing message's add commit {commit[:8]}; a "
+                        "message may only rely on state that existed when it "
+                        "was committed"
                     )
-                return store._load_raw(path, store._history()[path])
+                return store._load_raw(path, other)
+
+            @staticmethod
+            def commit_object_state(sha: str) -> str:
+                return store.commit_object_state(sha)
 
         return _AsOfResolver()
+
+    def commit_object_state(self, sha: str) -> str:
+        """Whether a pinned object id is locally present, and if so what it is.
+
+        Returns "commit", "not-a-commit", or "absent". Evidence usually pins a
+        commit in a *different* repository that this machine may not have; in
+        that case the full locator is preserved and existence is deliberately
+        not fabricated. Only objects we actually hold are checked.
+        """
+        if self._git("cat-file", "-e", sha, check=False).returncode != 0:
+            return "absent"
+        kind = self._git("cat-file", "-t", sha, check=False).stdout.strip()
+        return "commit" if kind == "commit" else "not-a-commit"
 
     def _load(self, path: str, commit: str) -> dict:
         """Read one message as committed, with references resolved.
@@ -464,7 +544,7 @@ class GitMessageStore:
         validate_envelope(
             envelope,
             agent_facing=False,
-            resolver=self._resolver_as_of(self._position_of(path)),
+            resolver=self._resolver_as_of(commit),
             check_references=True,
         )
         return envelope
@@ -477,10 +557,16 @@ class GitMessageStore:
         actually in the branch. Falls back when history cannot be read at all -
         reporting a stale SHA is still better than reporting none.
         """
-        try:
-            return self._history().get(path, fallback)
-        except AgentRoomError:
-            return fallback
+        proc = self._git(
+            "log", self.branch, "--reverse", "--diff-filter=A",
+            "--format=%H", "-z", "--", path, check=False,
+        )
+        if proc.returncode == 0:
+            for token in proc.stdout.split("\0"):
+                token = token.strip()
+                if len(token) >= 40 and all(c in "0123456789abcdef" for c in token):
+                    return token
+        return fallback
 
     def verify_store(self) -> int:
         """Walk every committed message and check the whole contract.
@@ -560,9 +646,14 @@ class GitMessageStore:
         """
         self.assert_room_branch()
         canonical.verify(envelope)
+        # Every WRITE path in this package is agent-facing for Issues #2-#4:
+        # `append` is exported, so validating it leniently would be a
+        # privileged bypass around AgentRoom.post for exactly the two reserved
+        # types. Reads stay agent_facing=False so Issue #5 records remain
+        # readable when that authority-bearing path is built.
         validate_envelope(
             envelope,
-            agent_facing=False,
+            agent_facing=True,
             resolver=resolver if resolver is not None else self._raw_resolver,
         )
 
@@ -574,6 +665,11 @@ class GitMessageStore:
             # Whole checkout must be clean before we stage anything, or a
             # rewrite someone already staged would be committed alongside.
             self.assert_clean_checkout()
+            # Never build on corrupt history. A local-only store must refuse
+            # this just as the delivery path does: otherwise a store with no
+            # remote would happily extend an artifact that is correctly hashed
+            # but semantically invalid.
+            self.verify_store()
 
             existing_path = self._id_index().get(message_id)
             if existing_path is not None:
@@ -606,7 +702,26 @@ class GitMessageStore:
             self._git("add", "--", rel)
             # Commit this path only. Even if something else reached the index
             # between the clean check and here, it cannot ride along.
-            commit = self._commit(f"agent-room: {envelope['type']} {message_id}", rel)
+            try:
+                commit = self._commit(
+                    f"agent-room: {envelope['type']} {message_id}", rel
+                )
+            except GitTimeout as exc:
+                # The commit may or may not have landed. Guessing either way is
+                # wrong: reporting failure invites a repost under a fresh UUID,
+                # reporting success may be false. Look and say what is true.
+                landed = self.current_add_commit(rel)
+                if landed is None:
+                    raise
+                raise DeliveryError(
+                    f"message {message_id} was committed at {landed} but the "
+                    f"commit command did not return cleanly: {exc}. "
+                    "Retry delivery with push(); do not repost.",
+                    message_id=message_id,
+                    commit=landed,
+                    path=rel,
+                    cause=exc,
+                ) from exc
 
             result = {
                 "status": "created",

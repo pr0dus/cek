@@ -12,10 +12,19 @@ correction at cb13177 removed.
 """
 
 import os
+import re
 import time
 import uuid
 
 UUID_VERSION = 7
+
+#: Textual identity has exactly one spelling: lower-case, hyphenated, version
+#: nibble 7, RFC 4122 variant. `uuid.UUID()` happily parses unhyphenated,
+#: upper-case, braced and urn: forms, which would let the same identity be
+#: committed under several distinct paths and defeat room-wide uniqueness.
+CANONICAL_UUID7_RE = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
 
 
 def uuid7(*, when_ms: int | None = None) -> str:
@@ -43,13 +52,14 @@ def uuid7(*, when_ms: int | None = None) -> str:
     return str(uuid.UUID(int=value))
 
 
-def is_uuid7(value: str) -> bool:
-    """True iff `value` parses as a UUID and declares version 7."""
-    try:
-        parsed = uuid.UUID(str(value))
-    except (ValueError, AttributeError, TypeError):
+def is_uuid7(value) -> bool:
+    """True iff `value` is a UUIDv7 in its one canonical textual form."""
+    if not isinstance(value, str) or not CANONICAL_UUID7_RE.match(value):
         return False
-    return parsed.version == UUID_VERSION
+    try:
+        return uuid.UUID(value).version == UUID_VERSION
+    except ValueError:
+        return False
 
 
 def timestamp_ms(value: str) -> int:

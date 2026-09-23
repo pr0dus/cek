@@ -83,10 +83,24 @@ the body, so a mismatch would let `resolve_message()` return an envelope
 claiming an identity it is not filed under. Checked before the artifact can
 participate in any reference resolution.
 
+**The branch is linear.** Merge commits are refused anywhere in the room
+branch. Concurrency is resolved by rebase, so a merge adds no capability — but
+it does add a hiding place, since a merge commit's own A/M/D changes are not
+reported by default log traversal. Linear history is what makes the scan
+complete.
+
+**History parsing is NUL-safe and fail-closed.** The scan uses `-z`: without
+it Git quotes paths containing spaces or non-ASCII, and a quoted path would
+silently vanish from verification. Any path under `.agent-room/messages/` that
+is not a canonical `<thread_id>/<uuid7>.json` fails verification rather than
+being skipped.
+
 **References obey historical causality.** A parent or cross-message
-`evidence_basis` entry must resolve to a message whose add commit is *strictly
-earlier* in commit order. Self-reference, forward reference, and two messages
-added in the same commit are all refused — a message may only rely on state
+`evidence_basis` entry must resolve to a message whose add commit is a **strict
+ancestor** of the referencing message's add commit — Git ancestry, not log
+order, because log order is a traversal artifact that would call two sibling
+commits ordered when neither can see the other. Self-reference, same-commit,
+sibling and forward references are all refused — a message may only rely on state
 that existed when it was committed, otherwise a claim could become
 retrospectively supported by evidence added later. In-message evidence ids are
 unaffected: they live inside the same envelope.
@@ -130,6 +144,10 @@ under the lock before writing**, so two processes acknowledging different
 messages cannot lose each other's acknowledgements.
 
 ## Clean checkout
+
+`append()` also runs the **full-store gate on existing history before
+extending it**, with or without a remote: a local-only store must not build on
+a correctly hashed but semantically invalid artifact either.
 
 `append()` refuses to start unless `git status --porcelain` is empty
 (`DirtyCheckoutError`). Otherwise a rewrite of an already-committed message
@@ -200,6 +218,28 @@ thread; `reply()` refuses a conflicting explicit `thread_id`.
 Agent-facing `post`/`reply` refuse `approval` and `rejection` outright. The
 schema and `approvals/` path stay reserved for Issue #5.
 
+## Evidence locator schemas
+
+An admissible reference must identify something inspectable. The store still
+does not decide whether evidence is *true*.
+
+| kind | required |
+|---|---|
+| `repo` | non-empty `repo`, full non-null Git object id `commit`, non-empty repository-relative `path`; optional `lines` as `[start, end]` with `start >= 1` and `end >= start` |
+| `run` | full non-null `commit`, plus **at least one** stable locator: `run_id` (non-empty string) or a repository-relative artifact `path` |
+| `external` | non-empty `url` |
+| `agent_output` | free-form; never admissible as support |
+
+Paths must be repository-relative — no leading `/`, no `..` segment. The
+all-zero object id is refused: it is syntactically a full oid but names
+nothing.
+
+**Existence is verified only where it can be.** If the pinned object is present
+in this machine's object database it must really be a commit. Evidence usually
+pins a commit in a *different* repository that this host does not have; there
+the full immutable locator is preserved and existence is deliberately **not**
+fabricated.
+
 ## Provenance
 
 `sender.agent` is fixed to the `AgentRoom`'s participant. A room opened as
@@ -207,6 +247,21 @@ schema and `approvals/` path stay reserved for Issue #5.
 `ForbiddenOperation`. Optional `model`/`operator` metadata stays configurable.
 Git authorship is deliberately not authority, which is exactly why `sender`
 must be reliable.
+
+`sender` metadata beyond the identity must be scalar. `recipient` must name a
+non-empty `agent` or set `broadcast: true` as a real boolean — a truthy string
+would otherwise silently widen a directed message. `project.repo` and
+`project.commit` are typed the same way as evidence locators.
+
+**Reserved types are not writable.** Every write API in this package —
+including the exported `GitMessageStore.append()` — refuses `approval` and
+`rejection` for Issues #2–#4, so there is no privileged bypass around
+`AgentRoom.post()`. Reads keep `agent_facing=False`, so Issue #5 records stay
+parseable once that authority-bearing path exists.
+
+**Stored JSON is decoded strictly.** Duplicate object keys are refused rather
+than silently resolved to the last value — at an audited boundary that
+ambiguity is a defect. CLI JSON arguments are parsed the same way.
 
 `acknowledge()` requires the message to exist and, for directed messages, to be
 addressed to (or broadcast to) the acknowledging participant.
@@ -265,6 +320,18 @@ history. That state is therefore explicit:
   (`as_result()` renders the same facts as a dict).
 
 The correct recovery is to retry `push()`, never to repost.
+
+**Git timeouts stay inside the contract.** A `subprocess.TimeoutExpired` from
+any Git call becomes `GitTimeout` (an `AgentRoomError`) carrying the command;
+on the post-commit push path it becomes a `DeliveryError` like any other
+delivery failure. If the *commit* itself returns ambiguously, the store looks
+up whether the message actually landed and reports that identity rather than
+letting a caller assume nothing happened.
+
+**The reported commit does not depend on store-wide validity.**
+`current_add_commit()` uses an exact per-path `git log --diff-filter=A` lookup,
+so delivery recovery still names the surviving commit even when unrelated
+corruption makes full verification fail.
 
 **The reported `commit` is always current.** A non-fast-forward rebase rewrites
 local commit SHAs, so both the success result and `DeliveryError.commit` report

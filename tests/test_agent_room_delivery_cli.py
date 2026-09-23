@@ -18,7 +18,7 @@ from agent_room.errors import ClaimStateError, SchemaError
 from tests.conftest_agent_room import configure_identity
 
 FULL_SHA = "40ffdf4617283f4accb3493a8a710c5025c5d3bc"
-REPO_EVIDENCE = {"kind": "repo", "commit": FULL_SHA, "path": "x.py"}
+REPO_EVIDENCE = {"kind": "repo", "repo": "pr0dus/concept-evolution-kernel", "commit": FULL_SHA, "path": "x.py"}
 
 
 # -- public API --------------------------------------------------------------

@@ -31,7 +31,8 @@ def _emit(obj) -> None:
 
 
 def _json_arg(value: str | None, default):
-    return json.loads(value) if value else default
+    """Parse a CLI JSON argument, rejecting duplicate keys like stored JSON."""
+    return canonical.strict_loads(value) if value else default
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     reply.add_argument("--evidence", default=None)
     reply.add_argument("--claim", default=None)
     reply.add_argument("--status", default="open")
+    reply.add_argument("--reply-requested", action="store_true")
+    reply.add_argument("--human-approval-required", action="store_true")
 
     get = sub.add_parser("get", help="get one message")
     get.add_argument("--thread-id", required=True)
@@ -131,6 +134,8 @@ def main(argv=None) -> int:
                 evidence=_json_arg(args.evidence, None),
                 claim=_json_arg(args.claim, None),
                 status=args.status,
+                reply_requested=args.reply_requested,
+                human_approval_required=args.human_approval_required,
             ))
         elif args.command == "get":
             _emit(room.get(args.thread_id, args.message_id))

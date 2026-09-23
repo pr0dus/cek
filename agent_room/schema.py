@@ -57,6 +57,11 @@ ADMISSIBLE_FOR_SUPPORT = EVIDENCE_KINDS - INADMISSIBLE_FOR_SUPPORT
 #: one.
 FULL_COMMIT_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
+#: The all-zero object id is syntactically a full oid but names nothing. Git
+#: itself uses it as the null sentinel, so accepting it would let "pinned"
+#: evidence point at no object at all.
+NULL_OBJECT_IDS = frozenset({"0" * 40, "0" * 64})
+
 #: A thread_id becomes a Git path segment and is parsed back out of
 #: `git log --name-status` output line by line. Anything Git would quote or
 #: escape - whitespace, control characters, separators, non-ASCII - could break
@@ -83,7 +88,158 @@ def _require(condition: bool, message: str) -> None:
         raise SchemaError(message)
 
 
-def validate_evidence(evidence: Any) -> None:
+#: Sender metadata beyond the identity is free-form but must stay scalar, so
+#: routing/audit fields cannot smuggle nested structures past filtering.
+SCALAR_TYPES = (str, int, float, bool)
+
+
+def _validate_sender(sender: dict) -> None:
+    agent = sender.get("agent")
+    _require(
+        isinstance(agent, str) and agent.strip() != "",
+        f"sender.agent must be a non-empty string, got "
+        f"{type(agent).__name__} {agent!r}",
+    )
+    for key, value in sender.items():
+        if key == "agent":
+            continue
+        _require(
+            isinstance(value, SCALAR_TYPES),
+            f"sender.{key} must be a scalar (str/int/float/bool), got "
+            f"{type(value).__name__} {value!r}",
+        )
+
+
+def _validate_recipient(recipient: dict) -> None:
+    """A message must actually be addressed to someone.
+
+    `broadcast` must be a real boolean: a truthy string like "false" would
+    otherwise silently make a directed message visible room-wide.
+    """
+    if "broadcast" in recipient:
+        _require(
+            isinstance(recipient["broadcast"], bool),
+            f"recipient.broadcast must be a boolean, got "
+            f"{type(recipient['broadcast']).__name__} {recipient['broadcast']!r}",
+        )
+    if "agent" in recipient:
+        agent = recipient["agent"]
+        _require(
+            isinstance(agent, str) and agent.strip() != "",
+            f"recipient.agent must be a non-empty string, got "
+            f"{type(agent).__name__} {agent!r}",
+        )
+    _require(
+        recipient.get("broadcast") is True or bool(recipient.get("agent")),
+        "recipient must name an agent or set broadcast: true",
+    )
+
+
+def _validate_project(project: dict) -> None:
+    repo = project.get("repo")
+    if repo is not None:
+        _require(
+            isinstance(repo, str) and repo.strip() != "",
+            f"project.repo must be a non-empty string, got "
+            f"{type(repo).__name__} {repo!r}",
+        )
+    commit = project.get("commit")
+    if commit is not None:
+        _require(
+            isinstance(commit, str) and bool(FULL_COMMIT_RE.match(commit))
+            and commit not in NULL_OBJECT_IDS,
+            f"project.commit {commit!r} must be a full non-null Git object ID",
+        )
+
+
+def _require_relative_path(value, label: str) -> None:
+    _require(
+        isinstance(value, str) and value.strip() != "",
+        f"{label} must be a non-empty string, got {type(value).__name__} {value!r}",
+    )
+    _require(
+        not value.startswith("/") and ".." not in value.split("/"),
+        f"{label} {value!r} must be a repository-relative path without '..'",
+    )
+
+
+def _validate_pinned_commit(ref: dict, i: int, verifier=None) -> None:
+    commit = ref.get("commit")
+    _require(
+        bool(commit),
+        f"evidence[{i}] of kind {ref.get('kind')!r} must pin an immutable commit",
+    )
+    _require(
+        isinstance(commit, str) and bool(FULL_COMMIT_RE.match(commit)),
+        f"evidence[{i}].commit {commit!r} is not a full Git object ID "
+        "(40 hex for SHA-1, 64 for SHA-256); an abbreviation is not an "
+        "immutable identity",
+    )
+    _require(
+        commit not in NULL_OBJECT_IDS,
+        f"evidence[{i}].commit is the all-zero object id, which names nothing",
+    )
+    # Existence is only checkable for objects this machine actually has. When
+    # the referenced repository is not available locally the full locator is
+    # preserved and existence is deliberately NOT fabricated - see
+    # docs/AGENT_ROOM_STORE.md.
+    if verifier is not None and hasattr(verifier, "commit_object_state"):
+        state = verifier.commit_object_state(commit)
+        if state == "not-a-commit":
+            raise SchemaError(
+                f"evidence[{i}].commit {commit} exists locally but is not a commit"
+            )
+
+
+def _validate_repo_locator(ref: dict, i: int) -> None:
+    _require(
+        isinstance(ref.get("repo"), str) and ref["repo"].strip() != "",
+        f"evidence[{i}] of kind 'repo' must name a non-empty repo",
+    )
+    _require_relative_path(ref.get("path"), f"evidence[{i}].path")
+    if "lines" in ref:
+        lines = ref["lines"]
+        _require(
+            isinstance(lines, list) and len(lines) == 2
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in lines),
+            f"evidence[{i}].lines must be a two-integer range, got {lines!r}",
+        )
+        start, end = lines
+        _require(
+            start >= 1 and end >= start,
+            f"evidence[{i}].lines {lines!r} must be a positive ascending range",
+        )
+
+
+def _validate_run_locator(ref: dict, i: int) -> None:
+    """A run must be findable again: a stable run_id, or an artifact path."""
+    run_id, path = ref.get("run_id"), ref.get("path")
+    _require(
+        run_id is not None or path is not None,
+        f"evidence[{i}] of kind 'run' must carry a stable locator: "
+        "'run_id' or a repository-relative artifact 'path'",
+    )
+    if run_id is not None:
+        _require(
+            isinstance(run_id, str) and run_id.strip() != "",
+            f"evidence[{i}].run_id must be a non-empty string, got "
+            f"{type(run_id).__name__} {run_id!r}",
+        )
+    if path is not None:
+        _require_relative_path(path, f"evidence[{i}].path")
+
+
+def _validate_external_locator(ref: dict, i: int) -> None:
+    """External evidence must at least say where it is."""
+    url = ref.get("url")
+    _require(
+        isinstance(url, str) and url.strip() != "",
+        f"evidence[{i}] of kind 'external' must carry a non-empty 'url' "
+        f"locator, got {type(url).__name__} {url!r}",
+    )
+
+
+def validate_evidence(evidence: Any, verifier=None) -> None:
     _require(isinstance(evidence, list), "evidence must be a list")
     seen_ids: set = set()
     for i, ref in enumerate(evidence):
@@ -113,17 +269,13 @@ def validate_evidence(evidence: Any) -> None:
             f"evidence[{i}].kind {kind!r} not in {sorted(EVIDENCE_KINDS)}",
         )
         if kind in ("repo", "run"):
-            commit = ref.get("commit")
-            _require(
-                bool(commit),
-                f"evidence[{i}] of kind {kind!r} must pin an immutable commit",
-            )
-            _require(
-                isinstance(commit, str) and bool(FULL_COMMIT_RE.match(commit)),
-                f"evidence[{i}].commit {commit!r} is not a full Git object ID "
-                "(40 hex for SHA-1, 64 for SHA-256); an abbreviation is not an "
-                "immutable identity",
-            )
+            _validate_pinned_commit(ref, i, verifier)
+        if kind == "repo":
+            _validate_repo_locator(ref, i)
+        elif kind == "run":
+            _validate_run_locator(ref, i)
+        elif kind == "external":
+            _validate_external_locator(ref, i)
 
 
 def message_is_admissible_support(message: dict) -> bool:
@@ -291,7 +443,9 @@ def validate_envelope(
 
     for field in ("sender", "recipient", "project", "body"):
         _require(isinstance(envelope[field], dict), f"{field} must be an object")
-    _require(bool(envelope["sender"].get("agent")), "sender.agent is required")
+    _validate_sender(envelope["sender"])
+    _validate_recipient(envelope["recipient"])
+    _validate_project(envelope["project"])
 
     for field in ("reply_requested", "human_approval_required"):
         _require(isinstance(envelope[field], bool), f"{field} must be a boolean")
@@ -331,7 +485,7 @@ def validate_envelope(
                 "a reply may not cross threads"
             )
 
-    validate_evidence(envelope.get("evidence", []))
+    validate_evidence(envelope.get("evidence", []), resolver)
 
     if "claim" in envelope and envelope["claim"] is not None:
         _require(

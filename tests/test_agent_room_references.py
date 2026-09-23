@@ -18,7 +18,8 @@ from agent_room.errors import (
 from agent_room.ids import uuid7
 
 FULL_SHA = "40ffdf4617283f4accb3493a8a710c5025c5d3bc"
-REPO_EVIDENCE = {"kind": "repo", "commit": FULL_SHA, "path": "newi_arc/metrics.py"}
+REPO_EVIDENCE = {"kind": "repo", "repo": "pr0dus/concept-evolution-kernel",
+                  "commit": FULL_SHA, "path": "newi_arc/metrics.py"}
 
 
 def supported(**over):
@@ -106,12 +107,12 @@ def test_abbreviated_or_symbolic_commits_are_refused(room, commit):
     """An abbreviation is not an immutable identity."""
     with pytest.raises(SchemaError, match="full Git object ID"):
         room.post(thread_id="t1", type="evidence", body={"text": "e"},
-                  evidence=[{"kind": "repo", "commit": commit, "path": "x.py"}])
+                  evidence=[{"kind": "repo", "repo": "pr0dus/concept-evolution-kernel", "commit": commit, "path": "x.py"}])
 
 
 def test_sha256_repo_object_ids_are_accepted(room):
     room.post(thread_id="t1", type="evidence", body={"text": "e"},
-              evidence=[{"kind": "repo", "commit": "a" * 64, "path": "x.py"}])
+              evidence=[{"kind": "repo", "repo": "pr0dus/concept-evolution-kernel", "commit": "a" * 64, "path": "x.py"}])
 
 
 # -- 5. provenance is not forgeable ----------------------------------------

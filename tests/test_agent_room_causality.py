@@ -23,7 +23,8 @@ from agent_room.ids import uuid7
 from tests.conftest_agent_room import configure_identity, git
 
 FULL_SHA = "40ffdf4617283f4accb3493a8a710c5025c5d3bc"
-REPO_EVIDENCE = {"kind": "repo", "commit": FULL_SHA, "path": "newi_arc/metrics.py"}
+REPO_EVIDENCE = {"kind": "repo", "repo": "pr0dus/concept-evolution-kernel",
+                  "commit": FULL_SHA, "path": "newi_arc/metrics.py"}
 
 
 def commit_at(store, rel, envelope, message="out-of-band artifact"):
