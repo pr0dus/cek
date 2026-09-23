@@ -28,6 +28,12 @@ SCHEMA_VERSION = 1
 LOCK_TIMEOUT_SECONDS = 10.0
 LOCK_POLL_SECONDS = 0.05
 
+#: Participant-local state is not shared state. The host umask here is 0002,
+#: which would leave the cursor group-writable — so the mode is set rather
+#: than inherited. `mkstemp` already creates at 0600; `mkdir` does not.
+STATE_DIR_MODE = 0o700
+STATE_FILE_MODE = 0o600
+
 
 class ParticipantCursor:
     """Tracks which messages one participant has acknowledged."""
@@ -106,11 +112,20 @@ class ParticipantCursor:
                 )
         return state
 
+    def _ensure_state_dir(self) -> None:
+        """Create the state directory owner-only, and keep it that way."""
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=STATE_DIR_MODE)
+        try:
+            self.state_dir.chmod(STATE_DIR_MODE)
+        except OSError:                                      # pragma: no cover
+            pass
+
     def _save(self) -> None:
         """Atomic replace, so an interrupted write cannot truncate the cursor."""
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_state_dir()
         fd, tmp = tempfile.mkstemp(dir=self.state_dir, suffix=".tmp")
         try:
+            os.fchmod(fd, STATE_FILE_MODE)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(self._state, fh, indent=2, sort_keys=True)
                 fh.flush()
@@ -128,7 +143,7 @@ class ParticipantCursor:
         write back the state they loaded, and the later write would silently
         drop the earlier acknowledgement.
         """
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_state_dir()
         lock_path = self.state_dir / f"cursor-{self.participant}.lock"
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS

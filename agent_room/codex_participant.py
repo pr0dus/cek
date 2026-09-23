@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from . import tool_profiles
+from .process import ProcessError, run_bounded, sanitised_env
 from .participant import (
     AGENT_MESSAGE_TYPES,
     DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
@@ -210,21 +211,26 @@ class CodexInvoker:
         command = self.command(str(schema_path), str(output_path))
         try:
             try:
-                proc = subprocess.run(
-                    command, input=prompt, cwd=self.cwd,
-                    capture_output=True, text=True, timeout=self.timeout,
+                result = run_bounded(
+                    command, input=prompt.encode("utf-8"), cwd=self.cwd,
+                    timeout=self.timeout, env=sanitised_env(),
                 )
-            except subprocess.TimeoutExpired as exc:
+            except ProcessError as exc:
                 raise CodexAdapterError(
-                    f"codex did not return within {self.timeout}s"
+                    f"could not run {self.executable}: {exc}"
                 ) from exc
-            except (OSError, ValueError) as exc:
+            if result.timed_out:
+                # The whole process group is already torn down by the time we
+                # get here: a model turn that spawns helpers must not leave
+                # them running after the turn is abandoned.
                 raise CodexAdapterError(
-                    f"could not run {self.executable}: {type(exc).__name__}: {exc}"
-                ) from exc
-            if proc.returncode != 0:
+                    f"codex did not return within {self.timeout}s; its process "
+                    f"group was {result.teardown}"
+                )
+            stderr = result.stderr.decode("utf-8", "replace")
+            if result.returncode != 0:
                 raise CodexAdapterError(
-                    f"codex exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+                    f"codex exited {result.returncode}: {stderr.strip()[:500]}"
                 )
             try:
                 raw = output_path.read_text(encoding="utf-8")

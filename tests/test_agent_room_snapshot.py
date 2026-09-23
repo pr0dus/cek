@@ -7,6 +7,7 @@ this module, and neither is a builder's claim that tests passed.
 
 import hashlib
 import json
+import pathlib
 import subprocess
 
 import pytest
@@ -216,12 +217,18 @@ def test_a_proof_artifact_is_written_outside_the_checkout(target, tmp_path):
         ["python3", "-c", "print('x')"],
         cwd=target, run_dir=tmp_path / "runs", proof_id="p-art",
     )
-    artifact = json.loads((tmp_path / "runs" / "p-art.json").read_text())
+    path = pathlib.Path(record["artifact_path"])
+    # Content-addressed: the filename carries the proof digest, which is what
+    # makes a second run of the same id a second artifact, never a rewrite.
+    assert path.parent == (tmp_path / "runs").resolve()
+    assert path.name == f"p-art-{record['proof_sha256'][:16]}.json"
+
+    artifact = json.loads(path.read_text())
     assert artifact["proof_sha256"] == record["proof_sha256"]
     assert artifact["stdout"] == "x\n"
     assert not str(tmp_path / "runs").startswith(str(target))
     assert record["artifact_sha256"] == hashlib.sha256(
-        (tmp_path / "runs" / "p-art.json").read_bytes()).hexdigest()
+        path.read_bytes()).hexdigest()
 
 
 def test_artifacts_inside_the_inspected_checkout_are_refused(target):

@@ -11,6 +11,7 @@ import pytest
 from agent_room.errors import ClaimStateError, ForbiddenOperation, SchemaError
 from agent_room.ids import is_uuid7, timestamp_ms, uuid7
 from agent_room.decision import binding_digest
+from tests.conftest_agent_room import ACTION_SAMPLES, bound_action
 from agent_room.schema import CLAIM_STATUS, LIFECYCLE_STATUS, validate_envelope
 
 
@@ -46,8 +47,9 @@ def decision_envelope(mtype="approval", **overrides):
         "request_envelope_sha256": "c" * 64,
         "action_id": "activate-agent-room-transport",
         "action_scope": "create the production agent-room transport branch",
-        "binding": {"snapshot_sha256": "a" * 64,
-                    "supervisor_context_sha256": "b" * 64},
+        "consequential": True,
+        "parameters": dict(ACTION_SAMPLES["activate-agent-room-transport"]),
+        "binding": bound_action()["binding"],
     }
     decision["decision_binding_sha256"] = binding_digest(decision)
     base = envelope(

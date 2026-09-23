@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from . import canonical
+from . import canonical, limits
 from .errors import (
     AgentRoomError,
     AppendOnlyViolation,
@@ -54,7 +54,10 @@ from .errors import (
     UnresolvedReference,
     WrongBranchError,
 )
+from . import namespace
 from .ids import is_uuid7
+from .namespace import NamespaceViolation
+from .process import sanitised_env
 from .schema import DECISION_TYPES, THREAD_ID_RE, validate_envelope
 
 MESSAGES_DIR = ".agent-room/messages"
@@ -63,6 +66,16 @@ GIT_TIMEOUT_SECONDS = 60
 DEFAULT_PUSH_RETRIES = 3
 DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
 CONTROL_OR_SPACE = frozenset(chr(c) for c in range(0x21)) | {"\x7f"}
+
+#: Applied to every Git invocation this store makes. Hooks in a room checkout
+#: would be attacker-supplied code running inside verification; `protocol.ext`
+#: would let a configured remote name a command to run. Neither has any part
+#: in a message transport.
+HARDENED_GIT_CONFIG = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "protocol.ext.allow=never",
+)
 LOCK_POLL_SECONDS = 0.05
 WRITER_LOCK_NAME = "agent-room-writer.lock"
 
@@ -112,7 +125,7 @@ class GitMessageStore:
         Hashing must see the object's real bytes; a text-mode round trip could
         normalise them and make a forged object hash correctly.
         """
-        command = ["git", "--no-replace-objects", *args]
+        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args]
         try:
             proc = subprocess.run(
                 command, cwd=self.workdir, capture_output=True,
@@ -146,15 +159,24 @@ class GitMessageStore:
     )
 
     def _clean_env(self) -> dict:
-        env = {k: v for k, v in os.environ.items() if k not in self.UNSAFE_GIT_ENV}
+        """Strip anything that can redirect objects, config or execution.
+
+        `UNSAFE_GIT_ENV` names the Git-specific redirections; `process.
+        sanitised_env` removes the broader class — interpreter and loader
+        variables that change what a hook or a credential helper would run if
+        one were ever reached.
+        """
+        env = sanitised_env({k: v for k, v in os.environ.items()
+                             if k not in self.UNSAFE_GIT_ENV})
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env["GIT_TERMINAL_PROMPT"] = "0"
         return env
 
     def _git(self, *args: str, check: bool = True,
              input: str | None = None) -> subprocess.CompletedProcess:
         # --no-replace-objects: a replace ref must never quietly rewrite what
         # verification sees. Their *presence* is rejected separately.
-        command = ["git", "--no-replace-objects", *args]
+        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args]
         try:
             proc = subprocess.run(
                 command,
@@ -449,6 +471,22 @@ class GitMessageStore:
             except OSError as exc:
                 raise HistoryUnavailable(f"cannot read {grafts}: {exc}") from exc
 
+        # Alternates are the third way to answer an object query from
+        # somewhere else. A room whose objects may come from a directory
+        # outside it is not a room whose history we can verify.
+        alternates = {self._git_dir() / "objects" / "info" / "alternates",
+                      self._git_common_dir() / "objects" / "info" / "alternates"}
+        for alternate in sorted(alternates):
+            try:
+                if alternate.exists() and alternate.read_text(encoding="utf-8").strip():
+                    raise HistoryUnavailable(
+                        f"{alternate} names alternate object directories; room "
+                        "objects must come from this repository alone, or "
+                        "verification is describing someone else's objects."
+                    )
+            except OSError as exc:
+                raise HistoryUnavailable(f"cannot read {alternate}: {exc}") from exc
+
     def assert_history_available(self) -> None:
         """Fail closed unless complete local history is readable.
 
@@ -502,6 +540,34 @@ class GitMessageStore:
                 "to history verification"
             )
 
+    def assert_namespace_closed(self) -> dict:
+        """Every tracked entry at the tip is a protocol artifact, or fail.
+
+        History says which paths were *touched*; this says what is actually
+        there now, including the two things a path alone cannot: the object
+        type and the file mode. A symlink, an executable or a gitlink is
+        refused here even if its path looked plausible.
+        """
+        proc = self._git("ls-tree", "-r", "-z", "--full-tree", self.ref,
+                         check=False)
+        if proc.returncode != 0:
+            raise HistoryUnavailable(
+                f"cannot list the tree of {self.ref} in {self.workdir}: "
+                f"{proc.stderr.strip()}"
+            )
+        counts = {"genesis": 0, "message": 0}
+        for entry in proc.stdout.split("\0"):
+            if not entry:
+                continue
+            meta, _, path = entry.partition("\t")
+            fields = meta.split()
+            if len(fields) < 3:
+                raise HistoryUnavailable(
+                    f"malformed tree entry {entry!r} on {self.ref}"
+                )
+            counts[namespace.assert_allowed_entry(fields[0], fields[1], path)] += 1
+        return counts
+
     @staticmethod
     def _is_canonical_message_path(path: str) -> bool:
         parts = path.split("/")
@@ -535,21 +601,25 @@ class GitMessageStore:
             return cached[1]
 
         self._assert_linear()
+        self.assert_namespace_closed()
 
+        # Deliberately no pathspec: the scan covers every tracked path on the
+        # branch. Restricting it to the message tree is what let a committed
+        # `.gitattributes` sit beside the messages and verify clean.
         proc = self._git(
             "log", self.ref, "--reverse", "--format=%H",
-            "--name-status", "-z", "--no-renames", "--", MESSAGES_DIR,
+            "--name-status", "-z", "--no-renames",
             check=False,
         )
         if proc.returncode != 0:
             # Never a silent {}: an unreadable history is not an empty room.
             raise HistoryUnavailable(
-                f"history query for {MESSAGES_DIR} on {self.ref} failed: "
-                f"{proc.stderr.strip()}"
+                f"history query on {self.ref} failed: {proc.stderr.strip()}"
             )
 
         added: dict[str, str] = {}
         commit_seq: dict[str, int] = {}
+        genesis: str | None = None
         commit = ""
         tokens = [t for t in proc.stdout.split("\0")]
         i = 0
@@ -571,17 +641,27 @@ class GitMessageStore:
                 )
             path = tokens[i]
             i += 1
-            # The root itself is inside the reserved namespace: a tracked file
-            # at exactly `.agent-room/messages` has no trailing slash and would
-            # otherwise be skipped by a prefix test.
-            if path != MESSAGES_DIR and not path.startswith(f"{MESSAGES_DIR}/"):
-                continue
-            if not self._is_canonical_message_path(path):
-                raise AppendOnlyViolation(
-                    f"{path!r} (in commit {commit}) is under {MESSAGES_DIR}/ but "
-                    "is not a canonical <thread_id>/<uuid7>.json message path; "
-                    "refusing to verify a history containing unrecognised paths"
+            kind = namespace.classify(path)
+            if kind is None:
+                raise NamespaceViolation(
+                    f"commit {commit} touches a path the room protocol does "
+                    f"not define: {namespace.describe_refusal(path)}"
                 )
+            if kind == "genesis":
+                # One immutable marker, written when the branch was created.
+                # A later add or edit of it rewrites the branch's own identity,
+                # so it is refused like any other mutation.
+                if not status.startswith("A"):
+                    raise AppendOnlyViolation(
+                        f"{path} was {status!r} in commit {commit}; the genesis "
+                        "marker is immutable"
+                    )
+                if genesis is not None:
+                    raise AppendOnlyViolation(
+                        f"{path} was added twice (second add in {commit})"
+                    )
+                genesis = commit
+                continue
             if status.startswith("A"):
                 if path in added:
                     raise AppendOnlyViolation(
@@ -1126,8 +1206,37 @@ class GitMessageStore:
         )
         return self._append_validated(envelope)
 
+    def append_receipt(self, envelope: dict) -> dict:
+        """Append one `execution_receipt`. Deliberately NOT agent-facing.
+
+        A receipt is what makes a consequential action one-shot. An agent that
+        could write one could consume a human's approval before the human
+        acted, or assert an execution that never happened — so it shares the
+        decision record's capability boundary: `append` and every participant
+        surface refuse the type, and only `agent_room.release` reaches here.
+        """
+        self.assert_room_branch()
+        canonical.verify(envelope)
+        mtype = envelope.get("type")
+        if mtype != "execution_receipt":
+            raise ForbiddenOperation(
+                f"append_receipt accepts only 'execution_receipt', not "
+                f"{mtype!r}; ordinary messages go through append()"
+            )
+        validate_envelope(
+            envelope,
+            agent_facing=False,
+            resolver=self._write_resolver,
+        )
+        return self._append_validated(envelope)
+
     def _append_validated(self, envelope: dict) -> dict:
         """Shared commit path. Validation has already happened above."""
+        # The last check before anything becomes permanent: an oversize
+        # artifact must fail here rather than after it is in history.
+        limits.assert_within(
+            len(canonical.canonical_bytes(envelope)),
+            limits.MAX_ENVELOPE_BYTES, "canonical envelope")
         thread_id = envelope["thread_id"]
         message_id = envelope["message_id"]
         rel = self.message_path(thread_id, message_id)

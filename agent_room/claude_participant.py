@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from . import tool_profiles
+from .process import ProcessError, run_bounded, sanitised_env
 from .participant import (
     AGENT_MESSAGE_TYPES,
     DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
@@ -91,24 +92,29 @@ class ClaudeInvoker:
     def __call__(self, prompt: str) -> str:
         command = self.command()
         try:
-            proc = subprocess.run(
-                command, input=prompt, cwd=self.cwd,
-                capture_output=True, text=True, timeout=self.timeout,
+            result = run_bounded(
+                command, input=prompt.encode("utf-8"), cwd=self.cwd,
+                timeout=self.timeout, env=sanitised_env(),
             )
-        except subprocess.TimeoutExpired as exc:
+        except ProcessError as exc:
             raise ClaudeAdapterError(
-                f"claude did not return within {self.timeout}s"
+                f"could not run {self.executable}: {exc}"
             ) from exc
-        except (OSError, ValueError) as exc:
+        if result.timed_out:
+            # Torn down as a group before this raises. An abandoned turn must
+            # not leave the client - or anything it spawned - running.
             raise ClaudeAdapterError(
-                f"could not run {self.executable}: {type(exc).__name__}: {exc}"
-            ) from exc
-        if proc.returncode != 0:
+                f"claude did not return within {self.timeout}s; its process "
+                f"group was {result.teardown}"
+            )
+        stderr = result.stderr.decode("utf-8", "replace")
+        if result.returncode != 0:
             raise ClaudeAdapterError(
-                f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+                f"claude exited {result.returncode}: {stderr.strip()[:500]}"
             )
 
-        envelope = parse_json(proc.stdout, "claude --output-format json output")
+        envelope = parse_json(result.stdout.decode("utf-8", "replace"),
+                              "claude --output-format json output")
         if not isinstance(envelope, dict):
             raise MalformedResponse("claude output was not a JSON object")
         if envelope.get("is_error"):

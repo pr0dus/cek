@@ -24,6 +24,7 @@ from agent_room.errors import (
     UnresolvedReference,
 )
 from agent_room.ids import uuid7
+from agent_room.namespace import NamespaceViolation
 from agent_room.schema import validate_envelope
 from tests.conftest_agent_room import configure_identity, git
 
@@ -352,7 +353,7 @@ def test_tracked_file_at_the_namespace_root_is_rejected(store, room):
     git(store.workdir, "add", "--", ".agent-room/messages")
     git(store.workdir, "commit", "-q", "-m", "file at the namespace root")
 
-    with pytest.raises(AppendOnlyViolation, match="canonical"):
+    with pytest.raises(NamespaceViolation, match="canonical"):
         store.verify_store()
 
 

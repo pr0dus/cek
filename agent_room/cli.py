@@ -176,8 +176,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     gate = sub.add_parser(
         "gate-status",
-        help="whether a bound consequential action is releasable right now "
-             "(read-only; fail-closed)",
+        help="ADVISORY diagnostic only: explain a gate using digests you "
+             "supply. Never an authorisation - use release-authorise, which "
+             "measures current state itself.",
     )
     gate.add_argument("--request-id", required=True,
                       help="the decision_request message id")
@@ -218,6 +219,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="required. Asserts a person is invoking this, which is exactly "
              "what the capability boundary rests on.",
     )
+
+    auth = sub.add_parser(
+        "release-authorise",
+        help="the exact final recheck for a consequential action. Derives "
+             "current snapshot and supervisor context itself; performs NO "
+             "side effect and accepts no digests.",
+    )
+    auth.add_argument("--request-id", required=True)
+    auth.add_argument("--target", required=True,
+                      help="checkout of the approved project")
+
+    reserve = sub.add_parser(
+        "release-reserve",
+        help="authorise and immediately consume the one-shot action nonce as "
+             "'uncertain', BEFORE a human performs the action manually",
+    )
+    reserve.add_argument("--request-id", required=True)
+    reserve.add_argument("--target", required=True)
+    reserve.add_argument(
+        "--confirm-manual", action="store_true",
+        help="required. Asserts you are about to perform the action by hand; "
+             "nothing here executes anything.",
+    )
+
+    recon = sub.add_parser(
+        "release-reconcile",
+        help="record what actually happened to a reserved action",
+    )
+    recon.add_argument("--request-id", required=True)
+    recon.add_argument("--status", required=True, choices=["executed", "failed"])
+    recon.add_argument("--result", default=None, help="JSON object")
+
+    verify_art = sub.add_parser(
+        "verify-artifact",
+        help="rehash a stored proof artifact and check it against the digest "
+             "its name and record claim",
+    )
+    verify_art.add_argument("--artifact", required=True)
 
     proof = sub.add_parser(
         "proof",
@@ -270,6 +309,40 @@ def main(argv=None) -> int:
                        "manifest_sha256": manifest["manifest_sha256"]})
             else:
                 _emit(manifest)
+            return 0
+        if args.command == "verify-artifact":
+            from .proof import verify_artifact
+            checked = verify_artifact(args.artifact)
+            _emit({"artifact": args.artifact,
+                   "artifact_sha256": checked["artifact_sha256"],
+                   "proof_sha256": checked["proof_sha256"],
+                   "verified": True})
+            return 0
+        if args.command in ("release-authorise", "release-reserve",
+                            "release-reconcile"):
+            from . import release as release_mod
+            store = GitMessageStore(args.repo, branch=args.branch,
+                                    remote=args.remote)
+            if args.command == "release-authorise":
+                _emit(release_mod.authorise(store, args.request_id,
+                                            workdir=args.target))
+                return 0
+            if args.command == "release-reserve":
+                if not args.confirm_manual:
+                    print(
+                        "Refusing to reserve without --confirm-manual. "
+                        "Reserving consumes the one-shot action nonce; it is "
+                        "meant to be done immediately before a person performs "
+                        "the action by hand. Nothing here executes anything.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                _emit(release_mod.reserve(store, args.request_id,
+                                          workdir=args.target))
+                return 0
+            _emit(release_mod.reconcile(
+                store, args.request_id, status=args.status,
+                result=_json_arg(args.result, {})))
             return 0
         if args.command == "proof":
             from .proof import run_proof

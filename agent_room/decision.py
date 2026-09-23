@@ -101,6 +101,11 @@ def binding_digest(decision: dict) -> str:
         "request_envelope_sha256": decision["request_envelope_sha256"],
         "action_id": decision["action_id"],
         "action_scope": decision["action_scope"],
+        "consequential": decision["consequential"],
+        # The structured parameters are inside the digest: approving an
+        # activation of branch X must not also approve branch Y, and prose
+        # scope is not what a later check compares.
+        "parameters": decision.get("parameters"),
         "binding": decision["binding"],
         "decision": decision["decision"],
     }
@@ -174,7 +179,19 @@ def evaluate_gate(
     snapshot_sha256: str | None = None,
     supervisor_context_sha256: str | None = None,
 ) -> dict:
-    """Is this bound action releasable right now? Fail-closed at every step.
+    """ADVISORY diagnostic: is this bound action releasable right now?
+
+    **Not the release path.** It accepts current measurements from the caller,
+    and a caller can type anything — a red-team simply echoed the digests out
+    of the decision request back in and got `released`. Every report it
+    returns is marked `advisory: true` for that reason.
+
+    `release.authorise` is the release-capable API: it derives both
+    measurements itself from the binding's recipe and has no parameter through
+    which a digest could be supplied. Use this one to *explain* a gate, never
+    to act on it.
+
+    Fail-closed at every step regardless.
 
     `snapshot_sha256` / `supervisor_context_sha256` are the state observed
     *now*, by the caller, from `snapshot.snapshot_manifest` and
@@ -185,6 +202,11 @@ def evaluate_gate(
     request = _load_request(store, request_message_id)
     action = request.get("action")
     report: dict = {
+        # Advisory by construction: this function is *told* what current state
+        # is. `release.authorise` measures it instead, and that is the only
+        # release-capable path. Kept separate so a diagnostic read can never
+        # be mistaken for an authorisation.
+        "advisory": True,
         "request_message_id": request["message_id"],
         "thread_id": request["thread_id"],
         "request_envelope_sha256": request[canonical.DIGEST_FIELD],
@@ -282,6 +304,36 @@ def evaluate_gate(
     if record["action_scope"] != action["scope"]:
         mismatches.append(
             "the decision's action scope is not the scope the request asked about"
+        )
+    if record.get("consequential") != action["consequential"]:
+        mismatches.append(
+            "the decision and the request disagree about whether the action "
+            "is consequential"
+        )
+    if record.get("parameters") != action.get("parameters"):
+        mismatches.append(
+            "the decision's structured action parameters are not the ones the "
+            "request asked about"
+        )
+    # An approval for repo A must never release the same-looking snapshot in
+    # repo B, so the project identity is compared like any other binding.
+    if record["binding"].get("project") != action["binding"].get("project"):
+        bound = (action["binding"].get("project") or {})
+        decided = (record["binding"].get("project") or {})
+        mismatches.append(
+            f"the decision bound project {decided.get('repo')!r}@"
+            f"{str(decided.get('commit'))[:12]}, the request bound "
+            f"{bound.get('repo')!r}@{str(bound.get('commit'))[:12]}"
+        )
+    if record["binding"].get("measurement") != action["binding"].get("measurement"):
+        mismatches.append(
+            "the decision and the request disagree about how current state is "
+            "to be measured"
+        )
+    if record["binding"].get("action_nonce") != action["binding"].get("action_nonce"):
+        mismatches.append(
+            "the decision names a different one-shot action nonce than the "
+            "request"
         )
     for field in ("snapshot_sha256", "supervisor_context_sha256"):
         bound = action["binding"][field]
@@ -418,6 +470,7 @@ class HumanDecisionAuthority:
             "action_id": action["action_id"],
             "action_scope": action["scope"],
             "consequential": action["consequential"],
+            "parameters": action.get("parameters"),
             "binding": action["binding"],
             "body": request.get("body") or {},
         }
@@ -472,6 +525,8 @@ class HumanDecisionAuthority:
             "request_envelope_sha256": described["request_envelope_sha256"],
             "action_id": described["action_id"],
             "action_scope": described["action_scope"],
+            "consequential": described["consequential"],
+            "parameters": described["parameters"],
             "binding": described["binding"],
         }
         record["decision_binding_sha256"] = binding_digest(record)

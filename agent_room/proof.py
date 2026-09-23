@@ -1,45 +1,78 @@
 """Independently observed proof, recorded as an immutable artifact.
 
 A builder saying "tests pass" is a report about a run nobody else watched. The
-qualification harness therefore runs the agreed command itself and records
-what it saw: the exact argv, the exit status, digests over the full output,
-a bounded tail for humans, and the repository/snapshot identity the run was
+qualification harness therefore runs the agreed command itself and records what
+it saw: the exact argv, the exit status, digests over the full output, a
+bounded tail for humans, and the repository/snapshot identity the run was
 against.
 
-Three rules keep this honest.
+Issue #13 closed four holes in that, each one demonstrated rather than argued:
 
-*A non-zero exit is a result, not a harness failure.* A falsification test that
-fails is exactly the outcome worth recording.
+*The proof id reached the filesystem.* `proof_id="../escaped-proof"` wrote
+outside the run directory. Ids now have a narrow grammar, and the resolved
+artifact path is asserted to be inside the resolved run directory — so a
+symlinked run directory cannot smuggle a write out either.
 
-*A denied command is evidence.* If the command cannot be executed — permission
-refused, not found, timed out — that is recorded as the outcome. It is never
-retried with different flags or quietly downgraded to a different command.
+*"Immutable" artifacts were overwritable.* Two runs with the same id wrote the
+same path and the second changed it. Artifacts are now content-addressed by
+their own digest, created with `O_EXCL`, and left read-only. Re-running an id
+produces a second artifact; it never rewrites the first.
 
-*Artifacts live outside the checkout.* Writing a run log into the repository
-being inspected would change the very snapshot the proof is about.
+*Timeouts left descendants running.* Proofs start their own process group and
+the whole group is torn down on timeout — see `process.run_bounded`.
+
+*Ignored files could change what ran without changing the binding.* A proof
+now executes in a clean checkout reconstructed from the exact bound commit, so
+an untracked or ignored `sitecustomize.py` beside the source is not there at
+all. Three rules keep the rest honest: a non-zero exit is a result, a denied
+command is evidence and is never retried differently, and artifacts live
+outside the inspected checkout.
 """
 
 import datetime as dt
 import hashlib
+import io
 import os
-import subprocess
+import re
+import shutil
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 
 from . import canonical
 from .errors import AgentRoomError
+from .limits import (
+    MAX_PROOF_ARTIFACT_BYTES,
+    MAX_PROOF_STREAM_BYTES,
+    LimitExceeded,
+    assert_within,
+)
+from .process import isolated_env, run_bounded, sanitised_env
 
-PROOF_SCHEMA_VERSION = 1
+PROOF_SCHEMA_VERSION = 2
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_TAIL_BYTES = 4096
+GIT_TIMEOUT_SECONDS = 120
+
+#: A proof id is a filename component and nothing else. No separators, no
+#: traversal, no control characters, no leading dot — the grammar is what
+#: makes containment provable rather than hopeful.
+PROOF_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+#: Directories and files created here. Sensitive enough not to inherit a
+#: group-writable umask; the artifact itself is read-only once written.
+RUN_DIR_MODE = 0o700
+ARTIFACT_MODE = 0o400
 
 #: Excluded from `proof_sha256` because they describe where the record was
 #: stored, not what was observed.
 UNHASHED_FIELDS = ("artifact_path", "artifact_sha256", "proof_sha256")
 
 __all__ = [
-    "PROOF_SCHEMA_VERSION", "ProofError", "run_proof", "proof_digest",
-    "verify_proof", "proof_evidence",
+    "PROOF_SCHEMA_VERSION", "PROOF_ID_RE", "ProofError", "ProofArtifactConflict",
+    "run_proof", "run_isolated_proof", "isolated_checkout", "proof_digest",
+    "verify_proof", "verify_artifact", "proof_evidence", "validate_proof_id",
 ]
 
 
@@ -47,8 +80,59 @@ class ProofError(AgentRoomError):
     """The proof could not be observed or recorded."""
 
 
+class ProofArtifactConflict(ProofError):
+    """An artifact already exists at the content-addressed path.
+
+    Only reachable when two runs produced byte-identical records, which is not
+    a collision to resolve by overwriting.
+    """
+
+
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def validate_proof_id(proof_id) -> str:
+    if not isinstance(proof_id, str) or not PROOF_ID_RE.match(proof_id):
+        raise ProofError(
+            f"proof_id {proof_id!r} must match {PROOF_ID_RE.pattern}: a single "
+            "filename component, no path separators and no traversal. A proof "
+            "id reaches the filesystem, so it is validated, not sanitised."
+        )
+    return proof_id
+
+
+def _prepare_run_dir(run_dir, cwd_path: Path) -> Path:
+    out_dir = Path(run_dir)
+    out_dir.mkdir(parents=True, exist_ok=True, mode=RUN_DIR_MODE)
+    # Set explicitly as well as at creation: mkdir's mode is masked by umask,
+    # and an existing directory keeps whatever it had.
+    try:
+        out_dir.chmod(RUN_DIR_MODE)
+    except OSError:                                          # pragma: no cover
+        pass
+    resolved = out_dir.resolve()
+    if resolved == cwd_path or cwd_path in resolved.parents:
+        raise ProofError(
+            f"proof artifacts must live outside the inspected checkout, but "
+            f"{resolved} is inside {cwd_path}; writing there would change the "
+            "state the proof is about"
+        )
+    return resolved
+
+
+def _contained(run_dir: Path, name: str) -> Path:
+    """Resolve an artifact path and prove it stayed inside `run_dir`."""
+    candidate = (run_dir / name).resolve()
+    if candidate != run_dir / name and run_dir not in candidate.parents:
+        raise ProofError(
+            f"artifact path {candidate} escapes the run directory {run_dir}"
+        )
+    if run_dir not in candidate.parents:
+        raise ProofError(
+            f"artifact path {candidate} is not inside the run directory {run_dir}"
+        )
+    return candidate
 
 
 def proof_digest(record: dict) -> str:
@@ -65,6 +149,34 @@ def verify_proof(record: dict) -> None:
         )
 
 
+def verify_artifact(path) -> dict:
+    """Re-read a stored artifact and rehash it.
+
+    The evidence locator names an observation; this is what makes that name
+    resolve to bytes nobody has changed since. Both digests are checked: the
+    file's own, and the record's.
+    """
+    artifact = Path(path)
+    try:
+        raw = artifact.read_bytes()
+    except OSError as exc:
+        raise ProofError(f"cannot read proof artifact {artifact}: {exc}") from exc
+    stored = canonical.strict_loads(raw.decode("utf-8"))
+    if not isinstance(stored, dict):
+        raise ProofError(f"proof artifact {artifact} is not a JSON object")
+    verify_proof({k: v for k, v in stored.items()
+                  if k not in ("stdout", "stderr")})
+    digest = hashlib.sha256(raw).hexdigest()
+    expected = artifact.name.rsplit("-", 1)[-1][: -len(".json")]
+    if not stored["proof_sha256"].startswith(expected):
+        raise ProofError(
+            f"proof artifact {artifact.name} does not carry the proof digest "
+            f"its filename claims ({expected})"
+        )
+    return {"artifact_sha256": digest, "proof_sha256": stored["proof_sha256"],
+            "record": stored}
+
+
 def _tail(raw: bytes, limit: int) -> str:
     """The last `limit` bytes, decoded leniently. Truncation is stated."""
     if len(raw) <= limit:
@@ -73,6 +185,42 @@ def _tail(raw: bytes, limit: int) -> str:
         f"…[{len(raw) - limit} earlier bytes omitted]…\n"
         + raw[-limit:].decode("utf-8", "replace")
     )
+
+
+def _write_artifact(run_dir: Path, proof_id: str, record: dict,
+                    stdout: bytes, stderr: bytes) -> dict:
+    """Content-addressed, exclusive-create, read-only once written."""
+    body = {k: v for k, v in record.items() if k not in UNHASHED_FIELDS}
+    body["proof_sha256"] = record["proof_sha256"]
+    # Streams are stored whole only while they fit. The digests above always
+    # cover the complete output, so omitting the body never hides a result.
+    for name, raw in (("stdout", stdout), ("stderr", stderr)):
+        if len(raw) <= MAX_PROOF_STREAM_BYTES:
+            body[name] = raw.decode("utf-8", "replace")
+        else:
+            body[f"{name}_omitted"] = True
+    payload = canonical.canonical_text(body).encode("utf-8")
+    assert_within(len(payload), MAX_PROOF_ARTIFACT_BYTES, "proof artifact")
+
+    name = f"{proof_id}-{record['proof_sha256'][:16]}.json"
+    artifact = _contained(run_dir, name)
+    try:
+        fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, ARTIFACT_MODE)
+    except FileExistsError as exc:
+        raise ProofArtifactConflict(
+            f"{artifact.name} already exists. Proof artifacts are write-once "
+            "and content-addressed, so an identical digest means this exact "
+            "observation is already recorded; it is never overwritten."
+        ) from exc
+    except OSError as exc:
+        raise ProofError(f"cannot create proof artifact {artifact}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+    except OSError as exc:                                   # pragma: no cover
+        raise ProofError(f"cannot write proof artifact {artifact}: {exc}") from exc
+    return {"artifact_path": str(artifact),
+            "artifact_sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def run_proof(
@@ -86,35 +234,31 @@ def run_proof(
     repo_commit: str | None = None,
     snapshot_sha256: str | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
+    isolation: dict | None = None,
 ) -> dict:
     """Run one command, observe it, and write an immutable record."""
     argv = [str(a) for a in command]
     if not argv:
         raise ProofError("a proof needs a command to run")
+    validate_proof_id(proof_id)
     cwd_path = Path(cwd).resolve()
-    out_dir = Path(run_dir).resolve()
-    if out_dir == cwd_path or cwd_path in out_dir.parents:
-        raise ProofError(
-            f"proof artifacts must live outside the inspected checkout, but "
-            f"{out_dir} is inside {cwd_path}; writing there would change the "
-            "state the proof is about"
-        )
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _prepare_run_dir(run_dir, cwd_path)
 
     started, clock = _now_iso(), time.monotonic()
-    status, exit_status, error = "completed", None, None
+    status, exit_status, error, teardown = "completed", None, None, ""
     stdout, stderr = b"", b""
     try:
-        proc = subprocess.run(
-            argv, cwd=cwd_path, capture_output=True, timeout=timeout,
-            env=env if env is not None else os.environ.copy(),
+        result = run_bounded(
+            argv, cwd=cwd_path, timeout=timeout,
+            env=env if env is not None else isolated_env(),
         )
-        exit_status, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        status = "timeout"
-        stdout, stderr = exc.stdout or b"", exc.stderr or b""
-        error = f"timed out after {timeout}s"
-    except (OSError, ValueError) as exc:
+        stdout, stderr, teardown = result.stdout, result.stderr, result.teardown
+        if result.timed_out:
+            status = "timeout"
+            error = f"timed out after {timeout}s; process group {teardown}"
+        else:
+            exit_status = result.returncode
+    except AgentRoomError as exc:
         # Denied, missing, or unexecutable. Recorded as the outcome; never
         # worked around by running something else.
         status = "denied"
@@ -128,11 +272,14 @@ def run_proof(
         "status": status,
         "exit_status": exit_status,
         "error": error,
+        "teardown": teardown,
         "started_at": started,
         "finished_at": _now_iso(),
         "duration_seconds": round(time.monotonic() - clock, 3),
         "repo_commit": repo_commit,
         "snapshot_sha256": snapshot_sha256,
+        "isolation": isolation or {"mode": "in-place",
+                                   "binds_execution_state": False},
         "stdout_bytes": len(stdout),
         "stderr_bytes": len(stderr),
         "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
@@ -141,27 +288,113 @@ def run_proof(
         "stderr_tail": _tail(stderr, tail_bytes),
     }
     record["proof_sha256"] = proof_digest(record)
-
-    artifact = out_dir / f"{proof_id}.json"
-    payload = canonical.canonical_text({
-        **{k: v for k, v in record.items() if k not in UNHASHED_FIELDS},
-        "proof_sha256": record["proof_sha256"],
-        "stdout": stdout.decode("utf-8", "replace"),
-        "stderr": stderr.decode("utf-8", "replace"),
-    })
-    artifact.write_text(payload, encoding="utf-8")
-    record["artifact_path"] = str(artifact)
-    record["artifact_sha256"] = hashlib.sha256(
-        payload.encode("utf-8")).hexdigest()
+    record.update(_write_artifact(out_dir, proof_id, record, stdout, stderr))
     return record
+
+
+def isolated_checkout(repo, commit: str, dest) -> dict:
+    """Reconstruct exactly one commit's tracked content into `dest`.
+
+    `git archive` rather than a worktree or a copy: the result contains the
+    committed tree and nothing else — no `.git`, no untracked files, no ignored
+    files, no `sitecustomize.py` that happened to be sitting beside the source.
+    That is what makes a proof reproducible from a binding instead of from
+    whatever the builder's machine also had lying around.
+    """
+    repo_path, dest_path = Path(repo), Path(dest)
+    result = run_bounded(
+        ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+         "archive", "--format=tar", commit],
+        cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS, env=sanitised_env(),
+    )
+    if result.returncode != 0:
+        raise ProofError(
+            f"cannot archive {commit} from {repo_path}: "
+            f"{result.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    dest_path.mkdir(parents=True, exist_ok=True, mode=RUN_DIR_MODE)
+    files = 0
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+        for member in archive.getmembers():
+            name = member.name
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise ProofError(
+                    f"archive of {commit} contains an unsafe path {name!r}"
+                )
+            if member.issym() or member.islnk():
+                raise ProofError(
+                    f"archive of {commit} contains a link ({name!r}); a proof "
+                    "checkout must not reach outside itself"
+                )
+            if member.isfile():
+                files += 1
+        # `filter="data"` is tar's own hardening: it refuses absolute paths,
+        # traversal and links, and drops modes and ownership. The explicit
+        # checks above stay because they name *why* each shape is refused, and
+        # because a filter that changes behaviour between versions is not
+        # something a trust boundary should depend on alone.
+        archive.extractall(dest_path, filter="data")
+    return {"mode": "git-archive", "commit": commit, "root": str(dest_path),
+            "tracked_files": files, "binds_execution_state": True}
+
+
+def run_isolated_proof(
+    command,
+    *,
+    repo,
+    commit: str,
+    run_dir,
+    proof_id: str,
+    manifest: dict | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    keep_checkout: bool = False,
+    **kwargs,
+) -> dict:
+    """Run a proof against a clean checkout of `commit`, not a working tree.
+
+    If a `manifest` is supplied it must describe exactly that commit with
+    nothing uncommitted, because otherwise the checkout and the binding are
+    different states and the proof would be evidence about neither.
+    """
+    validate_proof_id(proof_id)
+    if manifest is not None:
+        if manifest.get("head_commit") != commit:
+            raise ProofError(
+                f"the manifest was measured at head {manifest.get('head_commit')}, "
+                f"not {commit}; an isolated proof must run on the state that "
+                "was measured"
+            )
+        counts = manifest.get("counts") or {}
+        dirty = {k: counts.get(k, 0) for k in ("unstaged", "untracked")}
+        if any(dirty.values()):
+            raise ProofError(
+                f"the measured state has uncommitted content ({dirty}); commit "
+                "it before binding a proof to it, or the isolated checkout "
+                "cannot reproduce what was measured"
+            )
+
+    parent = Path(run_dir).resolve().parent
+    workdir = Path(tempfile.mkdtemp(prefix=f"agent-room-proof-{proof_id}-",
+                                    dir=parent))
+    try:
+        isolation = isolated_checkout(repo, commit, workdir / "tree")
+        return run_proof(
+            command, cwd=workdir / "tree", run_dir=run_dir, proof_id=proof_id,
+            timeout=timeout, repo_commit=commit, isolation=isolation,
+            env=isolated_env(), **kwargs,
+        )
+    finally:
+        if not keep_checkout:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def proof_evidence(record: dict, *, commit: str) -> dict:
     """The proof as an Agent Room `run` evidence locator.
 
     `run_id` is the proof digest, so the reference names the observation
-    itself rather than a mutable file path — a locator that cannot be
-    swapped for a different run after the fact.
+    itself rather than a mutable file path — a locator that cannot be swapped
+    for a different run after the fact, and which `verify_artifact` can check
+    the stored bytes against.
     """
     return {
         "kind": "run",

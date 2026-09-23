@@ -31,9 +31,22 @@ from pathlib import Path
 
 from . import canonical
 from .errors import AgentRoomError
+from .process import run_bounded, sanitised_env
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 GIT_TIMEOUT_SECONDS = 60
+
+#: What this manifest does and does not bind, stated inside the hashed payload
+#: so it cannot be read as a stronger claim than it is. Tracked content is
+#: measured byte for byte; ignored content is *named* but never hashed, and a
+#: proof that must be bound to execution state runs in an isolated checkout
+#: (`proof.run_isolated_proof`) rather than in this working tree.
+BINDS = "tracked-content-only"
+
+#: Ignored paths listed individually before the list is truncated. `git` is
+#: asked to collapse ignored directories, so a virtualenv is one entry, not
+#: forty thousand.
+MAX_IGNORED_SAMPLE = 256
 
 #: Same rule the envelope schema uses: an abbreviation is not an identity.
 FULL_OID_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -53,26 +66,66 @@ class SnapshotError(AgentRoomError):
 
 
 def _git(workdir: Path, *args: str, check: bool = True) -> bytes:
-    """Raw bytes, because a path may be any byte sequence but NUL."""
-    command = ["git", "--no-replace-objects", *args]
-    try:
-        proc = subprocess.run(
-            command, cwd=workdir, capture_output=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise SnapshotError(f"git {' '.join(args)} timed out in {workdir}") from exc
-    except (ValueError, OSError) as exc:
+    """Raw bytes, because a path may be any byte sequence but NUL.
+
+    Runs with a sanitised environment and hooks disabled. Measuring a
+    repository with the caller's `GIT_DIR`, `GIT_OBJECT_DIRECTORY` or
+    `core.hooksPath` in force would measure whatever those pointed at, and
+    would execute whatever a hook in the inspected repository contained.
+    """
+    command = [
+        "git", "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false",
+        *args,
+    ]
+    result = run_bounded(
+        command, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS,
+        env=sanitised_env(GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0"),
+    )
+    if result.timed_out:
+        raise SnapshotError(f"git {' '.join(args)} timed out in {workdir}")
+    if check and result.returncode != 0:
         raise SnapshotError(
-            f"git {' '.join(args)} could not be executed in {workdir}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    if check and proc.returncode != 0:
-        raise SnapshotError(
-            f"git {' '.join(args)} failed ({proc.returncode}): "
-            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+            f"git {' '.join(args)} failed ({result.returncode}): "
+            f"{result.stderr.decode('utf-8', 'replace').strip()}"
         )
-    return proc.stdout
+    return result.stdout
+
+
+def assert_object_hygiene(workdir: Path) -> None:
+    """Refuse to measure a checkout whose object resolution is overridden.
+
+    Replacement refs, grafts and alternate object directories all make Git
+    answer a question about objects that are not the ones committed here.
+    `--no-replace-objects` disables one of them for our own commands; their
+    *presence* still says this is not a checkout whose measurements mean what
+    they appear to mean.
+    """
+    replaced = _git(workdir, "for-each-ref", "--format=%(refname)",
+                    "refs/replace/", check=False)
+    refs = [r for r in replaced.decode("utf-8", "replace").split() if r]
+    if refs:
+        raise SnapshotError(
+            f"{workdir} has history replacement refs ({refs[:3]}); a snapshot "
+            "of it would not describe the committed objects"
+        )
+    git_dir = Path(
+        _git(workdir, "rev-parse", "--git-common-dir").decode().strip() or ".git")
+    if not git_dir.is_absolute():
+        git_dir = workdir / git_dir
+    for name, what in (("info/grafts", "a legacy graft file"),
+                       ("objects/info/alternates", "alternate object directories")):
+        candidate = git_dir / name
+        try:
+            if candidate.exists() and candidate.read_text(encoding="utf-8").strip():
+                raise SnapshotError(
+                    f"{candidate} is non-empty ({what}); object resolution in "
+                    "this checkout is not self-contained, so a measurement of "
+                    "it cannot be trusted"
+                )
+        except OSError as exc:
+            raise SnapshotError(f"cannot read {candidate}: {exc}") from exc
 
 
 def _decode(raw: bytes) -> str:
@@ -107,6 +160,33 @@ def _name_status(workdir: Path, *args: str) -> dict:
 def _untracked(workdir: Path) -> list:
     out = _git(workdir, "ls-files", "-z", "--others", "--exclude-standard")
     return [_decode(p) for p in out.split(b"\0") if p]
+
+
+def _ignored(workdir: Path) -> dict:
+    """Name the ignored paths; never hash their contents.
+
+    Ignored files can change what a command in this tree actually executes — a
+    `sitecustomize.py` is the demonstrated case — so a manifest that omitted
+    them entirely invited the reading that it bound execution state. It did
+    not, and it still does not.
+
+    What is recorded is the *set of names*, digested. Adding or removing an
+    ignored path moves the manifest; editing one already present does not, and
+    that limitation is why `binds` says `tracked-content-only` and why a proof
+    that must be bound to execution state runs from an isolated checkout
+    instead of from here. Hashing a virtualenv would be theatre, not binding.
+    """
+    out = _git(workdir, "ls-files", "-z", "--others", "--ignored",
+               "--exclude-standard", "--directory", "--no-empty-directory")
+    paths = sorted(_decode(p) for p in out.split(b"\0") if p)
+    return {
+        "count": len(paths),
+        "paths_sha256": hashlib.sha256(
+            canonical.canonical_bytes(paths)).hexdigest(),
+        "sample": paths[:MAX_IGNORED_SAMPLE],
+        "sample_truncated": len(paths) > MAX_IGNORED_SAMPLE,
+        "contents_measured": False,
+    }
 
 
 def _entry(workdir: Path, path: str, base_wt, base_index, index_wt,
@@ -167,6 +247,7 @@ def verify_manifest(manifest: dict) -> None:
 def snapshot_manifest(workdir, base_commit: str) -> dict:
     """Measure the inspected state of `workdir` against `base_commit`."""
     path = Path(workdir)
+    assert_object_hygiene(path)
     if not isinstance(base_commit, str) or not FULL_OID_RE.match(base_commit):
         raise SnapshotError(
             f"base_commit {base_commit!r} must be a full Git object id; an "
@@ -204,9 +285,11 @@ def snapshot_manifest(workdir, base_commit: str) -> dict:
 
     manifest = {
         "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "binds": BINDS,
         "base_commit": base_commit,
         "head_commit": head or None,
         "entries": entries,
+        "ignored": _ignored(path),
         "counts": {
             "changed_vs_base": sum(1 for e in entries if e["base_vs_worktree"]),
             "staged": sum(1 for e in entries if e["base_vs_index"]),

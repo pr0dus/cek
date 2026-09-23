@@ -30,7 +30,7 @@ deliberately excluded from the hash.
 
 import json
 
-from . import canonical
+from . import canonical, limits
 from .errors import SchemaError
 from .participant import (
     ParticipantAdapter,
@@ -100,9 +100,13 @@ def context_digest(target: dict, thread: list) -> str:
 def export_packet(room, target: dict) -> dict:
     """Build the supervisor packet for one target message."""
     thread = room.thread(target["thread_id"])
+    # Bounded before the packet is built, not after: a packet is handed to a
+    # reviewer and may cross a transport, so its size is a contract.
+    limits.assert_within(len(thread), limits.MAX_THREAD_MESSAGES,
+                         f"thread {target['thread_id']!r}", "messages")
     store = room.store
     tip = store._git("rev-parse", "--verify", store.ref, check=False).stdout.strip()
-    return {
+    packet = {
         "packet_schema_version": PACKET_SCHEMA_VERSION,
         "participant": PARTICIPANT,
         "target_message_id": target["message_id"],
@@ -120,6 +124,9 @@ def export_packet(room, target: dict) -> dict:
         "thread": thread,
         "context_sha256": context_digest(target, thread),
     }
+    limits.assert_within(len(canonical.canonical_bytes(packet)),
+                         limits.MAX_PACKET_BYTES, "supervisor packet")
+    return packet
 
 
 class SupervisorBoundary(ParticipantAdapter):

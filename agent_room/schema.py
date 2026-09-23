@@ -19,6 +19,7 @@ import ipaddress
 import re
 from urllib.parse import urlsplit
 
+from . import limits
 from .errors import (
     ClaimStateError,
     ForbiddenOperation,
@@ -38,12 +39,17 @@ MESSAGE_TYPES = frozenset({
     "question", "challenge", "proposed_test",
     "answer", "retraction",
     "decision_request", "approval", "rejection", "handoff",
+    "execution_receipt",
 })
 
 #: Withheld from agent-facing post/reply (design §6). Rather than pretend to
 #: verify a human, these types are simply not exposed to an agent at all; the
 #: only write path that accepts them is `GitMessageStore.append_decision`.
-AGENT_FORBIDDEN_TYPES = frozenset({"approval", "rejection"})
+#: `execution_receipt` joins them in Issue #13: a receipt is what makes a
+#: consequential action one-shot, so an agent that could author one could
+#: either consume somebody else's approval or claim an execution that never
+#: happened.
+AGENT_FORBIDDEN_TYPES = frozenset({"approval", "rejection", "execution_receipt"})
 
 #: Conversation flow only. Carries no epistemic weight.
 LIFECYCLE_STATUS = frozenset({"open", "answered", "superseded", "withdrawn"})
@@ -101,6 +107,17 @@ RESERVED_PARTICIPANTS = frozenset({HUMAN_PARTICIPANT})
 #: types agent-facing operations may never author.
 DECISION_TYPES = frozenset({"approval", "rejection"})
 
+RECEIPT_SCHEMA_VERSION = 1
+
+#: A receipt records what happened to a released action. Any of them consumes
+#: the action's nonce: an action is one-shot, and a retry needs a new human
+#: decision rather than a second use of the old one.
+RECEIPT_STATUS = frozenset({"executed", "failed", "uncertain"})
+
+#: `uncertain` means nobody knows whether the side effect happened. It blocks
+#: until a human reconciles it, because the alternative is doing it twice.
+RECEIPT_UNRESOLVED = frozenset({"uncertain"})
+
 DECISION_SCHEMA_VERSION = 1
 
 #: approve/reject spelled once, mapped to the envelope type that carries it.
@@ -111,6 +128,33 @@ DECISION_VERDICTS = {"approve": "approval", "reject": "rejection"}
 #: An action identifier is a stable slug, not prose: it is compared exactly
 #: when a decision is matched to the action it releases.
 ACTION_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+#: One-shot identity for a consequential action. Opaque; compared exactly.
+NONCE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
+
+#: Recipes the release path knows how to *derive*, versus digests a caller can
+#: type. A release must never be satisfiable by echoing back a string.
+MEASUREMENT_KINDS = {
+    "snapshot": "git-worktree-manifest",
+    "context": "agent-room-thread-context",
+}
+
+#: Structured parameters for each consequential action the room can put in
+#: front of a human. Prose in `scope` is for the human; these are what a later
+#: check compares. An action id with no entry here cannot be consequential.
+ACTION_PARAMETERS = {
+    "activate-agent-room-transport": {
+        "repo": str,
+        "branch": str,
+        "expect_branch_absent": bool,
+    },
+    "merge-agent-room-infrastructure": {
+        "repo": str,
+        "base_branch": str,
+        "head_branch": str,
+        "expect_head_commit": str,
+    },
+}
 
 #: A decision id must survive being read back out of an artifact or a log
 #: line, so the same narrow grammar applies.
@@ -133,23 +177,133 @@ def _require_sha256(value, label: str) -> str:
     return value
 
 
-def validate_binding(binding, label: str = "binding") -> None:
-    """The snapshot/context pair a decision is bound to.
+def validate_measurement(measurement, label: str = "binding.measurement") -> None:
+    """The recipe the release path uses to derive current state itself.
 
-    Both are mandatory. A decision bound to only one of them would release an
-    action after the other had moved, which is precisely the stale-approval
-    failure this exists to prevent.
+    This is the difference between "the caller says the snapshot is X" and
+    "the snapshot is X". A red-team simply echoed the two digests out of the
+    decision request back into the gate and got a release; the fix is that a
+    consequential binding must carry enough to *recompute* both, and the
+    release path recomputes them.
+    """
+    _require(isinstance(measurement, dict), f"{label} must be an object")
+    snapshot = measurement.get("snapshot")
+    _require(isinstance(snapshot, dict), f"{label}.snapshot must be an object")
+    _require(
+        snapshot.get("kind") == MEASUREMENT_KINDS["snapshot"],
+        f"{label}.snapshot.kind must be "
+        f"{MEASUREMENT_KINDS['snapshot']!r}, got {snapshot.get('kind')!r}",
+    )
+    base = snapshot.get("base_commit")
+    _require(
+        isinstance(base, str) and bool(FULL_COMMIT_RE.match(base))
+        and base not in NULL_OBJECT_IDS,
+        f"{label}.snapshot.base_commit {base!r} must be a full non-null "
+        "Git object id",
+    )
+    version = snapshot.get("snapshot_schema_version")
+    _require(
+        type(version) is int and version > 0,
+        f"{label}.snapshot.snapshot_schema_version must be a positive integer, "
+        f"got {version!r}",
+    )
+
+    context = measurement.get("context")
+    _require(isinstance(context, dict), f"{label}.context must be an object")
+    _require(
+        context.get("kind") == MEASUREMENT_KINDS["context"],
+        f"{label}.context.kind must be {MEASUREMENT_KINDS['context']!r}, "
+        f"got {context.get('kind')!r}",
+    )
+    thread_id = context.get("thread_id")
+    _require(
+        isinstance(thread_id, str) and bool(THREAD_ID_RE.match(thread_id)),
+        f"{label}.context.thread_id {thread_id!r} is not a valid thread id",
+    )
+    for field in ("target_message_id", "cutoff_message_id"):
+        _require(
+            is_uuid7(context.get(field)),
+            f"{label}.context.{field} {context.get(field)!r} is not a UUIDv7",
+        )
+
+
+def validate_action_parameters(action_id: str, parameters,
+                               label: str = "action.parameters") -> None:
+    """Structured parameters, so a later check compares values and not prose."""
+    expected = ACTION_PARAMETERS.get(action_id)
+    if expected is None:
+        raise SchemaError(
+            f"{action_id!r} has no structured parameter definition, so it "
+            f"cannot be a consequential action. Known: "
+            f"{sorted(ACTION_PARAMETERS)}"
+        )
+    _require(isinstance(parameters, dict), f"{label} must be an object")
+    missing = sorted(set(expected) - set(parameters))
+    unknown = sorted(set(parameters) - set(expected))
+    _require(not missing, f"{label} is missing {missing} for {action_id!r}")
+    _require(not unknown, f"{label} has unknown fields {unknown} for {action_id!r}")
+    for field, want in expected.items():
+        value = parameters[field]
+        # `bool` is a subclass of `int`; exact types only, so a truthy string
+        # cannot stand in for a boolean precondition.
+        _require(
+            type(value) is want,
+            f"{label}.{field} must be {want.__name__}, got "
+            f"{type(value).__name__} {value!r}",
+        )
+        if want is str:
+            _require_str(value, f"{label}.{field}")
+
+
+def validate_binding(binding, label: str = "binding", *,
+                     consequential: bool = False) -> None:
+    """What a decision is bound to.
+
+    Both digests are always mandatory: a decision bound to only one of them
+    would release an action after the other had moved.
+
+    A *consequential* binding must carry more, because a digest on its own
+    names a state without saying which repository it belongs to or how to
+    recompute it. An approval for repo A must never release the same-looking
+    snapshot in repo B, and a release must derive rather than be told.
     """
     _require(isinstance(binding, dict), f"{label} must be an object")
     for field in BINDING_FIELDS:
         _require(field in binding, f"{label} is missing {field}")
         _require_sha256(binding[field], f"{label}.{field}")
-    if binding.get("project") is not None:
+
+    project = binding.get("project")
+    if consequential:
         _require(
-            isinstance(binding["project"], dict),
-            f"{label}.project must be an object",
+            isinstance(project, dict),
+            f"{label}.project is mandatory for a consequential action: an "
+            "approval must name the repository it approves",
         )
-        _validate_project(binding["project"])
+        _validate_project(project)
+        _require_str(project.get("repo"), f"{label}.project.repo")
+        _require(
+            project.get("commit") is not None,
+            f"{label}.project.commit is mandatory for a consequential action",
+        )
+        _require(
+            binding.get("measurement") is not None,
+            f"{label}.measurement is mandatory for a consequential action; "
+            "without it the release path could only be told the current "
+            "state, never derive it",
+        )
+        validate_measurement(binding["measurement"], f"{label}.measurement")
+        nonce = binding.get("action_nonce")
+        _require(
+            isinstance(nonce, str) and bool(NONCE_RE.match(nonce)),
+            f"{label}.action_nonce {nonce!r} must match {NONCE_RE.pattern}; a "
+            "consequential action is one-shot and needs an identity to consume",
+        )
+    else:
+        if project is not None:
+            _require(isinstance(project, dict), f"{label}.project must be an object")
+            _validate_project(project)
+        if binding.get("measurement") is not None:
+            validate_measurement(binding["measurement"], f"{label}.measurement")
 
 
 def validate_action(action, label: str = "action") -> None:
@@ -168,8 +322,21 @@ def validate_action(action, label: str = "action") -> None:
         "[a-z0-9][a-z0-9._-]{0,63}",
     )
     _require_str(action.get("scope"), f"{label}.scope")
-    _require_bool(action.get("consequential"), f"{label}.consequential")
-    validate_binding(action.get("binding"), f"{label}.binding")
+    consequential = _require_bool(action.get("consequential"),
+                                  f"{label}.consequential")
+    validate_binding(action.get("binding"), f"{label}.binding",
+                     consequential=consequential)
+    if consequential:
+        _require(
+            action.get("parameters") is not None,
+            f"{label}.parameters is mandatory for a consequential action; "
+            "scope prose is for the human, parameters are what is checked",
+        )
+        validate_action_parameters(action_id, action["parameters"],
+                                   f"{label}.parameters")
+    elif action.get("parameters") is not None:
+        validate_action_parameters(action_id, action["parameters"],
+                                   f"{label}.parameters")
 
 
 def validate_decision(decision, envelope: Mapping[str, Any]) -> None:
@@ -234,7 +401,13 @@ def validate_decision(decision, envelope: Mapping[str, Any]) -> None:
         "[a-z0-9][a-z0-9._-]{0,63}",
     )
     _require_str(decision.get("action_scope"), "decision.action_scope")
-    validate_binding(decision.get("binding"), "decision.binding")
+    consequential = _require_bool(decision.get("consequential"),
+                                  "decision.consequential")
+    validate_binding(decision.get("binding"), "decision.binding",
+                     consequential=consequential)
+    if consequential:
+        validate_action_parameters(action_id, decision.get("parameters"),
+                                   "decision.parameters")
     _require_sha256(
         decision.get("decision_binding_sha256"), "decision.decision_binding_sha256"
     )
@@ -694,6 +867,62 @@ def validate_claim(claim, evidence=None, resolver=None, *, check_references: boo
             )
 
 
+def validate_receipt(receipt, envelope: Mapping[str, Any]) -> None:
+    """An immutable record of what happened to a released action.
+
+    A receipt is what makes an action one-shot. It is deliberately not
+    agent-authorable: whoever can write one can either consume somebody's
+    approval or assert an execution that never happened.
+    """
+    _require(isinstance(receipt, dict), "receipt must be an object")
+    version = receipt.get("receipt_schema_version")
+    _require(
+        type(version) is int and version == RECEIPT_SCHEMA_VERSION,
+        f"receipt.receipt_schema_version must be the integer "
+        f"{RECEIPT_SCHEMA_VERSION}, got {version!r}",
+    )
+    receipt_id = receipt.get("receipt_id")
+    _require(
+        isinstance(receipt_id, str) and bool(DECISION_ID_RE.match(receipt_id)),
+        f"receipt.receipt_id {receipt_id!r} must match "
+        "[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+    )
+    nonce = receipt.get("action_nonce")
+    _require(
+        isinstance(nonce, str) and bool(NONCE_RE.match(nonce)),
+        f"receipt.action_nonce {nonce!r} must match {NONCE_RE.pattern}",
+    )
+    action_id = receipt.get("action_id")
+    _require(
+        isinstance(action_id, str) and bool(ACTION_ID_RE.match(action_id)),
+        f"receipt.action_id {action_id!r} must match [a-z0-9][a-z0-9._-]{{0,63}}",
+    )
+    request_id = receipt.get("request_message_id")
+    _require(
+        is_uuid7(request_id),
+        f"receipt.request_message_id {request_id!r} is not a UUIDv7",
+    )
+    _require(
+        envelope.get("parent_id") == request_id,
+        f"an execution_receipt must reply to the decision_request it records "
+        f"({request_id!r}), got parent_id {envelope.get('parent_id')!r}",
+    )
+    _require_enum(receipt.get("status"), RECEIPT_STATUS, "receipt.status")
+    recorded_at = _require_str(receipt.get("recorded_at"), "receipt.recorded_at")
+    try:
+        dt.datetime.strptime(recorded_at, TIMESTAMP_FORMAT)
+    except ValueError as exc:
+        raise SchemaError(
+            f"receipt.recorded_at {recorded_at!r} is not canonical UTC "
+            f"({TIMESTAMP_FORMAT}): {exc}"
+        ) from exc
+    _require_str(receipt.get("decision_id"), "receipt.decision_id")
+    _require(
+        isinstance(receipt.get("result"), dict),
+        "receipt.result must be an object",
+    )
+
+
 def validate_envelope(
     envelope: Mapping[str, Any],
     *,
@@ -795,6 +1024,18 @@ def validate_envelope(
     # A decision record belongs to exactly the two authority-bearing types,
     # and both of them require one. An approval that binds to nothing could
     # not be checked against anything later.
+    if mtype == "execution_receipt":
+        _require(
+            envelope.get("receipt") is not None,
+            "an execution_receipt must carry a 'receipt' record",
+        )
+        validate_receipt(envelope["receipt"], envelope)
+    elif envelope.get("receipt") is not None:
+        raise SchemaError(
+            f"message type {mtype!r} may not carry a 'receipt'; only an "
+            "execution_receipt records what happened to a released action"
+        )
+
     if mtype in DECISION_TYPES:
         _require(
             envelope.get("decision") is not None,
@@ -820,6 +1061,17 @@ def validate_envelope(
                 f"{parent_message['thread_id']!r}, not {envelope['thread_id']!r}; "
                 "a reply may not cross threads"
             )
+
+    # Bounded before anything durable happens. An unbounded body or evidence
+    # list is not an attack on its own, but committing one is irreversible.
+    body_text = envelope["body"].get("text")
+    if isinstance(body_text, str):
+        limits.assert_within(len(body_text), limits.MAX_BODY_TEXT_CHARS,
+                             "body.text", "characters")
+    evidence = envelope.get("evidence", [])
+    if isinstance(evidence, list):
+        limits.assert_within(len(evidence), limits.MAX_EVIDENCE_ITEMS,
+                             "evidence", "items")
 
     validate_evidence(envelope.get("evidence", []), resolver)
 

@@ -26,6 +26,7 @@ from agent_room.errors import (
     UnresolvedReference,
 )
 from agent_room.ids import is_uuid7, uuid7
+from agent_room.namespace import NamespaceViolation
 from tests.conftest_agent_room import (
     configure_identity,
     git,
@@ -140,13 +141,13 @@ def test_malformed_message_paths_fail_closed(store, room, bad_name):
     room.post(thread_id="t1", type="observation", body={"text": "legit"})
     write_raw(store, f".agent-room/messages/t1/{bad_name}", "{}", "smuggled path")
 
-    with pytest.raises(AppendOnlyViolation, match="canonical"):
+    with pytest.raises(NamespaceViolation, match="canonical"):
         store.verify_store()
 
 
 def test_nested_directory_under_messages_is_rejected(store, room):
     write_raw(store, ".agent-room/messages/t1/sub/dir/x.json", "{}", "nested")
-    with pytest.raises(AppendOnlyViolation, match="canonical"):
+    with pytest.raises(NamespaceViolation, match="canonical"):
         store.verify_store()
 
 

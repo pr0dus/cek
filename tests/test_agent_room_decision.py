@@ -304,9 +304,11 @@ def test_a_moved_supervisor_context_makes_the_approval_stale(store, room):
 
 def test_an_approval_of_one_action_does_not_release_another(store, room):
     """The whole point: approval is per-action, not a mood."""
-    merge = post_decision_request(room, action_id="merge-infrastructure",
+    merge = post_decision_request(room,
+                                  action_id="merge-agent-room-infrastructure",
                                   scope="merge PR #8 into main")
-    activate = post_decision_request(room, action_id="activate-transport",
+    activate = post_decision_request(room,
+                                     action_id="activate-agent-room-transport",
                                      scope="create the live branch")
     HumanDecisionAuthority(store).record(merge["message_id"], "approve")
 
@@ -493,14 +495,16 @@ def test_gate_blocked_carries_the_full_report(store, room):
 
 
 def test_pending_requests_lists_only_undecided_bound_requests(store, room):
-    decided = post_decision_request(room, action_id="already-decided")
-    waiting = post_decision_request(room, action_id="still-waiting")
+    decided = post_decision_request(
+        room, action_id="merge-agent-room-infrastructure")
+    waiting = post_decision_request(
+        room, action_id="activate-agent-room-transport")
     room.post(thread_id="t1", type="decision_request",
               body={"text": "unbound"}, human_approval_required=True)
     HumanDecisionAuthority(store).record(decided["message_id"], "approve")
 
     pending = pending_requests(store, "t1")
-    assert [p["action_id"] for p in pending] == ["still-waiting"]
+    assert [p["action_id"] for p in pending] == ["activate-agent-room-transport"]
     assert pending[0]["request_message_id"] == waiting["message_id"]
 
 

@@ -51,7 +51,19 @@ from .orchestrator import (
     IndependenceViolation,
     RoundBounds,
 )
-from .proof import ProofError, proof_evidence, run_proof, verify_proof
+from .namespace import NamespaceViolation
+from .limits import LimitExceeded
+from .process import BoundedResult, ProcessError, isolated_env, run_bounded, sanitised_env
+from .proof import (
+    ProofArtifactConflict,
+    ProofError,
+    proof_evidence,
+    run_isolated_proof,
+    run_proof,
+    verify_artifact,
+    verify_proof,
+)
+from .release import ReleaseBlocked, ReleaseError, authorise, reconcile, reserve
 from .snapshot import SnapshotError, snapshot_manifest, verify_manifest
 from .participant import ParticipantAdapter, ParticipantAdapterError
 from .supervisor import (
@@ -97,6 +109,21 @@ __all__ = [
     "verify_manifest",
     "SnapshotError",
     "run_proof",
+    "run_isolated_proof",
+    "verify_artifact",
+    "ProofArtifactConflict",
+    "NamespaceViolation",
+    "LimitExceeded",
+    "ProcessError",
+    "BoundedResult",
+    "run_bounded",
+    "sanitised_env",
+    "isolated_env",
+    "authorise",
+    "reserve",
+    "reconcile",
+    "ReleaseError",
+    "ReleaseBlocked",
     "verify_proof",
     "proof_evidence",
     "ProofError",

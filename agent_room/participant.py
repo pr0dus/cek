@@ -31,7 +31,7 @@ import time
 from contextlib import contextmanager
 from typing import Callable
 
-from . import canonical
+from . import canonical, limits
 from .errors import (
     AgentRoomError,
     DeliveryError,
@@ -378,6 +378,10 @@ Rules:
             }
 
         thread = self.room.thread(target["thread_id"])
+        # Before the model call, not after: an unbounded thread would be paid
+        # for in tokens and time before anything noticed.
+        limits.assert_within(len(thread), limits.MAX_THREAD_MESSAGES,
+                             f"thread {target['thread_id']!r}", "messages")
         prompt = self.build_prompt(thread, target)
 
         if dry_run:
