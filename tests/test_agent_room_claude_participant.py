@@ -14,8 +14,10 @@ import textwrap
 
 import pytest
 
+import agent_room
 from agent_room import AgentRoom, GitMessageStore, ParticipantCursor
 from agent_room.claude_participant import (
+    ADAPTER_MARKER,
     AGENT_MESSAGE_TYPES,
     RESPONSE_SCHEMA,
     ClaudeAdapterError,
@@ -25,7 +27,7 @@ from agent_room.claude_participant import (
     NoWorkAvailable,
 )
 from agent_room.cli import main
-from agent_room.errors import AgentRoomError, ForbiddenOperation
+from agent_room.errors import AgentRoomError, DeliveryError, ForbiddenOperation
 from agent_room.ids import uuid7
 from tests.conftest_agent_room import configure_identity, git
 
@@ -463,3 +465,238 @@ def test_the_prompt_states_the_required_evidence_shape(addressed):
     assert '"kind": "repo"' in invoker.prompt
     assert "REQUIRED for `repo` evidence" in invoker.prompt
     assert "omit `evidence` entirely rather than inventing one" in invoker.prompt
+
+
+# ===== idempotence: a lost acknowledgement must not buy a second answer ====
+
+def _refuse_acknowledge(room):
+    """Make the cursor write fail, leaving the target unread after a post."""
+    def explode(message_id):
+        raise AgentRoomError("simulated cursor write failure")
+    room.acknowledge = explode
+
+
+def exploding_invoker(reason="Claude must not be invoked again"):
+    def invoke(prompt):
+        raise AssertionError(reason)
+    return invoke
+
+
+def test_post_succeeds_but_acknowledgement_fails_leaves_one_reply(addressed):
+    """Acceptance 1: target stays unread, exactly one Claude reply exists."""
+    _, claude, posted = addressed
+    _refuse_acknowledge(claude)
+
+    result = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "durable"}})).run_turn()
+
+    assert result["status"] == "responded"
+    assert result["acknowledged"] is False
+    assert "acknowledge_error" in result
+    assert len(claude.thread("research-1")) == 2
+
+    # The target is genuinely still unread.
+    fresh_cursor = ParticipantCursor(claude.cursor.state_dir, "claude-code")
+    assert not fresh_cursor.is_acknowledged(posted["message_id"])
+
+
+def test_retry_reconciles_without_invoking_claude_again(store, tmp_path, addressed):
+    """Acceptance 2: a fresh participant finds the reply and only acks."""
+    _, claude, posted = addressed
+    _refuse_acknowledge(claude)
+    first = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "durable"}})).run_turn()
+
+    retry_room = AgentRoom(
+        GitMessageStore(store.workdir, branch="agent-room"), "claude-code",
+        ParticipantCursor(tmp_path / "claude", "claude-code"))
+    result = ClaudeParticipant(retry_room, exploding_invoker()).run_turn()
+
+    assert result["status"] == "already_responded"
+    assert result["invoked_claude"] is False
+    assert result["response_message_id"] == first["response_message_id"]
+    assert result["response_via"] == ADAPTER_MARKER
+    assert result["acknowledged"] is True
+
+    assert len(retry_room.thread("research-1")) == 2, "still exactly one reply"
+    assert retry_room.is_acknowledged(posted["message_id"])
+    assert retry_room.inbox() == []
+
+
+def test_process_loss_after_post_is_reconciled_on_restart(store, tmp_path, addressed):
+    """Acceptance 3: durable post, process dies before ack, restart recovers."""
+    _, claude, posted = addressed
+
+    # A separate process posts the reply and exits *without* acknowledging.
+    script = textwrap.dedent(f"""
+        import json, sys
+        sys.path.insert(0, {os.getcwd()!r})
+        from agent_room import AgentRoom, GitMessageStore, ParticipantCursor
+        from agent_room.claude_participant import ClaudeParticipant
+        store = GitMessageStore({str(store.workdir)!r}, branch='agent-room')
+        room = AgentRoom(store, 'claude-code',
+                         ParticipantCursor({str(tmp_path / 'claude')!r}, 'claude-code'))
+        def die_before_ack(message_id):
+            raise SystemExit(7)          # process loss at exactly that point
+        room.acknowledge = die_before_ack
+        p = ClaudeParticipant(room, lambda prompt: json.dumps(
+            {{"type": "answer", "body": {{"text": "posted then died"}}}}))
+        p.run_turn()
+    """)
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 7, proc.stderr
+
+    # Restart: fresh store, room and cursor, recovered purely from disk.
+    restarted = AgentRoom(
+        GitMessageStore(store.workdir, branch="agent-room"), "claude-code",
+        ParticipantCursor(tmp_path / "claude", "claude-code"))
+    assert len(restarted.thread("research-1")) == 2
+    assert not restarted.is_acknowledged(posted["message_id"])
+
+    result = ClaudeParticipant(restarted, exploding_invoker()).run_turn()
+    assert result["status"] == "already_responded"
+    assert result["acknowledged"] is True
+    assert len(restarted.thread("research-1")) == 2
+
+
+def test_ambiguous_delivery_does_not_produce_a_second_response(
+        tmp_path, bare_remote, addressed_remote):
+    """Acceptance 4: locally durable but undelivered is still one response."""
+    supervisor, claude, posted, store = addressed_remote
+
+    hook = bare_remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    store.push_retries = 1
+
+    first = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "local only"}})).run_turn()
+    assert first["status"] == "responded"
+    assert first["delivered"] is False and "delivery_error" in first
+    assert len(claude.thread("t-remote")) == 2
+    # Locally durable, so the turn legitimately acknowledged: there is no
+    # unread work left. Retry the same target explicitly.
+    assert claude.inbox() == []
+
+    retry = ClaudeParticipant(claude, exploding_invoker()).run_turn(
+        posted["message_id"])
+    assert retry["status"] == "already_responded"
+    assert retry["response_message_id"] == first["response_message_id"]
+    assert len(claude.thread("t-remote")) == 2, "no second logical response"
+
+
+@pytest.fixture
+def addressed_remote(tmp_path, bare_remote):
+    store = GitMessageStore.initialise(tmp_path / "room", branch="agent-room")
+    configure_identity(store.workdir)
+    store.remote = str(bare_remote)
+    supervisor = AgentRoom(store, "supervisor",
+                           ParticipantCursor(tmp_path / "sup", "supervisor"))
+    claude = AgentRoom(store, "claude-code",
+                       ParticipantCursor(tmp_path / "cl", "claude-code"))
+    posted = supervisor.post(thread_id="t-remote", type="question",
+                             body={"text": "remote question"},
+                             recipient={"agent": "claude-code"})
+    return supervisor, claude, posted, store
+
+
+def test_unproven_persistence_does_not_acknowledge_or_claim_a_response(
+        store, tmp_path, addressed, monkeypatch):
+    """If local durability cannot be proven, claim nothing and acknowledge nothing.
+
+    Uses the commit-sequence path, where `locally_committed` really can be
+    unknown - a failed push leaves the commit itself proven.
+    """
+    _, claude, posted = addressed
+    real_run = subprocess.run
+
+    def flaky(cmd, **kwargs):
+        if "commit" in cmd or "--diff-filter=A" in cmd:
+            raise subprocess.TimeoutExpired(cmd, 60)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(agent_room.gitstore.subprocess, "run", flaky)
+    with pytest.raises(DeliveryError) as exc:
+        ClaudeParticipant(
+            claude, stub({"type": "answer", "body": {"text": "x"}})).run_turn()
+    monkeypatch.undo()
+
+    assert exc.value.locally_committed is None
+    assert exc.value.locally_committed_known is False
+    assert not claude.is_acknowledged(posted["message_id"])
+    assert len(claude.thread("research-1")) == 1, "no response was claimed"
+
+
+def test_an_unanswered_target_still_invokes_claude_exactly_once(addressed):
+    """Acceptance 5: the ordinary path is unchanged."""
+    _, claude, posted = addressed
+    calls = []
+
+    def counting(prompt):
+        calls.append(prompt)
+        return json.dumps({"type": "answer", "body": {"text": "first answer"}})
+
+    result = ClaudeParticipant(claude, counting).run_turn()
+    assert len(calls) == 1
+    assert result["status"] == "responded" and result["invoked_claude"] is True
+    assert result["acknowledged"] is True
+    assert len(claude.thread("research-1")) == 2
+
+
+def test_adapter_replies_carry_an_auditable_marker(addressed):
+    _, claude, _ = addressed
+    result = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "x"}})).run_turn()
+    stored = claude.get("research-1", result["response_message_id"])
+    assert stored["sender"] == {"agent": "claude-code", "via": ADAPTER_MARKER}
+
+
+def test_a_manual_claude_reply_also_blocks_a_duplicate_turn(addressed):
+    """Conservative: any durable claude-code reply to T stops a second answer."""
+    _, claude, posted = addressed
+    manual = claude.reply(posted["message_id"], type="answer",
+                          body={"text": "answered by hand"})
+
+    result = ClaudeParticipant(claude, exploding_invoker()).run_turn()
+    assert result["status"] == "already_responded"
+    assert result["response_message_id"] == manual["message_id"]
+    assert result["response_via"] is None, "distinguishable from an adapter reply"
+    assert len(claude.thread("research-1")) == 2
+
+
+def test_reconciliation_ignores_replies_from_other_participants(store, tmp_path,
+                                                                room_pair, addressed):
+    """Another participant answering T must not suppress Claude's turn."""
+    supervisor, claude, posted = addressed
+    openai = AgentRoom(store, "openai-research",
+                       ParticipantCursor(tmp_path / "oa", "openai-research"))
+    openai.reply(posted["message_id"], type="observation",
+                 body={"text": "someone else replied"})
+
+    result = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "mine"}})).run_turn()
+    assert result["status"] == "responded" and result["invoked_claude"] is True
+    assert len(claude.thread("research-1")) == 3
+
+
+def test_reconciliation_ignores_replies_to_a_different_message(addressed):
+    _, claude, posted = addressed
+    other = claude.post(thread_id="research-1", type="observation",
+                        body={"text": "unrelated root"})
+    claude.reply(other["message_id"], type="answer", body={"text": "unrelated reply"})
+
+    result = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "for the target"}})).run_turn()
+    assert result["status"] == "responded" and result["invoked_claude"] is True
+
+
+def test_dry_run_reports_an_existing_response(addressed):
+    _, claude, _ = addressed
+    first = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "x"}})).run_turn()
+    claude.cursor.acknowledge  # cursor already advanced; target by id
+    result = ClaudeParticipant(claude, exploding_invoker()).run_turn(
+        first["target_message_id"], dry_run=True)
+    assert result["status"] == "dry_run"
+    assert result["existing_response_message_id"] == first["response_message_id"]

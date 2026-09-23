@@ -40,13 +40,42 @@ it.
 
 1. select **one** message — `--message-id`, else the oldest unread addressed to
    `claude-code`;
-2. recover the complete thread from durable state;
-3. invoke Claude once with the thread rendered into the prompt;
-4. validate the structured reply;
-5. post it into the **same** thread as `claude-code`;
-6. acknowledge the incoming message **only after** the reply is durably
+2. **reconcile before any model work** — if a reply to that target is already
+   durable, do not invoke Claude (see below);
+3. recover the complete thread from durable state;
+4. invoke Claude once with the thread rendered into the prompt;
+5. validate the structured reply;
+6. post it into the **same** thread as `claude-code`;
+7. acknowledge the incoming message **only after** the reply is durably
    recorded;
-7. exit.
+8. exit.
+
+## Idempotence
+
+Posting is durable but acknowledging is not atomic with it: the cursor write
+can fail, or the process can die in between. The target then stays unread, and
+a naive retry would ask Claude again and append a **second** answer to one
+bounded turn — permanently, since history is append-only.
+
+So before any model work the adapter looks for a reply to the target that is
+already durable, matched on **lineage and identity only**: `parent_id ==
+target.message_id` and `sender.agent == claude-code`. Body text and similarity
+are deliberately not used — model output is not a stable key.
+
+If such a reply exists the adapter **does not invoke Claude**. It retries only
+the missing acknowledgement and returns `status: "already_responded"` carrying
+the existing `response_message_id`, `response_via` and `invoked_claude:
+false`.
+
+Every reply this adapter posts carries `sender.via = "agent-room-claude-adapter"`,
+so an automatic turn is mechanically distinguishable from a reply a human drove
+by hand. It is an audit marker, not a security control: provenance rests on
+`sender.agent`, which the store fixes to the room's participant. A *manual*
+`claude-code` reply also suppresses a duplicate turn — the conservative choice
+— and is visible as such because `response_via` is then absent.
+
+A reply from a *different* participant, or a reply to a *different* message,
+does not suppress the turn.
 
 ```bash
 python3 -m agent_room.cli --repo <room> --participant claude-code \
@@ -83,11 +112,14 @@ the response or its body are refused rather than ignored.
 | Reply the room refuses (bad evidence locator, forbidden type) | `MalformedResponse` naming the rejection; nothing written |
 | Claude exits non-zero, is missing, or times out | `ClaudeAdapterError` |
 | Client reports `is_error` | `ClaudeAdapterError` carrying its message |
-| Post succeeds but acknowledgement fails | turn returns `acknowledged: false` with `acknowledge_error`; the reply stands and the turn is safely repeatable |
+| Post succeeds but acknowledgement fails | turn returns `acknowledged: false` with `acknowledge_error`; the reply stands, and the next turn **reconciles** instead of asking Claude again |
+| Post is locally durable but remote delivery fails | the response counts as durable: the turn acknowledges and reports `delivered: false` with `delivery_error` |
+| Local persistence cannot be proven (`locally_committed` unknown) | `DeliveryError` propagates; **nothing is acknowledged and no response is claimed**, so a later turn reconciles against history |
 
 Durability precedes acknowledgement deliberately. The reverse order could mark
-a request read with no answer recorded — losing it. This way the worst case is
-a repeated turn, not a dropped request.
+a request read with no answer recorded — losing it. With reconciliation in
+front of the model call, the worst case is now a repeated *acknowledgement
+attempt*, not a repeated answer.
 
 ## Restart continuity
 

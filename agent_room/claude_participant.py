@@ -23,13 +23,24 @@ import subprocess
 from typing import Any, Callable
 
 from . import canonical
-from .errors import AgentRoomError, ForbiddenOperation, SchemaError
+from .errors import (
+    AgentRoomError,
+    DeliveryError,
+    ForbiddenOperation,
+    SchemaError,
+)
 from .schema import AGENT_FORBIDDEN_TYPES, MESSAGE_TYPES
 
 #: Types an agent participant may author (design §6; enforced again by the store).
 AGENT_MESSAGE_TYPES = tuple(sorted(MESSAGE_TYPES - AGENT_FORBIDDEN_TYPES))
 
 DEFAULT_CLAUDE_BIN = "claude"
+
+#: Stamped into `sender.via` on every reply this adapter posts, so an
+#: automatic turn can be told from a reply a human drove by hand. It is an
+#: audit marker, not a security control - `sender.agent` is what provenance
+#: rests on, and the store already fixes that to the room's participant.
+ADAPTER_MARKER = "agent-room-claude-adapter"
 DEFAULT_TIMEOUT_SECONDS = 900
 
 #: Passed to `claude --json-schema`, so the client validates the shape before
@@ -221,6 +232,30 @@ class ClaudeParticipant:
             )
         return unread[0]
 
+    def find_existing_response(self, target: dict) -> dict | None:
+        """A reply to `target` this participant has already made durable.
+
+        Matched on lineage and identity only - `parent_id` plus
+        `sender.agent`. Deliberately not on body text or similarity: model
+        output is not a stable key, and comparing it would make the
+        deduplication depend on what the model happened to say.
+
+        This is what makes a retry idempotent. Once a response to T is in room
+        history, a lost acknowledgement must never buy a second one.
+        """
+        for message in self.room.thread(target["thread_id"]):
+            if (message.get("parent_id") == target["message_id"]
+                    and message["sender"].get("agent") == self.participant):
+                return message
+        return None
+
+    def _acknowledge(self, message_id: str) -> tuple:
+        try:
+            self.room.acknowledge(message_id)
+            return True, None
+        except AgentRoomError as exc:
+            return False, str(exc)
+
     # -- prompt ------------------------------------------------------------
     def build_prompt(self, thread: list, target: dict) -> str:
         rendered = "\n".join(_render_message(m) for m in thread)
@@ -308,6 +343,25 @@ Rules:
     def run_turn(self, message_id: str | None = None, *, dry_run: bool = False) -> dict:
         """Select, read, ask, validate, post, acknowledge. Then stop."""
         target = self.select_message(message_id)
+
+        # Reconcile before doing any model work. If a response to this target
+        # is already durable, the only thing that can legitimately be missing
+        # is the acknowledgement.
+        existing = self.find_existing_response(target)
+        if existing is not None and not dry_run:
+            acknowledged, ack_error = self._acknowledge(target["message_id"])
+            return {
+                "status": "already_responded",
+                "target_message_id": target["message_id"],
+                "thread_id": target["thread_id"],
+                "response_message_id": existing["message_id"],
+                "response_type": existing["type"],
+                "response_via": (existing["sender"] or {}).get("via"),
+                "invoked_claude": False,
+                "acknowledged": acknowledged,
+                **({"acknowledge_error": ack_error} if ack_error else {}),
+            }
+
         thread = self.room.thread(target["thread_id"])
         prompt = self.build_prompt(thread, target)
 
@@ -318,11 +372,14 @@ Rules:
                 "thread_id": target["thread_id"],
                 "thread_length": len(thread),
                 "prompt_characters": len(prompt),
+                "existing_response_message_id":
+                    existing["message_id"] if existing else None,
             }
 
         raw = self.invoke(prompt)
         response = self.parse_response(raw)   # raises before any mutation
 
+        delivery_error = None
         try:
             posted = self.room.reply(
                 target["message_id"],
@@ -334,6 +391,7 @@ Rules:
                 human_approval_required=response.get("human_approval_required", False),
                 recipient={"agent": target["sender"].get("agent")}
                 if target["sender"].get("agent") else None,
+                sender={"via": ADAPTER_MARKER},
             )
         except (SchemaError, ForbiddenOperation) as exc:
             # A reply the room refuses is malformed output too. Surfacing it as
@@ -342,25 +400,35 @@ Rules:
             raise MalformedResponse(
                 f"claude's reply was rejected by the room: {exc}"
             ) from exc
+        except DeliveryError as exc:
+            if exc.locally_committed is not True:
+                # Persistence is unproven. Do not acknowledge and do not claim
+                # a response exists; a later turn reconciles against history.
+                raise
+            # The response IS durable in room history - only remote delivery
+            # failed - so the turn did its work and may be acknowledged.
+            posted = {"message_id": exc.message_id, "commit": exc.commit,
+                      "path": exc.path}
+            delivery_error = exc
 
         # Durable first, acknowledged second. If the acknowledgement fails the
-        # response still stands and the turn is safely repeatable against the
-        # same target; the reverse order could lose a request entirely.
-        acknowledged = False
-        ack_error = None
-        try:
-            self.room.acknowledge(target["message_id"])
-            acknowledged = True
-        except AgentRoomError as exc:
-            ack_error = str(exc)
+        # response still stands, and the next turn reconciles rather than
+        # asking Claude again.
+        acknowledged, ack_error = self._acknowledge(target["message_id"])
 
-        return {
+        result = {
             "status": "responded",
             "target_message_id": target["message_id"],
             "thread_id": target["thread_id"],
             "response_message_id": posted["message_id"],
             "response_type": response["type"],
             "commit": posted.get("commit"),
+            "invoked_claude": True,
             "acknowledged": acknowledged,
-            **({"acknowledge_error": ack_error} if ack_error else {}),
         }
+        if ack_error:
+            result["acknowledge_error"] = ack_error
+        if delivery_error is not None:
+            result["delivered"] = False
+            result["delivery_error"] = str(delivery_error)
+        return result
