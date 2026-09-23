@@ -132,6 +132,31 @@ def test_no_participant_or_orchestrator_module_reaches_the_authority_surface():
             )
 
 
+def test_the_cli_shows_what_would_be_decided_without_deciding(store, room, capsys):
+    """`--show` must stand alone: read first, decide second."""
+    from agent_room.cli import main
+
+    request = post_decision_request(room)
+    code = main(["--repo", str(store.workdir), "--participant", "human",
+                 "human-decide", "--request-id", request["message_id"], "--show"])
+    assert code == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["action_id"] == "activate-agent-room-transport"
+    assert shown["binding"]["snapshot_sha256"] == SNAPSHOT_SHA
+    assert evaluate_gate(store, request["message_id"])["decisions"] == []
+
+
+def test_the_cli_needs_a_verdict_before_it_will_record_anything(store, room, capsys):
+    from agent_room.cli import main
+
+    request = post_decision_request(room)
+    code = main(["--repo", str(store.workdir), "--participant", "human",
+                 "human-decide", "--request-id", request["message_id"],
+                 "--confirm-human"])
+    assert code == 2
+    assert "--decision approve|reject" in capsys.readouterr().err
+
+
 def test_the_cli_never_records_a_decision_without_explicit_human_confirmation(
         store, room, capsys):
     from agent_room.cli import main

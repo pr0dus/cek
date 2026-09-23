@@ -312,8 +312,8 @@ Rules:
         mtype = payload.get("type")
         if mtype in AGENT_FORBIDDEN_TYPES:
             raise MalformedResponse(
-                f"{self.participant} may not author {mtype!r}; human authority "
-                "arrives in Issue #5"
+                f"{self.participant} may not author {mtype!r}; human "
+                "authority is a separate surface no participant can reach"
             )
         if mtype not in AGENT_MESSAGE_TYPES:
             raise MalformedResponse(f"unsupported response type {mtype!r}")

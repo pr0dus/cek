@@ -40,9 +40,9 @@ MESSAGE_TYPES = frozenset({
     "decision_request", "approval", "rejection", "handoff",
 })
 
-#: Withheld from agent-facing post/reply for Issues #2-#4 (design §6).
-#: Mechanical human authority is Issue #5's problem, so rather than pretend to
-#: verify a human we simply do not expose these types to an agent.
+#: Withheld from agent-facing post/reply (design §6). Rather than pretend to
+#: verify a human, these types are simply not exposed to an agent at all; the
+#: only write path that accepts them is `GitMessageStore.append_decision`.
 AGENT_FORBIDDEN_TYPES = frozenset({"approval", "rejection"})
 
 #: Conversation flow only. Carries no epistemic weight.
@@ -732,7 +732,8 @@ def validate_envelope(
     if agent_facing and mtype in AGENT_FORBIDDEN_TYPES:
         raise ForbiddenOperation(
             f"agent-facing operations cannot author {mtype!r} messages; "
-            "mechanical human authority arrives in Issue #5"
+            "the human decision surface (agent_room.decision) is the only "
+            "path to one, and no agent may reach it"
         )
 
     _require_enum(envelope["status"], LIFECYCLE_STATUS, "status")

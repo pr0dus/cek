@@ -37,8 +37,10 @@ class ConflictError(AgentRoomError):
 class ForbiddenOperation(AgentRoomError):
     """Operation not available to an agent participant.
 
-    Issues #2-#4 withhold `approval`/`rejection` from agent-facing APIs;
-    mechanical human authority arrives in Issue #5.
+    `approval`/`rejection` are withheld from every agent-facing API, and the
+    identity `human` is reserved. The only path to a decision record is
+    `agent_room.decision.HumanDecisionAuthority`, which no participant or
+    orchestrator code may reach.
     """
 
 

@@ -199,7 +199,9 @@ def build_parser() -> argparse.ArgumentParser:
              "code may invoke it.",
     )
     decide.add_argument("--request-id", required=True)
-    decide.add_argument("--decision", required=True, choices=["approve", "reject"])
+    # Not `required`: `--show` must be usable on its own, so a person can read
+    # what would be decided before naming a verdict at all.
+    decide.add_argument("--decision", default=None, choices=["approve", "reject"])
     decide.add_argument("--decision-id", default=None)
     decide.add_argument("--note", default=None)
     decide.add_argument("--expect-action-id", default=None,
@@ -297,6 +299,10 @@ def main(argv=None) -> int:
             if args.show:
                 _emit(authority.describe(args.request_id))
                 return 0
+            if args.decision is None:
+                print("human-decide needs --decision approve|reject, or --show "
+                      "to read what would be decided.", file=sys.stderr)
+                return 2
             if not args.confirm_human:
                 print(
                     "Refusing to record a decision without --confirm-human. "
