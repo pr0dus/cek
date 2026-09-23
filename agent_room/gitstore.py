@@ -44,6 +44,7 @@ from .errors import (
     DeliveryError,
     DirtyCheckoutError,
     GitTimeout,
+    InvalidBranchName,
     HistoryUnavailable,
     LockTimeout,
     PushAmbiguous,
@@ -60,8 +61,13 @@ DEFAULT_BRANCH = "agent-room"
 GIT_TIMEOUT_SECONDS = 60
 DEFAULT_PUSH_RETRIES = 3
 DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+CONTROL_OR_SPACE = frozenset(chr(c) for c in range(0x21)) | {"\x7f"}
 LOCK_POLL_SECONDS = 0.05
 WRITER_LOCK_NAME = "agent-room-writer.lock"
+
+#: Git revision syntax that must never appear in a configured branch name.
+#: `refs/heads/` + one of these still resolves as an expression.
+REVISION_SYNTAX = ("~", "^", ":", "?", "*", "[", "\\", "@{", "..")
 
 
 class GitMessageStore:
@@ -83,7 +89,8 @@ class GitMessageStore:
         author: tuple[str, str] = ("agent-room", "agent-room@localhost"),
     ) -> None:
         self.workdir = Path(workdir)
-        self.branch = branch
+        #: Validated once, before any ref is built from it.
+        self.branch = self._validate_branch_name(branch)
         #: The only revision authority. A short name can be shadowed by a tag
         #: of the same name, so `agent-room` must never be used to resolve a
         #: tip, scan history, fetch, push or reconcile a remote.
@@ -261,6 +268,47 @@ class GitMessageStore:
         return parts[2], parts[3][: -len(".json")]
 
     # -- single-writer lock ------------------------------------------------
+    @staticmethod
+    def _validate_branch_name(branch) -> str:
+        """Require a literal branch name, not a revision expression.
+
+        `refs/heads/agent-room~1` is still resolvable by Git, so prefixing the
+        namespace is not enough on its own: the name itself has to be proven
+        literal before any ref is constructed from it.
+        """
+        if not isinstance(branch, str) or not branch:
+            raise InvalidBranchName(
+                f"branch must be a non-empty string, got "
+                f"{type(branch).__name__} {branch!r}"
+            )
+        for token in REVISION_SYNTAX:
+            if token in branch:
+                raise InvalidBranchName(
+                    f"branch {branch!r} contains Git revision syntax {token!r}; "
+                    "a room branch must be a literal branch name"
+                )
+        if branch.startswith("-"):
+            # Would be read as an option by any Git invocation that takes it
+            # positionally.
+            raise InvalidBranchName(f"branch {branch!r} must not start with '-'")
+        if branch.startswith("/") or branch.endswith("/") or branch.endswith("."):
+            raise InvalidBranchName(f"branch {branch!r} is not a valid branch name")
+        if any(c in branch for c in CONTROL_OR_SPACE):
+            raise InvalidBranchName(
+                f"branch {branch!r} contains whitespace or control characters"
+            )
+        # Git's own rules are the authority for everything else.
+        proc = subprocess.run(
+            ["git", "check-ref-format", f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise InvalidBranchName(
+                f"branch {branch!r} is not a valid Git branch name "
+                f"(git check-ref-format rejected refs/heads/{branch})"
+            )
+        return branch
+
     def _git_dir(self) -> Path:
         out = self._git("rev-parse", "--absolute-git-dir", check=False)
         if out.returncode != 0:
@@ -421,7 +469,10 @@ class GitMessageStore:
                 "cannot be verified from a truncated clone. Fetch full history "
                 "(git fetch --unshallow) before verifying, appending or pushing."
             )
-        if self._git("rev-parse", "--verify", self.ref, check=False).returncode != 0:
+        # show-ref --verify has exact-ref semantics: it will not resolve an
+        # expression, only a literal ref that exists.
+        if self._git("show-ref", "--verify", "--quiet", self.ref,
+                     check=False).returncode != 0:
             raise HistoryUnavailable(
                 f"configured room branch {self.branch!r} does not exist in "
                 f"{self.workdir}; refusing to report an empty history for a "
@@ -632,7 +683,7 @@ class GitMessageStore:
                 f"but its content hashes to {actual}; the object database has "
                 "been altered under the committed object id"
             )
-        return content.decode("utf-8")
+        return canonical.decode_artifact(content, f"stored artifact {path}")
 
     def _discard_uncommitted(self, rel: str) -> None:
         """Unstage and remove a message artifact that was never committed.
@@ -651,11 +702,36 @@ class GitMessageStore:
             # outcome we are about to report.
             pass
 
+    def _object_store_fingerprint(self) -> tuple:
+        """A cheap signature that changes when the local object store does.
+
+        A ref-tip cache is not a valid invalidation source for integrity:
+        rewriting an object under its existing id does not move the tip. Size
+        and mtime of every object file does change, so this is what the
+        integrity cache is keyed on.
+        """
+        objects = self._git_common_dir() / "objects"
+        entries = []
+        try:
+            for root, _dirs, files in os.walk(objects):
+                for name in files:
+                    full = Path(root) / name
+                    try:
+                        stat = full.stat()
+                    except OSError:
+                        entries.append((str(full), -1, -1))
+                        continue
+                    entries.append((str(full), stat.st_size, stat.st_mtime_ns))
+        except OSError as exc:
+            raise AgentRoomError(f"cannot inspect the object store: {exc}") from exc
+        return tuple(sorted(entries))
+
     def assert_object_integrity(self) -> None:
         """Fail closed on any reachable-object corruption in the room history.
 
-        Run on every full verification rather than cached: `_history_cache` is
-        keyed on the ref tip, and object corruption does not move the tip.
+        Cached only against the ref tip *and* an object-store fingerprint, so
+        a rewrite under an existing object id - which leaves the tip untouched
+        - always invalidates the cache.
         """
         # fsck takes an object, not a ref name; resolving first also means a
         # missing branch is reported as unavailable history, not corruption.
@@ -663,6 +739,9 @@ class GitMessageStore:
         tip = self._git("rev-parse", "--verify", self.ref, check=False).stdout.strip()
         if not tip:
             raise HistoryUnavailable(f"cannot resolve {self.ref} for integrity check")
+        key = (tip, self._object_store_fingerprint())
+        if getattr(self, "_integrity_cache", None) == key:
+            return
         proc = self._git(
             "fsck", "--strict", "--no-dangling", "--no-reflogs", tip,
             check=False,
@@ -672,15 +751,22 @@ class GitMessageStore:
                 f"git fsck --strict rejected the object database backing "
                 f"{self.ref}: {(proc.stderr or proc.stdout).strip()[:500]}"
             )
+        self._integrity_cache = key
 
     def _load_raw(self, path: str, commit: str) -> dict:
         """Phase one: the message itself, with no reference resolution.
+
+        The integrity gate runs first. Hashing the blob alone is not enough:
+        the commit and tree objects that *select* that blob can themselves be
+        forged under their existing ids, so a read could return authentic-
+        looking content chosen by a corrupt tree.
 
         Structural validation at the trust boundary - a correctly resealed but
         malformed artifact, or one written by another participant's library,
         must still fail loudly. `agent_facing=False` so the reserved Issue #5
         types stay structurally readable.
         """
+        self.assert_object_integrity()
         raw = self._blob_at(commit, path)
         if raw is None:
             raise AppendOnlyViolation(
@@ -954,7 +1040,6 @@ class GitMessageStore:
         would not notice a freshly fetched artifact that is malformed,
         misfiled, or cites something that did not yet exist.
         """
-        self.assert_object_integrity()
         history = self._history()
         for path, commit in history.items():
             self._load(path, commit)
@@ -1272,7 +1357,8 @@ class GitMessageStore:
                     return {"pushed": True, "pushed_known": True,
                             "attempts": attempt, "reconciled": True}
                 raise PushAmbiguous(
-                    f"push to {self.remote} did not return a result: {exc}",
+                    f"push to {self.remote} did not return a result: {exc}"
+                    + ("" if known else " and delivery could not be settled"),
                     pushed=pushed, pushed_known=known,
                     cause=exc, recovery_error=recon_error,
                 ) from exc
@@ -1319,6 +1405,22 @@ class GitMessageStore:
                     f"{attempt}: {rebase.stderr.strip() or last_error}"
                 )
             self.verify_store()
+        # Retry exhaustion is not by itself proof of non-delivery: an earlier
+        # attempt may have been accepted while its acknowledgement was lost.
+        # Settle it before classifying, or stay honestly unknown.
+        final_tip = self._git("rev-parse", self.ref, check=False).stdout.strip()
+        settled, settled_known, recon_error = self._reconcile_push(final_tip)
+        if settled is True:
+            return {"pushed": True, "pushed_known": True,
+                    "attempts": self.push_retries, "reconciled": True}
+        if not settled_known:
+            raise PushAmbiguous(
+                f"push to {self.remote} failed after {self.push_retries} "
+                f"attempts and delivery could not be settled: {last_error}",
+                pushed=None, pushed_known=False,
+                cause=AgentRoomError(last_error or "push failed"),
+                recovery_error=recon_error,
+            )
         raise PushRaceError(
             f"push rejected after {self.push_retries} attempts: {last_error}"
         )

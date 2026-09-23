@@ -43,12 +43,33 @@ def _reject_constant(name: str):
     raise SchemaError(f"stored JSON contains the non-standard constant {name}")
 
 
-def strict_loads(text: str):
+def decode_artifact(raw, label: str = "stored artifact") -> str:
+    """Decode committed bytes as strict UTF-8.
+
+    A committed artifact with invalid UTF-8 must fail as a SchemaError; a raw
+    UnicodeDecodeError is outside the contract callers and the CLI rely on.
+    """
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            return bytes(raw).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SchemaError(f"{label} is not valid UTF-8: {exc}") from exc
+    raise SchemaError(
+        f"{label} must be text or bytes, got {type(raw).__name__}"
+    )
+
+
+def strict_loads(text):
     """Parse JSON, rejecting duplicate keys and non-standard constants.
 
-    Malformed stored JSON must surface as a SchemaError: a raw
-    JSONDecodeError would escape the Agent Room contract the CLI relies on.
+    Accepts `str`, `bytes` or `bytearray` only; anything else (including
+    None) is a SchemaError rather than a TypeError. Malformed stored JSON
+    surfaces as a SchemaError too: a raw JSONDecodeError would escape the
+    Agent Room contract the CLI relies on.
     """
+    text = decode_artifact(text, "JSON input")
     try:
         return json.loads(
             text,

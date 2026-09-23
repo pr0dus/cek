@@ -296,6 +296,12 @@ def _validate_run_locator(ref: dict, i: int, verifier=None) -> None:
                 )
 
 
+#: A host made only of digits and dots is claiming to be IPv4. If it is not a
+#: valid IPv4 address it must be rejected, not quietly re-read as a DNS name -
+#: `256.1.2.3` is nobody's hostname.
+IPV4_SHAPED_RE = re.compile(r"\A[0-9.]+\Z")
+
+
 def _validate_url_host(host: str, url: str, i: int) -> None:
     """Host must be a valid IP literal or a valid DNS/IDNA hostname."""
     try:
@@ -303,6 +309,11 @@ def _validate_url_host(host: str, url: str, i: int) -> None:
         return
     except ValueError:
         pass
+    if IPV4_SHAPED_RE.match(host):
+        raise SchemaError(
+            f"evidence[{i}].url {url!r} has an IPv4-shaped host {host!r} that "
+            "is not a valid IPv4 address"
+        )
     if host.startswith("[") or ":" in host:
         raise SchemaError(
             f"evidence[{i}].url {url!r} has a malformed IP literal host {host!r}"

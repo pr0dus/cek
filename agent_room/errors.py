@@ -137,6 +137,24 @@ class HistoryUnavailable(AgentRoomError):
     """
 
 
+class InvalidBranchName(AgentRoomError):
+    """The configured branch is not a literal Git branch name.
+
+    Prefixing `refs/heads/` does not neutralise revision syntax: Git still
+    resolves `refs/heads/room~1`, so a caller could point verification at an
+    earlier, cleaner history than the branch actually holds.
+    """
+
+
+class CursorStateError(AgentRoomError):
+    """The participant-local cursor file is malformed.
+
+    Cursor state is local and rebuildable, so recovery is simply to delete the
+    file — every message reverts to unread and nothing durable is lost. It is
+    reported rather than silently discarded so that corruption is noticed.
+    """
+
+
 class GitTimeout(AgentRoomError):
     """A Git subprocess exceeded its timeout.
 

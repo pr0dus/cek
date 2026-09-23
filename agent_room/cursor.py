@@ -21,7 +21,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .errors import LockTimeout
+from . import canonical
+from .errors import CursorStateError, LockTimeout
 
 SCHEMA_VERSION = 1
 LOCK_TIMEOUT_SECONDS = 10.0
@@ -39,15 +40,70 @@ class ParticipantCursor:
         self.path = self.state_dir / f"cursor-{participant}.json"
         self._state = self._load()
 
+    def _empty(self) -> dict:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "participant": self.participant,
+            "acknowledged": {},
+        }
+
     def _load(self) -> dict:
+        """Read and validate the cursor file.
+
+        Corruption is reported, not silently discarded. Recovery is documented
+        and trivial - delete the file and everything reverts to unread - but a
+        cursor that has been tampered with or truncated is worth noticing
+        rather than quietly forgetting.
+        """
         if not self.path.exists():
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "participant": self.participant,
-                "acknowledged": {},
-            }
-        state = json.loads(self.path.read_text(encoding="utf-8"))
-        state.setdefault("acknowledged", {})
+            return self._empty()
+        try:
+            raw = self.path.read_bytes()
+        except OSError as exc:
+            raise CursorStateError(f"cannot read {self.path}: {exc}") from exc
+
+        try:
+            state = canonical.strict_loads(raw)
+        except Exception as exc:
+            raise CursorStateError(
+                f"{self.path} is not valid cursor JSON: {exc}. "
+                "Delete the file to reset this participant to unread."
+            ) from exc
+
+        if not isinstance(state, dict):
+            raise CursorStateError(
+                f"{self.path} must contain a JSON object, got "
+                f"{type(state).__name__}. Delete the file to reset to unread."
+            )
+        version = state.get("schema_version")
+        if type(version) is not int or version != SCHEMA_VERSION:
+            raise CursorStateError(
+                f"{self.path} has unsupported schema_version {version!r}"
+            )
+        owner = state.get("participant")
+        if not isinstance(owner, str) or owner != self.participant:
+            raise CursorStateError(
+                f"{self.path} belongs to participant {owner!r}, not "
+                f"{self.participant!r}"
+            )
+        acknowledged = state.get("acknowledged")
+        if acknowledged is None:
+            acknowledged = state["acknowledged"] = {}
+        if not isinstance(acknowledged, dict):
+            raise CursorStateError(
+                f"{self.path} has a malformed 'acknowledged' field: expected an "
+                f"object, got {type(acknowledged).__name__}"
+            )
+        for key, entry in acknowledged.items():
+            if not isinstance(key, str) or not key:
+                raise CursorStateError(
+                    f"{self.path} has a non-string acknowledged key {key!r}"
+                )
+            if not isinstance(entry, dict):
+                raise CursorStateError(
+                    f"{self.path} has a malformed acknowledged entry for {key!r}: "
+                    f"expected an object, got {type(entry).__name__}"
+                )
         return state
 
     def _save(self) -> None:

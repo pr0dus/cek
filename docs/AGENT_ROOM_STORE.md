@@ -83,6 +83,16 @@ the body, so a mismatch would let `resolve_message()` return an envelope
 claiming an identity it is not filed under. Checked before the artifact can
 participate in any reference resolution.
 
+**The configured branch must be a literal branch name.** Prefixing
+`refs/heads/` does not neutralise revision syntax — Git still resolves
+`refs/heads/room~1`, which would let verification inspect an earlier, cleaner
+history than the branch actually holds. The name is validated **once, before
+any ref is built from it**: revision operators (`~ ^ : ? * [ \ @{ ..`),
+whitespace, control characters and a leading `-` are refused outright, and
+`git check-ref-format refs/heads/<name>` is the authority for the rest.
+Existence is then checked with `git show-ref --verify`, which has exact-ref
+semantics and will not resolve an expression.
+
 **Every branch reference is fully qualified.** `refs/heads/<branch>` is the
 only revision authority — a short name can be shadowed by a same-name tag, so
 it is never used to resolve a tip, scan history, fetch, rebase, push or
@@ -92,10 +102,16 @@ tag can never stand in as proof of branch delivery.
 **Reachable object integrity is verified, not assumed.** A loose object file
 can be replaced with different, validly compressed content under its old name;
 Git will hand that content back and the envelope can simply be resealed around
-it. Two gates close that: `git fsck --strict --no-dangling --no-reflogs` runs
-on **every** full verification (never cached — corruption does not move the ref
-tip), and every blob read recomputes the object id from the bytes and refuses
-any mismatch.
+it. Hashing the blob is not sufficient on its own either: the **commit and tree
+objects that select** that blob can themselves be forged under their existing
+ids, so a read could return authentic-looking content chosen by a corrupt tree.
+
+The gate therefore runs before **every authoritative read**, not only full
+verification: `git fsck --strict --no-dangling --no-reflogs` over the room
+head, plus a per-read recomputation of the blob object id. Its cache is keyed
+on the ref tip **and an object-store fingerprint** (size and mtime of every
+object file), because rewriting an object under its existing id does not move
+the tip — a ref-tip-only cache would be no invalidation source at all.
 
 **Local history overrides are refused.** A checkout carrying `refs/replace/*`
 or a non-empty legacy `info/grafts` — checked in the **common** Git directory
@@ -271,6 +287,20 @@ backslashes, invalid percent escapes, any userinfo/credentials, malformed IP
 literals, invalid IDNA/DNS labels, out-of-range ports and non-`http(s)` schemes
 are all refused.
 
+**One loader decodes every stored artifact.** `decode_artifact` accepts only
+text or bytes and decodes bytes as strict UTF-8, wrapping a decode failure as
+`SchemaError`; `strict_loads` accepts only `str`/`bytes`/`bytearray` and
+rejects anything else (including `None`) as `SchemaError` rather than
+`TypeError`.
+
+**Cursor corruption is reported, not swallowed.** The cursor file's root,
+`schema_version`, `participant` and `acknowledged` map (including entry shapes)
+are validated on load, and a malformed file raises `CursorStateError`. Cursor
+state is local and rebuildable, so the **documented recovery is simply to
+delete the file** — every message reverts to unread and nothing durable is
+lost. It fails loudly rather than silently resetting so that tampering or
+truncation is noticed.
+
 **Stored roots must be JSON objects.** `null`, arrays, booleans, numbers and
 bare strings fail as `SchemaError` before any `.get()` is attempted.
 
@@ -312,6 +342,11 @@ does not decide whether evidence is *true*.
 | `repo` | non-empty `repo`, full non-null Git object id `commit`, non-empty repository-relative `path`; optional `lines` as `[start, end]` with `start >= 1` and `end >= start` |
 | `run` | full non-null `commit`, plus **at least one** stable locator: `run_id` (non-empty string) or a repository-relative artifact `path` |
 | `external` | non-empty `url` |
+
+A host made only of digits and dots is claiming to be IPv4: if it is not a
+valid IPv4 address it is rejected outright rather than falling through to DNS
+validation, so `256.1.2.3` cannot be accepted as a hostname. No DNS resolution
+is performed.
 | `agent_output` | free-form; never admissible as support |
 
 Paths must be repository-relative — no leading `/`, no `..` segment. The
@@ -476,6 +511,12 @@ can accept a ref while the client still sees a failure. Reconciliation queries
 the exact ref, and if the remote head has moved it bounded-fetches that ref and
 tests whether the attempted tip is an ancestor — so delivery stays provable
 even when another writer has built on top.
+
+**Retry exhaustion is not proof of non-delivery either.** An earlier attempt
+may have been accepted while its acknowledgement was lost, so the loop
+reconciles once more before classifying: proven delivered returns success,
+unprovable stays `null`/unknown, and only an established rejection raises
+`PushRaceError` and reports `pushed: false`.
 
 A lost push acknowledgement is **not** `pushed: false`: the remote may already
 hold the ref. One bounded `ls-remote` reconciliation is attempted — no fetch —
