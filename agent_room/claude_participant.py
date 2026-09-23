@@ -17,9 +17,13 @@ only once the response is durably recorded. Any other outcome leaves an
 honest retryable state rather than a message marked read with no answer.
 """
 
+import fcntl
 import json
+import os
 import shutil
 import subprocess
+import time
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from . import canonical
@@ -42,6 +46,12 @@ DEFAULT_CLAUDE_BIN = "claude"
 #: rests on, and the store already fixes that to the room's participant.
 ADAPTER_MARKER = "agent-room-claude-adapter"
 DEFAULT_TIMEOUT_SECONDS = 900
+
+#: How long a second turn waits for the first to finish. Must comfortably
+#: exceed a model invocation, or a legitimately queued turn fails instead of
+#: waiting and then reconciling. Bounded, never infinite.
+DEFAULT_TURN_LOCK_TIMEOUT_SECONDS = 960.0
+TURN_LOCK_POLL_SECONDS = 0.05
 
 #: Passed to `claude --json-schema`, so the client validates the shape before
 #: we ever see it. We validate again: a schema the model satisfies is not the
@@ -83,6 +93,16 @@ class MalformedResponse(ClaudeAdapterError):
 
 class NoWorkAvailable(ClaudeAdapterError):
     """No unread message is addressed to this participant."""
+
+
+class TurnLockTimeout(ClaudeAdapterError):
+    """Another turn for this participant is already in flight.
+
+    Bounded by construction: the wait has a deadline and then fails cleanly,
+    so a stuck or very slow turn can never hang a caller indefinitely. The
+    caller may simply try again later - reconciliation will then find whatever
+    the first turn produced.
+    """
 
 
 class ClaudeInvoker:
@@ -204,6 +224,7 @@ class ClaudeParticipant:
         invoker: Callable[[str], str] | None = None,
         *,
         participant: str = "claude-code",
+        turn_timeout: float = DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
     ) -> None:
         if room.participant != participant:
             raise ClaudeAdapterError(
@@ -212,6 +233,61 @@ class ClaudeParticipant:
         self.room = room
         self.participant = participant
         self.invoke = invoker if invoker is not None else ClaudeInvoker()
+        self.turn_timeout = float(turn_timeout)
+        if self.turn_timeout < 0:
+            raise ClaudeAdapterError("turn_timeout must be >= 0")
+
+    # -- single-flight -----------------------------------------------------
+    def turn_lock_path(self):
+        """Shared, deterministic location: the repository's common Git dir.
+
+        Common dir rather than the worktree dir, so linked worktrees of one
+        room cannot each run a turn simultaneously. Scoped per participant, so
+        two different participants never block each other.
+        """
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.participant)
+        return self.room.store._git_common_dir() / f"agent-room-turn-{safe}.lock"
+
+    @contextmanager
+    def turn_lock(self):
+        """Exclusive lock over one participant's whole turn.
+
+        Reconciliation alone cannot stop two processes that both check before
+        either appends - that is check-then-act. The lock has to span
+        selection, reconciliation, the model call, the post and the
+        acknowledgement, so the second process only looks *after* the first
+        has finished and therefore sees its response.
+
+        Deliberately a different file from the store's writer lock: the append
+        inside this critical section takes that one, and reusing the same lock
+        would deadlock. `flock` is released by the kernel if the process dies,
+        so a crashed turn cannot wedge the participant.
+        """
+        path = self.turn_lock_path()
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError as exc:
+            raise ClaudeAdapterError(f"cannot open turn lock {path}: {exc}") from exc
+        deadline = time.monotonic() + self.turn_timeout
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TurnLockTimeout(
+                            f"another {self.participant} turn is in flight for "
+                            f"{self.room.store.workdir} (waited "
+                            f"{self.turn_timeout}s); try again later"
+                        )
+                    time.sleep(TURN_LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     # -- selection ---------------------------------------------------------
     def select_message(self, message_id: str | None = None) -> dict:
@@ -341,7 +417,17 @@ Rules:
 
     # -- the turn ----------------------------------------------------------
     def run_turn(self, message_id: str | None = None, *, dry_run: bool = False) -> dict:
-        """Select, read, ask, validate, post, acknowledge. Then stop."""
+        """Select, read, ask, validate, post, acknowledge. Then stop.
+
+        The whole sequence runs under the participant turn lock, so a second
+        process cannot pass the reconciliation check while this one is still
+        deciding what to say.
+        """
+        with self.turn_lock():
+            return self._run_turn_locked(message_id, dry_run=dry_run)
+
+    def _run_turn_locked(self, message_id: str | None = None, *,
+                         dry_run: bool = False) -> dict:
         target = self.select_message(message_id)
 
         # Reconcile before doing any model work. If a response to this target

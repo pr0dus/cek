@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -25,6 +26,7 @@ from agent_room.claude_participant import (
     ClaudeParticipant,
     MalformedResponse,
     NoWorkAvailable,
+    TurnLockTimeout,
 )
 from agent_room.cli import main
 from agent_room.errors import AgentRoomError, DeliveryError, ForbiddenOperation
@@ -700,3 +702,234 @@ def test_dry_run_reports_an_existing_response(addressed):
         first["target_message_id"], dry_run=True)
     assert result["status"] == "dry_run"
     assert result["existing_response_message_id"] == first["response_message_id"]
+
+
+# ===== single-flight: concurrent first turns must not duplicate ===========
+
+def _fake_claude(path, marker, hold_seconds=0.0, text="concurrent answer"):
+    """A `claude` stand-in that records each invocation and can block."""
+    path.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import json, sys, time, os
+        sys.stdin.read()
+        with open({str(marker)!r}, "a") as fh:
+            fh.write(f"{{os.getpid()}}\\n")
+        time.sleep({hold_seconds!r})
+        print(json.dumps({{"is_error": False,
+                          "result": json.dumps({{"type": "answer",
+                                                 "body": {{"text": {text!r}}}}})}}))
+    """), encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _turn_argv(store, tmp_path, fake, turn_timeout=None):
+    argv = ["--repo", str(store.workdir), "--participant", "claude-code",
+            "--state-dir", str(tmp_path / "claude"), "claude-turn",
+            "--claude-bin", str(fake)]
+    if turn_timeout is not None:
+        argv += ["--turn-timeout", str(turn_timeout)]
+    return argv
+
+
+def _run_cli(argv):
+    return subprocess.run(
+        [sys.executable, "-m", "agent_room.cli", *argv],
+        cwd=os.getcwd(), capture_output=True, text=True, timeout=180,
+    )
+
+
+def test_two_concurrent_turns_on_the_same_target_invoke_claude_once(
+        store, tmp_path, addressed):
+    """The reproduction, made deterministic by naming the target.
+
+    Both processes pass reconciliation before either appends unless the turn
+    lock serialises them. With the lock, the waiter reconciles *after* the
+    first finishes and reports `already_responded`.
+    """
+    _, claude, posted = addressed
+    marker = tmp_path / "invocations.log"
+    fake = _fake_claude(tmp_path / "slow-claude", marker, hold_seconds=2.0)
+
+    argv = _turn_argv(store, tmp_path, fake, turn_timeout=60) + \
+        ["--message-id", posted["message_id"]]
+    first = subprocess.Popen(
+        [sys.executable, "-m", "agent_room.cli", *argv],
+        cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.4)          # let the first process take the turn lock
+    second = subprocess.Popen(
+        [sys.executable, "-m", "agent_room.cli", *argv],
+        cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    out_first = first.communicate(timeout=180)
+    out_second = second.communicate(timeout=180)
+    assert first.returncode == 0, out_first[1]
+    assert second.returncode == 0, out_second[1]
+
+    invocations = [l for l in marker.read_text().splitlines() if l.strip()]
+    assert len(invocations) == 1, f"claude was invoked {len(invocations)} times"
+
+    results = [json.loads(out_first[0]), json.loads(out_second[0])]
+    assert sorted(r["status"] for r in results) == ["already_responded", "responded"]
+    waiter = next(r for r in results if r["status"] == "already_responded")
+    responder = next(r for r in results if r["status"] == "responded")
+    assert waiter["invoked_claude"] is False
+    assert waiter["response_message_id"] == responder["response_message_id"]
+
+    room = AgentRoom(GitMessageStore(store.workdir, branch="agent-room"), "claude-code",
+                     ParticipantCursor(tmp_path / "claude", "claude-code"))
+    thread = room.thread("research-1")
+    assert len(thread) == 2, "exactly one durable Claude reply"
+    assert thread[1]["sender"]["agent"] == "claude-code"
+    assert room.store.verify_store() == 2
+    assert "Traceback" not in (out_first[1] + out_second[1])
+
+
+def test_two_concurrent_unread_driven_turns_still_produce_one_reply(
+        store, tmp_path, addressed):
+    """Same race with no explicit target, as an unattended runner would do.
+
+    The waiter's outcome is legitimately one of two things: it reconciles and
+    reports `already_responded`, or - if the first turn also acknowledged -
+    there is genuinely no unread work left. Both are clean; what must never
+    happen is a second invocation or a second reply.
+    """
+    _, claude, posted = addressed
+    marker = tmp_path / "invocations.log"
+    fake = _fake_claude(tmp_path / "slow-claude", marker, hold_seconds=2.0)
+
+    argv = _turn_argv(store, tmp_path, fake, turn_timeout=60)
+    first = subprocess.Popen(
+        [sys.executable, "-m", "agent_room.cli", *argv],
+        cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.4)
+    second = subprocess.Popen(
+        [sys.executable, "-m", "agent_room.cli", *argv],
+        cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    out_first = first.communicate(timeout=180)
+    out_second = second.communicate(timeout=180)
+
+    assert first.returncode == 0, out_first[1]
+    assert json.loads(out_first[0])["status"] == "responded"
+
+    invocations = [l for l in marker.read_text().splitlines() if l.strip()]
+    assert len(invocations) == 1, f"claude was invoked {len(invocations)} times"
+
+    combined = out_second[0] + out_second[1]
+    assert "Traceback" not in combined
+    if second.returncode == 0:
+        assert json.loads(out_second[0])["status"] == "already_responded"
+    else:
+        # Controlled: the first turn acknowledged, so nothing is unread.
+        assert second.returncode == 2 and "NoWorkAvailable" in out_second[1]
+
+    room = AgentRoom(GitMessageStore(store.workdir, branch="agent-room"), "claude-code",
+                     ParticipantCursor(tmp_path / "claude", "claude-code"))
+    assert len(room.thread("research-1")) == 2
+    assert room.store.verify_store() == 2
+
+
+def test_a_waiting_turn_can_fail_with_a_controlled_lock_timeout(
+        store, tmp_path, addressed):
+    """The other permitted policy: bounded wait, then a clean failure."""
+    _, claude, posted = addressed
+    marker = tmp_path / "invocations.log"
+    fake = _fake_claude(tmp_path / "slow-claude", marker, hold_seconds=3.0)
+
+    first = subprocess.Popen(
+        [sys.executable, "-m", "agent_room.cli",
+         *_turn_argv(store, tmp_path, fake, turn_timeout=60)],
+        cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.4)
+    second = subprocess.run(
+        [sys.executable, "-m", "agent_room.cli",
+         *_turn_argv(store, tmp_path, fake, turn_timeout=0.2)],
+        cwd=os.getcwd(), capture_output=True, text=True, timeout=180)
+    out_first = first.communicate(timeout=180)
+
+    assert second.returncode == 2
+    assert "TurnLockTimeout" in second.stderr
+    assert "Traceback" not in second.stderr
+    assert first.returncode == 0, out_first[1]
+
+    invocations = [l for l in marker.read_text().splitlines() if l.strip()]
+    assert len(invocations) == 1
+
+    room = AgentRoom(GitMessageStore(store.workdir, branch="agent-room"), "claude-code",
+                     ParticipantCursor(tmp_path / "claude", "claude-code"))
+    assert len(room.thread("research-1")) == 2
+    assert room.store.verify_store() == 2
+
+
+def test_the_turn_lock_is_released_when_a_process_dies(store, tmp_path, addressed):
+    """flock is released by the kernel, so a crashed turn cannot wedge us."""
+    _, claude, posted = addressed
+    script = textwrap.dedent(f"""
+        import os, sys, time
+        sys.path.insert(0, {os.getcwd()!r})
+        from agent_room import AgentRoom, GitMessageStore, ParticipantCursor
+        from agent_room.claude_participant import ClaudeParticipant
+        store = GitMessageStore({str(store.workdir)!r}, branch='agent-room')
+        room = AgentRoom(store, 'claude-code',
+                         ParticipantCursor({str(tmp_path / 'claude')!r}, 'claude-code'))
+        p = ClaudeParticipant(room, lambda prompt: "unused")
+        with p.turn_lock():
+            print("locked", flush=True)
+            time.sleep(30)
+    """)
+    holder = subprocess.Popen([sys.executable, "-c", script],
+                              stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "locked"
+
+    blocked = ClaudeParticipant(claude, exploding_invoker(), turn_timeout=0.2)
+    with pytest.raises(TurnLockTimeout):
+        blocked.run_turn()
+
+    holder.kill()
+    holder.wait(timeout=30)
+
+    # The lock died with the process; a normal turn now succeeds.
+    result = ClaudeParticipant(
+        claude, stub({"type": "answer", "body": {"text": "after the crash"}}),
+        turn_timeout=30).run_turn()
+    assert result["status"] == "responded"
+
+
+def test_turn_lock_is_participant_scoped(store, tmp_path, addressed):
+    """Two different participants must not block each other."""
+    _, claude, _ = addressed
+    openai_room = AgentRoom(store, "openai-research",
+                            ParticipantCursor(tmp_path / "oa", "openai-research"))
+    claude_p = ClaudeParticipant(claude, exploding_invoker())
+    openai_p = ClaudeParticipant(openai_room, exploding_invoker(),
+                                 participant="openai-research")
+    assert claude_p.turn_lock_path() != openai_p.turn_lock_path()
+
+    with claude_p.turn_lock():
+        with openai_p.turn_lock():
+            pass          # must not block
+
+
+def test_turn_lock_lives_in_the_common_git_dir(store, tmp_path, addressed):
+    _, claude, _ = addressed
+    participant = ClaudeParticipant(claude, exploding_invoker())
+    path = participant.turn_lock_path()
+    assert path.parent == store._git_common_dir()
+    assert "claude-code" in path.name
+
+
+def test_turn_lock_does_not_deadlock_with_the_store_writer_lock(addressed):
+    """The append inside the turn takes the writer lock; they must differ."""
+    _, claude, _ = addressed
+    participant = ClaudeParticipant(claude, stub({"type": "answer",
+                                                  "body": {"text": "x"}}))
+    assert participant.turn_lock_path().name != "agent-room-writer.lock"
+    result = participant.run_turn()
+    assert result["status"] == "responded"
+
+
+def test_negative_turn_timeout_is_refused(addressed):
+    _, claude, _ = addressed
+    with pytest.raises(ClaudeAdapterError, match="turn_timeout"):
+        ClaudeParticipant(claude, exploding_invoker(), turn_timeout=-1)

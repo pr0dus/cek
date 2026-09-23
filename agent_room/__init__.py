@@ -30,6 +30,7 @@ from .claude_participant import (
     ClaudeParticipant,
     MalformedResponse,
     NoWorkAvailable,
+    TurnLockTimeout,
 )
 from .room import AgentRoom
 from .gitstore import GitMessageStore
@@ -42,6 +43,7 @@ __all__ = [
     "ClaudeAdapterError",
     "MalformedResponse",
     "NoWorkAvailable",
+    "TurnLockTimeout",
     "GitMessageStore",
     "ParticipantCursor",
     "AgentRoomError",

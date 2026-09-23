@@ -112,6 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     turn.add_argument("--project-dir", default=None,
                       help="working directory for the Claude turn")
     turn.add_argument("--timeout", type=int, default=None)
+    turn.add_argument("--turn-timeout", type=float, default=None,
+                      help="bounded wait for another in-flight turn (seconds)")
 
     sub.add_parser(
         "push",
@@ -185,7 +187,13 @@ def main(argv=None) -> int:
                 model=args.model,
                 timeout=args.timeout or DEFAULT_TIMEOUT_SECONDS,
             )
-            participant = ClaudeParticipant(room, invoker)
+            from .claude_participant import DEFAULT_TURN_LOCK_TIMEOUT_SECONDS
+            participant = ClaudeParticipant(
+                room, invoker,
+                turn_timeout=args.turn_timeout
+                if args.turn_timeout is not None
+                else DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
+            )
             _emit(participant.run_turn(args.message_id, dry_run=args.dry_run))
         elif args.command == "verify":
             _emit({"verified": room.store.verify_store()})

@@ -50,6 +50,41 @@ it.
    recorded;
 8. exit.
 
+## Single-flight
+
+Reconciliation alone cannot stop two processes that both *check* before either
+*appends* — that is check-then-act, and it would produce two durable replies to
+one bounded turn.
+
+So the whole critical section — select, reconcile, invoke, validate, post,
+acknowledge — runs under a **participant turn lock**: an advisory `flock` on
+`<common-git-dir>/agent-room-turn-<participant>.lock`.
+
+- **Common** Git dir, so linked worktrees of one room cannot each run a turn.
+- **Per participant**, so different participants never block each other.
+- **A different file from the store's writer lock**, which the append inside
+  the section takes — reusing it would deadlock.
+- **Bounded** by `--turn-timeout` (default 960 s, comfortably more than a model
+  call). On expiry: `TurnLockTimeout`, exit 2, no traceback. Never an infinite
+  wait.
+- Released by the kernel if the process dies, so a crashed turn cannot wedge
+  the participant.
+
+A second process that waits then re-runs selection **and** reconciliation, so
+it discovers the first turn's response instead of asking Claude again. Its
+outcome is one of three, all clean:
+
+| | |
+|---|---|
+| `already_responded` | the target is still unread (the first turn's acknowledgement failed, or it was named explicitly) |
+| exit 2, `NoWorkAvailable` | the first turn also acknowledged, so there is genuinely nothing unread |
+| exit 2, `TurnLockTimeout` | the bounded wait expired |
+
+What never happens is a second model invocation or a second durable reply.
+
+`--dry-run` takes the same lock, so its report reflects settled state rather
+than a turn in flight.
+
 ## Idempotence
 
 Posting is durable but acknowledging is not atomic with it: the cursor write
