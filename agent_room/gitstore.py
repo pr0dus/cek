@@ -43,6 +43,7 @@ from .errors import (
     DeliveryError,
     DirtyCheckoutError,
     GitTimeout,
+    HistoryUnavailable,
     LockTimeout,
     PushRaceError,
     SchemaError,
@@ -275,6 +276,33 @@ class GitMessageStore:
             )
 
     # -- history (the authority for what was actually committed) -----------
+    def assert_history_available(self) -> None:
+        """Fail closed unless complete local history is readable.
+
+        A shallow clone cannot prove append-only semantics: the commits that
+        would show a rewrite may simply not be present. "I cannot see the
+        history" and "the history is clean" are different answers, and only
+        one of them is safe to act on.
+        """
+        shallow = self._git("rev-parse", "--is-shallow-repository", check=False)
+        if shallow.returncode != 0:
+            raise HistoryUnavailable(
+                f"cannot determine whether {self.workdir} is shallow: "
+                f"{shallow.stderr.strip()}"
+            )
+        if shallow.stdout.strip() == "true":
+            raise HistoryUnavailable(
+                f"{self.workdir} is a shallow repository; append-only history "
+                "cannot be verified from a truncated clone. Fetch full history "
+                "(git fetch --unshallow) before verifying, appending or pushing."
+            )
+        if self._git("rev-parse", "--verify", self.branch, check=False).returncode != 0:
+            raise HistoryUnavailable(
+                f"configured room branch {self.branch!r} does not exist in "
+                f"{self.workdir}; refusing to report an empty history for a "
+                "branch that is simply missing"
+            )
+
     def _assert_linear(self) -> None:
         """Refuse merge commits anywhere in the branch.
 
@@ -286,7 +314,9 @@ class GitMessageStore:
         """
         proc = self._git("rev-list", "--merges", self.branch, check=False)
         if proc.returncode != 0:
-            return
+            raise HistoryUnavailable(
+                f"merge scan of {self.branch} failed: {proc.stderr.strip()}"
+            )
         merges = [line for line in proc.stdout.split() if line]
         if merges:
             raise AppendOnlyViolation(
@@ -314,9 +344,12 @@ class GitMessageStore:
         never again; a path that is not a canonical message path fails closed
         rather than being skipped.
         """
+        self.assert_history_available()
         tip = self._git("rev-parse", self.branch, check=False)
         if tip.returncode != 0:
-            return {}
+            raise HistoryUnavailable(
+                f"cannot resolve {self.branch}: {tip.stderr.strip()}"
+            )
         tip_sha = tip.stdout.strip()
         cached = getattr(self, "_history_cache", None)
         if cached is not None and cached[0] == tip_sha:
@@ -330,7 +363,11 @@ class GitMessageStore:
             check=False,
         )
         if proc.returncode != 0:
-            return {}
+            # Never a silent {}: an unreadable history is not an empty room.
+            raise HistoryUnavailable(
+                f"history query for {MESSAGES_DIR} on {self.branch} failed: "
+                f"{proc.stderr.strip()}"
+            )
 
         added: dict[str, str] = {}
         commit_seq: dict[str, int] = {}
@@ -355,7 +392,10 @@ class GitMessageStore:
                 )
             path = tokens[i]
             i += 1
-            if not path.startswith(f"{MESSAGES_DIR}/"):
+            # The root itself is inside the reserved namespace: a tracked file
+            # at exactly `.agent-room/messages` has no trailing slash and would
+            # otherwise be skipped by a prefix test.
+            if path != MESSAGES_DIR and not path.startswith(f"{MESSAGES_DIR}/"):
                 continue
             if not self._is_canonical_message_path(path):
                 raise AppendOnlyViolation(
@@ -472,11 +512,15 @@ class GitMessageStore:
         return self._load_raw(path, self._history()[path])
 
     @property
-    def _raw_resolver(self):
-        """Resolves against everything already committed.
+    def _write_resolver(self):
+        """The store's own authority for validating a message being written.
 
-        Correct for `append`, where the new message is by definition later
-        than all existing history.
+        Deliberately not caller-supplied: an exported `append` that accepted an
+        arbitrary resolver would let a caller assert that a parent or evidence
+        message exists when it does not. References are decided against this
+        store's committed history, and artifact verification is the same as on
+        the read side so a blob cannot be accepted as a pinned commit and only
+        discovered to be unreadable afterwards.
         """
         store = self
 
@@ -484,6 +528,14 @@ class GitMessageStore:
             @staticmethod
             def resolve_message(message_id: str):
                 return store._resolve_raw(message_id)
+
+            @staticmethod
+            def commit_object_state(sha: str) -> str:
+                return store.commit_object_state(sha)
+
+            @staticmethod
+            def commit_path_state(sha: str, path: str) -> str:
+                return store.commit_path_state(sha, path)
 
         return _Resolver()
 
@@ -517,6 +569,10 @@ class GitMessageStore:
             def commit_object_state(sha: str) -> str:
                 return store.commit_object_state(sha)
 
+            @staticmethod
+            def commit_path_state(sha: str, path: str) -> str:
+                return store.commit_path_state(sha, path)
+
         return _AsOfResolver()
 
     def commit_object_state(self, sha: str) -> str:
@@ -531,6 +587,18 @@ class GitMessageStore:
             return "absent"
         kind = self._git("cat-file", "-t", sha, check=False).stdout.strip()
         return "commit" if kind == "commit" else "not-a-commit"
+
+    def commit_path_state(self, sha: str, path: str) -> str:
+        """Whether `path` exists in a locally available commit.
+
+        Returns "present", "absent", or "unknown" when the commit is not held
+        locally. Nothing is fetched: an unavailable foreign repository keeps
+        its immutable locator and the store makes no claim about it.
+        """
+        if self.commit_object_state(sha) != "commit":
+            return "unknown"
+        found = self._git("cat-file", "-e", f"{sha}:{path}", check=False)
+        return "present" if found.returncode == 0 else "absent"
 
     def _load(self, path: str, commit: str) -> dict:
         """Read one message as committed, with references resolved.
@@ -548,6 +616,33 @@ class GitMessageStore:
             check_references=True,
         )
         return envelope
+
+    def recover_add_commit(self, path: str) -> tuple:
+        """Prove the surviving add commit, or admit that it is unknown.
+
+        Returns `(commit | None, known, error | None)`. The lookup itself can
+        fail or time out; when it does we report uncertainty rather than a
+        stale pre-rebase SHA dressed up as current. A wrong commit is worse
+        than an honest "unknown" - the whole point of the field is audit.
+        """
+        try:
+            proc = self._git(
+                "log", self.branch, "--reverse", "--diff-filter=A",
+                "--format=%H", "-z", "--", path, check=False,
+            )
+        except AgentRoomError as exc:
+            return None, False, exc
+        if proc.returncode != 0:
+            return None, False, AgentRoomError(
+                f"add-commit lookup for {path} failed: {proc.stderr.strip()}"
+            )
+        for token in proc.stdout.split("\0"):
+            token = token.strip()
+            if len(token) >= 40 and all(c in "0123456789abcdef" for c in token):
+                return token, True, None
+        return None, False, AgentRoomError(
+            f"{path} has no add commit on {self.branch}"
+        )
 
     def current_add_commit(self, path: str, fallback: str | None = None) -> str | None:
         """The commit that currently adds `path`, after any rebase.
@@ -632,7 +727,7 @@ class GitMessageStore:
         return self._load(path, self._history()[path])
 
     # -- append ------------------------------------------------------------
-    def append(self, envelope: dict, *, resolver=None) -> dict:
+    def append(self, envelope: dict) -> dict:
         """Commit one sealed envelope.
 
         Returns `{"status": "created"|"duplicate", "commit": sha, ...}`.
@@ -654,7 +749,7 @@ class GitMessageStore:
         validate_envelope(
             envelope,
             agent_facing=True,
-            resolver=resolver if resolver is not None else self._raw_resolver,
+            resolver=self._write_resolver,
         )
 
         thread_id = envelope["thread_id"]
@@ -730,6 +825,7 @@ class GitMessageStore:
                 "message_id": message_id,
                 "thread_id": thread_id,
                 "commit": commit,
+                "commit_known": True,
                 "path": rel,
             }
             if self.remote:
@@ -738,22 +834,33 @@ class GitMessageStore:
                 # post() would mint a second UUID for the same logical message
                 # and duplicate it in permanent history.
                 try:
-                    result["push"] = self._push_locked()
-                    result["pushed"] = bool(result["push"].get("pushed"))
+                    push_result = self._push_locked()
                 except AgentRoomError as exc:
                     # A rebase during the push may have rewritten our commit,
-                    # so report the SHA that actually holds the message now.
-                    current = self.current_add_commit(rel, commit)
+                    # so re-derive it - and say so honestly if we cannot.
+                    current, known, recovery_error = self.recover_add_commit(rel)
                     raise DeliveryError(
-                        f"message {message_id} is committed locally at {current} "
-                        f"but was not delivered to {self.remote}: {exc}. "
+                        f"message {message_id} is committed locally at "
+                        f"{current if known else '<commit unknown>'} but was not "
+                        f"delivered to {self.remote}: {exc}. "
                         "Retry delivery with push(); do not repost.",
                         message_id=message_id,
                         commit=current,
+                        commit_known=known,
                         path=rel,
                         cause=exc,
+                        recovery_error=recovery_error,
                     ) from exc
-                result["commit"] = self.current_add_commit(rel, commit)
+
+                # Push succeeded. A failed receipt lookup afterwards must not
+                # be reported as a delivery failure - the message did land.
+                result["push"] = push_result
+                result["pushed"] = bool(push_result.get("pushed"))
+                current, known, recovery_error = self.recover_add_commit(rel)
+                result["commit"] = current
+                result["commit_known"] = known
+                if recovery_error is not None:
+                    result["recovery_error"] = str(recovery_error)
         return result
 
     # -- push with bounded retry -------------------------------------------

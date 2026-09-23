@@ -80,8 +80,11 @@ class AgentRoom:
             "body": body,
             "evidence": evidence or [],
             "status": status,
-            "reply_requested": bool(reply_requested),
-            "human_approval_required": bool(human_approval_required),
+            # Deliberately NOT bool(...): coercing here would silently accept
+            # "false", 0, [] and friends. Preserve what the caller passed and
+            # let schema validation reject the wrong type.
+            "reply_requested": reply_requested,
+            "human_approval_required": human_approval_required,
         }
         if parent_id is not None:
             envelope["parent_id"] = parent_id
@@ -97,8 +100,10 @@ class AgentRoom:
         dangling edge.
         """
         envelope = self.build_envelope(**kwargs)
+        # The store is its own authority for references; nothing the caller
+        # supplies can assert that a parent or evidence message exists.
         validate_envelope(envelope, agent_facing=True, resolver=self.store)
-        return self.store.append(canonical.seal(envelope), resolver=self.store)
+        return self.store.append(canonical.seal(envelope))
 
     def reply(self, parent_id: str, **kwargs) -> dict:
         """Post a message linked to `parent_id`, inheriting its thread.

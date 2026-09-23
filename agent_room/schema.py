@@ -14,7 +14,9 @@ claim by itself — only a later message asserting the change can.
 
 from typing import Any, Mapping
 
+import datetime as dt
 import re
+from urllib.parse import urlparse
 
 from .errors import (
     ClaimStateError,
@@ -25,6 +27,10 @@ from .errors import (
 from .ids import is_uuid7
 
 SCHEMA_VERSION = 1
+
+#: The one timestamp spelling the room emits and accepts: UTC, second
+#: precision, trailing Z. Anything else is ambiguous to compare or sort.
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 MESSAGE_TYPES = frozenset({
     "observation", "hypothesis", "claim", "evidence", "test_result",
@@ -86,6 +92,38 @@ ASSERTION_TYPES = frozenset({
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise SchemaError(message)
+
+
+def _require_str(value, label: str) -> str:
+    """A non-empty string, with no coercion.
+
+    `str(value)` would turn `[]` into "[]" and quietly accept it; membership
+    tests on a list or dict raise a bare TypeError the CLI does not contract
+    to catch. Type first, then content.
+    """
+    _require(
+        isinstance(value, str) and value.strip() != "",
+        f"{label} must be a non-empty string, got {type(value).__name__} {value!r}",
+    )
+    return value
+
+
+def _require_bool(value, label: str) -> bool:
+    _require(
+        isinstance(value, bool),
+        f"{label} must be a boolean, got {type(value).__name__} {value!r}",
+    )
+    return value
+
+
+def _require_enum(value, allowed: frozenset, label: str):
+    """Check the type before membership, so lists/dicts cannot raise TypeError."""
+    _require(
+        isinstance(value, str),
+        f"{label} must be a string, got {type(value).__name__} {value!r}",
+    )
+    _require(value in allowed, f"{label} {value!r} not in {sorted(allowed)}")
+    return value
 
 
 #: Sender metadata beyond the identity is free-form but must stay scalar, so
@@ -191,12 +229,20 @@ def _validate_pinned_commit(ref: dict, i: int, verifier=None) -> None:
             )
 
 
-def _validate_repo_locator(ref: dict, i: int) -> None:
-    _require(
-        isinstance(ref.get("repo"), str) and ref["repo"].strip() != "",
-        f"evidence[{i}] of kind 'repo' must name a non-empty repo",
-    )
+def _validate_repo_locator(ref: dict, i: int, verifier=None) -> None:
+    _require_str(ref.get("repo"), f"evidence[{i}].repo")
     _require_relative_path(ref.get("path"), f"evidence[{i}].path")
+    # Only what is locally decidable. If this machine holds the pinned commit,
+    # the cited path must exist in it; if it does not hold the object, the
+    # locator is preserved and nothing is fetched - see the boundary note in
+    # docs/AGENT_ROOM_STORE.md.
+    if verifier is not None and hasattr(verifier, "commit_path_state"):
+        state = verifier.commit_path_state(ref["commit"], ref["path"])
+        if state == "absent":
+            raise SchemaError(
+                f"evidence[{i}].path {ref['path']!r} does not exist in locally "
+                f"available commit {ref['commit'][:8]}"
+            )
     if "lines" in ref:
         lines = ref["lines"]
         _require(
@@ -230,12 +276,22 @@ def _validate_run_locator(ref: dict, i: int) -> None:
 
 
 def _validate_external_locator(ref: dict, i: int) -> None:
-    """External evidence must at least say where it is."""
-    url = ref.get("url")
+    """External evidence must be a syntactically usable absolute URL.
+
+    Syntax only. Issue #2 deliberately does not make an HTTP request to prove
+    the artifact is reachable: the store preserves references, it does not
+    attest to external availability.
+    """
+    url = _require_str(ref.get("url"), f"evidence[{i}].url")
+    parsed = urlparse(url)
     _require(
-        isinstance(url, str) and url.strip() != "",
-        f"evidence[{i}] of kind 'external' must carry a non-empty 'url' "
-        f"locator, got {type(url).__name__} {url!r}",
+        parsed.scheme in ("http", "https"),
+        f"evidence[{i}].url {url!r} must be an absolute http:// or https:// URL, "
+        f"got scheme {parsed.scheme!r}",
+    )
+    _require(
+        bool(parsed.netloc),
+        f"evidence[{i}].url {url!r} has no host",
     )
 
 
@@ -263,15 +319,11 @@ def validate_evidence(evidence: Any, verifier=None) -> None:
                 "be unique within a message",
             )
             seen_ids.add(ref_id)
-        kind = ref.get("kind")
-        _require(
-            kind in EVIDENCE_KINDS,
-            f"evidence[{i}].kind {kind!r} not in {sorted(EVIDENCE_KINDS)}",
-        )
+        kind = _require_enum(ref.get("kind"), EVIDENCE_KINDS, f"evidence[{i}].kind")
         if kind in ("repo", "run"):
             _validate_pinned_commit(ref, i, verifier)
         if kind == "repo":
-            _validate_repo_locator(ref, i)
+            _validate_repo_locator(ref, i, verifier)
         elif kind == "run":
             _validate_run_locator(ref, i)
         elif kind == "external":
@@ -303,6 +355,10 @@ def validate_claim(claim, evidence=None, resolver=None, *, check_references: boo
     """
     _require(isinstance(claim, dict), "claim must be an object")
     status = claim.get("status")
+    if not isinstance(status, str):
+        raise ClaimStateError(
+            f"claim.status must be a string, got {type(status).__name__} {status!r}"
+        )
     if status not in CLAIM_STATUS:
         raise ClaimStateError(
             f"claim.status {status!r} not in {sorted(CLAIM_STATUS)}; "
@@ -313,13 +369,14 @@ def validate_claim(claim, evidence=None, resolver=None, *, check_references: boo
         return
 
     # PROCESS.md rule 1: supported is evidence-scoped, never universal truth.
-    if not str(claim.get("scope") or "").strip():
-        raise ClaimStateError("claim.status 'supported' requires a non-empty scope")
-    # PROCESS.md rule 3: no revision condition means 'proposed' at best.
-    if not str(claim.get("revision_condition") or "").strip():
-        raise ClaimStateError(
-            "claim.status 'supported' requires a non-empty revision_condition"
-        )
+    # No str() coercion - an array must fail, not stringify into "[]".
+    for field in ("scope", "revision_condition"):
+        value = claim.get(field)
+        if not isinstance(value, str) or value.strip() == "":
+            raise ClaimStateError(
+                f"claim.status 'supported' requires a non-empty string {field}, "
+                f"got {type(value).__name__} {value!r}"
+            )
 
     basis = claim.get("evidence_basis") or []
     _require(isinstance(basis, list), "claim.evidence_basis must be a list")
@@ -407,33 +464,36 @@ def validate_envelope(
     missing = [f for f in REQUIRED_FIELDS if f not in envelope]
     _require(not missing, f"envelope missing required fields: {missing}")
 
+    version = envelope["schema_version"]
+    # `True == 1` in Python, so an explicit type test is required here.
     _require(
-        envelope["schema_version"] == SCHEMA_VERSION,
-        f"unsupported schema_version {envelope['schema_version']!r}",
+        type(version) is int and version == SCHEMA_VERSION,
+        f"schema_version must be the integer {SCHEMA_VERSION}, got "
+        f"{type(version).__name__} {version!r}",
     )
     _require(
         is_uuid7(envelope["message_id"]),
         f"message_id {envelope['message_id']!r} is not a UUIDv7",
     )
 
-    mtype = envelope["type"]
-    _require(mtype in MESSAGE_TYPES, f"unknown message type {mtype!r}")
+    mtype = _require_enum(envelope["type"], MESSAGE_TYPES, "type")
     if agent_facing and mtype in AGENT_FORBIDDEN_TYPES:
         raise ForbiddenOperation(
             f"agent-facing operations cannot author {mtype!r} messages; "
             "mechanical human authority arrives in Issue #5"
         )
 
-    _require(
-        envelope["status"] in LIFECYCLE_STATUS,
-        f"status {envelope['status']!r} not in {sorted(LIFECYCLE_STATUS)}",
-    )
+    _require_enum(envelope["status"], LIFECYCLE_STATUS, "status")
 
-    for field in ("thread_id", "timestamp"):
-        _require(
-            isinstance(envelope[field], str) and envelope[field].strip(),
-            f"{field} must be a non-empty string",
-        )
+    _require_str(envelope["thread_id"], "thread_id")
+    timestamp = _require_str(envelope["timestamp"], "timestamp")
+    try:
+        dt.datetime.strptime(timestamp, TIMESTAMP_FORMAT)
+    except ValueError as exc:
+        raise SchemaError(
+            f"timestamp {timestamp!r} is not canonical UTC "
+            f"({TIMESTAMP_FORMAT}): {exc}"
+        ) from exc
     _require(
         bool(THREAD_ID_RE.match(envelope["thread_id"])),
         f"thread_id {envelope['thread_id']!r} is not a safe path segment: "
@@ -448,7 +508,7 @@ def validate_envelope(
     _validate_project(envelope["project"])
 
     for field in ("reply_requested", "human_approval_required"):
-        _require(isinstance(envelope[field], bool), f"{field} must be a boolean")
+        _require_bool(envelope[field], field)
 
     parent = envelope.get("parent_id")
     if parent is not None:

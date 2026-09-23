@@ -83,6 +83,21 @@ the body, so a mismatch would let `resolve_message()` return an envelope
 claiming an identity it is not filed under. Checked before the artifact can
 participate in any reference resolution.
 
+**Complete history is a precondition.** A shallow repository is refused for
+verification, append and push (`git rev-parse --is-shallow-repository`): a
+truncated clone cannot prove append-only semantics, because the commits that
+would show a rewrite may simply be absent. Every required history query fails
+closed — a missing configured branch, a failed `git log`, a failed merge scan
+or malformed output raises `HistoryUnavailable`. **An empty room and an
+unreadable history are different answers**, and only `verified: 0` on a real,
+readable branch means the former.
+
+> **Operational trust anchor.** Code can reject a shallow or unreadable local
+> history, but Git alone cannot prove a remote branch was never force-rewritten
+> before this clone existed. When the live transport branch is created it must
+> carry **branch protection with force-push disabled**. That is an operational
+> control; Issue #2 deliberately implements no remote administration.
+
 **The branch is linear.** Merge commits are refused anywhere in the room
 branch. Concurrency is resolved by rebase, so a merge adds no capability — but
 it does add a hiding place, since a merge commit's own A/M/D changes are not
@@ -93,7 +108,8 @@ complete.
 it Git quotes paths containing spaces or non-ASCII, and a quoted path would
 silently vanish from verification. Any path under `.agent-room/messages/` that
 is not a canonical `<thread_id>/<uuid7>.json` fails verification rather than
-being skipped.
+being skipped — including a tracked file at exactly `.agent-room/messages`,
+the namespace root itself, which has no trailing slash to match on.
 
 **References obey historical causality.** A parent or cross-message
 `evidence_basis` entry must resolve to a message whose add commit is a **strict
@@ -202,6 +218,18 @@ entry is a redundant citation.
 
 ## Safe identifiers
 
+Every field is type-checked before it is used: `schema_version` must be a real
+`int` equal to 1 (`True` is not 1 here), `timestamp` must parse as canonical
+UTC `%Y-%m-%dT%H:%M:%SZ`, `claim.scope` and `claim.revision_condition` must be
+non-empty strings with no `str()` coercion, enum-like fields are type-checked
+before membership so a list or dict cannot escape as a raw `TypeError`, and
+boolean flags are **not** coerced with `bool(...)` — `"false"`, `0`, `[]` and
+`{}` are rejected rather than silently accepted.
+
+**References are the store's own authority.** `GitMessageStore.append()` takes
+no caller-supplied resolver: an exported write API that accepted one would let
+a caller assert that a parent or evidence message exists when it does not.
+
 `thread_id` becomes a Git path segment and is parsed back out of
 `git log --name-status` line by line, so it is restricted to
 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` — ASCII only, first character alphanumeric,
@@ -234,11 +262,23 @@ Paths must be repository-relative — no leading `/`, no `..` segment. The
 all-zero object id is refused: it is syntactically a full oid but names
 nothing.
 
-**Existence is verified only where it can be.** If the pinned object is present
-in this machine's object database it must really be a commit. Evidence usually
-pins a commit in a *different* repository that this host does not have; there
-the full immutable locator is preserved and existence is deliberately **not**
-fabricated.
+### What the store can and cannot establish
+
+This boundary is deliberate, and future validators should hold it:
+
+| Situation | The store does |
+|---|---|
+| Pinned object **is** in this machine's object database | require it to be a commit, **and** require the cited repo-relative path to exist in it |
+| Pinned object is **not** local (foreign repository) | keep the full immutable locator; make **no** claim that it exists; **never** fetch |
+| `external.url` | validate URL **syntax** only — absolute `http`/`https` with a host; **never** make an HTTP request |
+
+The store preserves evidence references; it does not decide scientific truth
+or external availability. A `supported` claim citing an unavailable foreign
+locator remains **the participant's evidence-scoped assertion**, not a
+store-generated attestation that the artifact exists.
+
+The same verification applies to in-message evidence, to cross-message evidence
+returned by the internal resolver, to low-level `append`, and to read/verify.
 
 ## Provenance
 
@@ -328,10 +368,18 @@ delivery failure. If the *commit* itself returns ambiguously, the store looks
 up whether the message actually landed and reports that identity rather than
 letting a caller assume nothing happened.
 
-**The reported commit does not depend on store-wide validity.**
-`current_add_commit()` uses an exact per-path `git log --diff-filter=A` lookup,
-so delivery recovery still names the surviving commit even when unrelated
-corruption makes full verification fail.
+**The reported commit does not depend on store-wide validity, and never
+lies.** `recover_add_commit()` uses an exact per-path `git log --diff-filter=A`
+lookup and returns `(commit, known, error)`:
+
+- commit proven → `commit: "<sha>"`, `commit_known: true`;
+- lookup failed or timed out → `commit: null`, `commit_known: false`, plus a
+  `recovery_error`, while `message_id`, `path` and the local/delivery state are
+  preserved. A known-stale pre-rebase SHA is **never** reported as current.
+
+If the push itself succeeded and only the receipt lookup failed, `pushed`
+stays **true** — a successful delivery is not converted into an apparent
+pre-commit failure.
 
 **The reported `commit` is always current.** A non-fast-forward rebase rewrites
 local commit SHAs, so both the success result and `DeliveryError.commit` report

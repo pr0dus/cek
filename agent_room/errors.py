@@ -85,26 +85,44 @@ class DeliveryError(AgentRoomError):
     the logical message in permanent history.
     """
 
-    def __init__(self, message, *, message_id, commit, path, cause=None):
+    def __init__(self, message, *, message_id, commit, path, cause=None,
+                 commit_known=True, pushed=False, recovery_error=None):
         super().__init__(message)
         self.locally_committed = True
-        self.pushed = False
+        self.pushed = pushed
         self.message_id = message_id
+        #: The surviving add commit, or None when it could not be proven.
+        #: Never a known-stale pre-rebase SHA presented as current.
         self.commit = commit
+        self.commit_known = commit_known
         self.path = path
         self.cause = cause
+        self.recovery_error = recovery_error
 
     def as_result(self) -> dict:
         """The same facts in the shape `append()` returns on success."""
-        return {
+        result = {
             "status": "created",
             "locally_committed": True,
-            "pushed": False,
+            "pushed": self.pushed,
             "message_id": self.message_id,
             "commit": self.commit,
+            "commit_known": self.commit_known,
             "path": self.path,
             "error": str(self.cause or self),
         }
+        if self.recovery_error:
+            result["recovery_error"] = str(self.recovery_error)
+        return result
+
+
+class HistoryUnavailable(AgentRoomError):
+    """Required Git history could not be read, or is known to be incomplete.
+
+    Distinct from "the room is empty". A shallow clone or a failed history
+    query cannot prove append-only semantics, so it must fail closed rather
+    than present itself as a room with zero messages.
+    """
 
 
 class GitTimeout(AgentRoomError):
