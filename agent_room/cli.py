@@ -7,6 +7,7 @@ would keep running belongs to Issues #3/#4, not here.
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import canonical
 from .cursor import ParticipantCursor
@@ -138,6 +139,24 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Codex sandbox policy (default read-only). "
                             "danger-full-access is deliberately not offered.")
 
+    export = sub.add_parser(
+        "supervisor-export",
+        help="emit the canonical supervisor packet for one message addressed "
+             "to openai-research (read-only, deterministic)",
+    )
+    export.add_argument("--message-id", default=None)
+    export.add_argument("--out", default=None, help="write the packet to a file")
+
+    imp = sub.add_parser(
+        "supervisor-import",
+        help="post ONE structured supervisor response, bound to the context "
+             "hash it reviewed (one shot; no daemon, no loop)",
+    )
+    imp.add_argument("--response", required=True,
+                     help="path to the supervisor response JSON, or - for stdin")
+    imp.add_argument("--message-id", default=None)
+    imp.add_argument("--turn-timeout", type=float, default=None)
+
     sub.add_parser(
         "push",
         help="retry delivery of already-committed messages to --remote "
@@ -197,6 +216,26 @@ def main(argv=None) -> int:
             _emit(room.store.thread_ids())
         elif args.command == "push":
             _emit(room.store.push())
+        elif args.command == "supervisor-export":
+            from .supervisor import SupervisorBoundary
+            packet = SupervisorBoundary(room).export(args.message_id)
+            if args.out:
+                from . import canonical as _c
+                Path(args.out).write_text(_c.canonical_text(packet), encoding="utf-8")
+                _emit({"written": args.out,
+                       "context_sha256": packet["context_sha256"],
+                       "target_message_id": packet["target_message_id"]})
+            else:
+                _emit(packet)
+        elif args.command == "supervisor-import":
+            from .supervisor import SupervisorBoundary
+            raw = (sys.stdin.read() if args.response == "-"
+                   else Path(args.response).read_text(encoding="utf-8"))
+            boundary = SupervisorBoundary(
+                room,
+                turn_timeout=args.turn_timeout if args.turn_timeout is not None else None,
+            )
+            _emit(boundary.import_response(raw, message_id=args.message_id))
         elif args.command == "codex-turn":
             from . import tool_profiles
             from .codex_participant import (

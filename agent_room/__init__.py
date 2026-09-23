@@ -34,6 +34,12 @@ from .claude_participant import (
 )
 from .codex_participant import CodexInvoker, CodexParticipant
 from .participant import ParticipantAdapter, ParticipantAdapterError
+from .supervisor import (
+    MalformedSupervisorResponse,
+    StaleSupervisorContext,
+    SupervisorBoundary,
+    SupervisorError,
+)
 from .tool_profiles import (
     KNOWN_PROFILES,
     QUALIFIED_PROFILES,
@@ -53,6 +59,10 @@ __all__ = [
     "CodexInvoker",
     "ParticipantAdapter",
     "ParticipantAdapterError",
+    "SupervisorBoundary",
+    "SupervisorError",
+    "StaleSupervisorContext",
+    "MalformedSupervisorResponse",
     "ToolProfile",
     "ToolProfileError",
     "ToolProfileUnavailable",
