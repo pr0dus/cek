@@ -33,7 +33,9 @@ def test_push_succeeds_when_the_remote_has_not_moved(tmp_path, bare_remote):
     room = AgentRoom(store, "claude-code", None)
 
     result = room.post(thread_id="t1", type="observation", body={"text": "one"})
-    assert result["push"] == {"pushed": True, "attempts": 1}
+    assert result["push"]["pushed"] is True
+    assert result["push"]["pushed_known"] is True
+    assert result["push"]["attempts"] == 1
 
 
 def test_non_fast_forward_race_is_resolved_by_rebase(tmp_path, bare_remote):

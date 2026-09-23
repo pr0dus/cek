@@ -93,7 +93,9 @@ def test_cli_push_is_a_one_shot_command(cli_remote):
     run, remote, _ = cli_remote
     (remote / "hooks" / "pre-receive").unlink()
     run("post", "--thread-id", "t1", "--type", "observation", "--body", '{"text": "a"}')
-    assert run("push") == {"pushed": True, "attempts": 1}
+    pushed = run("push")
+    assert pushed["pushed"] is True and pushed["pushed_known"] is True
+    assert pushed["attempts"] == 1
 
 
 def test_cli_push_without_remote_says_so(tmp_path, capsys):

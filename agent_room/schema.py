@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 import datetime as dt
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from .errors import (
     ClaimStateError,
@@ -190,14 +190,26 @@ def _validate_project(project: dict) -> None:
         )
 
 
+#: Anything Git or a shell would treat specially, or that cannot survive a
+#: subprocess argument, is refused before the value reaches a Git command.
+CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {"\x7f"}
+
+
 def _require_relative_path(value, label: str) -> None:
+    _require_str(value, label)
+    bad = sorted({c for c in value if c in CONTROL_CHARS})
     _require(
-        isinstance(value, str) and value.strip() != "",
-        f"{label} must be a non-empty string, got {type(value).__name__} {value!r}",
+        not bad,
+        f"{label} contains control characters {[hex(ord(c)) for c in bad]}; "
+        "such a path cannot be passed safely to Git",
     )
     _require(
-        not value.startswith("/") and ".." not in value.split("/"),
-        f"{label} {value!r} must be a repository-relative path without '..'",
+        not value.startswith("/"),
+        f"{label} {value!r} must be repository-relative, not absolute",
+    )
+    _require(
+        ".." not in value.split("/"),
+        f"{label} {value!r} must not contain a '..' traversal segment",
     )
 
 
@@ -257,7 +269,7 @@ def _validate_repo_locator(ref: dict, i: int, verifier=None) -> None:
         )
 
 
-def _validate_run_locator(ref: dict, i: int) -> None:
+def _validate_run_locator(ref: dict, i: int, verifier=None) -> None:
     """A run must be findable again: a stable run_id, or an artifact path."""
     run_id, path = ref.get("run_id"), ref.get("path")
     _require(
@@ -273,6 +285,14 @@ def _validate_run_locator(ref: dict, i: int) -> None:
         )
     if path is not None:
         _require_relative_path(path, f"evidence[{i}].path")
+        # Same rule as repo evidence: if we hold the commit, the artifact
+        # must really be in it. A run_id-only locator implies no lookup.
+        if verifier is not None and hasattr(verifier, "commit_path_state"):
+            if verifier.commit_path_state(ref["commit"], path) == "absent":
+                raise SchemaError(
+                    f"evidence[{i}].path {path!r} does not exist in locally "
+                    f"available commit {ref['commit'][:8]}"
+                )
 
 
 def _validate_external_locator(ref: dict, i: int) -> None:
@@ -283,16 +303,30 @@ def _validate_external_locator(ref: dict, i: int) -> None:
     attest to external availability.
     """
     url = _require_str(ref.get("url"), f"evidence[{i}].url")
-    parsed = urlparse(url)
+    bad = sorted({c for c in url if c in CONTROL_CHARS or c.isspace()})
+    _require(
+        not bad,
+        f"evidence[{i}].url contains whitespace or control characters "
+        f"{[hex(ord(c)) for c in bad]}",
+    )
+    try:
+        parsed = urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError as exc:
+        # Malformed IPv6 literals and out-of-range ports raise here.
+        raise SchemaError(f"evidence[{i}].url {url!r} is not parseable: {exc}") from exc
     _require(
         parsed.scheme in ("http", "https"),
         f"evidence[{i}].url {url!r} must be an absolute http:// or https:// URL, "
         f"got scheme {parsed.scheme!r}",
     )
-    _require(
-        bool(parsed.netloc),
-        f"evidence[{i}].url {url!r} has no host",
-    )
+    _require(bool(parsed.netloc), f"evidence[{i}].url {url!r} has no authority")
+    _require(bool(host), f"evidence[{i}].url {url!r} has no host")
+    if port is not None:
+        _require(
+            1 <= port <= 65535,
+            f"evidence[{i}].url {url!r} has an out-of-range port {port}",
+        )
 
 
 def validate_evidence(evidence: Any, verifier=None) -> None:
@@ -325,7 +359,7 @@ def validate_evidence(evidence: Any, verifier=None) -> None:
         if kind == "repo":
             _validate_repo_locator(ref, i, verifier)
         elif kind == "run":
-            _validate_run_locator(ref, i)
+            _validate_run_locator(ref, i, verifier)
         elif kind == "external":
             _validate_external_locator(ref, i)
 

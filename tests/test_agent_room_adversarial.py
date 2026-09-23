@@ -16,6 +16,7 @@ from agent_room import AgentRoom, GitMessageStore, canonical
 from agent_room.cli import EXIT_PARTIAL_DELIVERY, main
 from agent_room.errors import (
     AgentRoomError,
+    PushAmbiguous,
     AppendOnlyViolation,
     ClaimStateError,
     DeliveryError,
@@ -297,8 +298,13 @@ def test_push_timeout_becomes_structured_delivery_error(tmp_path, bare_remote, m
     with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "timed out"})
 
-    assert isinstance(exc.value.cause, GitTimeout)
-    assert exc.value.locally_committed is True and exc.value.pushed is False
+    # The timeout is wrapped as an ambiguous push; here the remote has no
+    # branch at all, so non-delivery is genuinely provable.
+    assert isinstance(exc.value.cause, PushAmbiguous)
+    assert isinstance(exc.value.cause.cause, GitTimeout)
+    assert exc.value.locally_committed is True
+    assert exc.value.locally_committed_known is True
+    assert exc.value.pushed is False and exc.value.pushed_known is True
     assert exc.value.message_id and exc.value.commit
 
     monkeypatch.undo()

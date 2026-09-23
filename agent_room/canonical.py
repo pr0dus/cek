@@ -14,7 +14,8 @@ digest cannot cover its own value.
 
 import hashlib
 import json
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .errors import IntegrityError, SchemaError
 
@@ -57,8 +58,25 @@ def canonical_text(obj: Any) -> str:
     return canonical_bytes(obj).decode("utf-8")
 
 
+def require_mapping(envelope: Any, label: str = "envelope") -> Mapping:
+    """A stored root must be a JSON object.
+
+    `null`, arrays, numbers, booleans and bare strings are valid JSON but not
+    valid envelopes. Without this they reach `.get()` / `.items()` and escape
+    as a raw AttributeError or TypeError, which the CLI does not contract to
+    catch.
+    """
+    if not isinstance(envelope, Mapping):
+        raise SchemaError(
+            f"{label} must be a JSON object, got "
+            f"{type(envelope).__name__} {envelope!r}"
+        )
+    return envelope
+
+
 def digest_payload(envelope: Mapping[str, Any]) -> dict:
     """The envelope minus its own digest field."""
+    require_mapping(envelope)
     return {k: v for k, v in envelope.items() if k != DIGEST_FIELD}
 
 
@@ -80,6 +98,7 @@ def verify(envelope: Mapping[str, Any]) -> None:
     Called on every read. A mismatch means the artifact changed after commit,
     which append-only history forbids.
     """
+    require_mapping(envelope)
     recorded = envelope.get(DIGEST_FIELD)
     if not recorded:
         raise IntegrityError(

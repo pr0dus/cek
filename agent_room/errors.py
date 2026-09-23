@@ -86,10 +86,18 @@ class DeliveryError(AgentRoomError):
     """
 
     def __init__(self, message, *, message_id, commit, path, cause=None,
-                 commit_known=True, pushed=False, recovery_error=None):
+                 commit_known=True, pushed=False, recovery_error=None,
+                 locally_committed=True, locally_committed_known=True,
+                 pushed_known=True):
         super().__init__(message)
-        self.locally_committed = True
+        #: True / False / None. None means reconciliation could not settle it;
+        #: a caller must not repost while persistence is unknown.
+        self.locally_committed = locally_committed
+        self.locally_committed_known = locally_committed_known
+        #: True / False / None. None means the remote may have accepted the
+        #: ref but the acknowledgement was lost.
         self.pushed = pushed
+        self.pushed_known = pushed_known
         self.message_id = message_id
         #: The surviving add commit, or None when it could not be proven.
         #: Never a known-stale pre-rebase SHA presented as current.
@@ -103,8 +111,10 @@ class DeliveryError(AgentRoomError):
         """The same facts in the shape `append()` returns on success."""
         result = {
             "status": "created",
-            "locally_committed": True,
+            "locally_committed": self.locally_committed,
+            "locally_committed_known": self.locally_committed_known,
             "pushed": self.pushed,
+            "pushed_known": self.pushed_known,
             "message_id": self.message_id,
             "commit": self.commit,
             "commit_known": self.commit_known,
@@ -136,6 +146,23 @@ class GitTimeout(AgentRoomError):
         super().__init__(message)
         self.command = command
         self.timeout = timeout
+
+
+class PushAmbiguous(AgentRoomError):
+    """The push produced no usable result, so delivery is unknown.
+
+    Distinct from a rejection: the remote may already hold the ref. The safe
+    recovery is to retry `push()` for the same committed message — never to
+    repost it under a new id.
+    """
+
+    def __init__(self, message, *, pushed=None, pushed_known=False,
+                 cause=None, recovery_error=None):
+        super().__init__(message)
+        self.pushed = pushed
+        self.pushed_known = pushed_known
+        self.cause = cause
+        self.recovery_error = recovery_error
 
 
 class LockTimeout(AgentRoomError):

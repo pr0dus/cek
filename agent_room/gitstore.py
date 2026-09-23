@@ -45,6 +45,7 @@ from .errors import (
     GitTimeout,
     HistoryUnavailable,
     LockTimeout,
+    PushAmbiguous,
     PushRaceError,
     SchemaError,
     UnresolvedReference,
@@ -92,21 +93,49 @@ class GitMessageStore:
         self.author = author
 
     # -- git plumbing ------------------------------------------------------
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    #: Caller environment variables that can redirect object lookup, replace
+    #: history, or move the repository out from under us. Verification must not
+    #: inherit them: the answer has to describe *this* checkout.
+    UNSAFE_GIT_ENV = (
+        "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE", "GIT_DIR", "GIT_WORK_TREE",
+        "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_NAMESPACE",
+    )
+
+    def _clean_env(self) -> dict:
+        env = {k: v for k, v in os.environ.items() if k not in self.UNSAFE_GIT_ENV}
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        return env
+
+    def _git(self, *args: str, check: bool = True,
+             input: str | None = None) -> subprocess.CompletedProcess:
+        # --no-replace-objects: a replace ref must never quietly rewrite what
+        # verification sees. Their *presence* is rejected separately.
+        command = ["git", "--no-replace-objects", *args]
         try:
             proc = subprocess.run(
-                ["git", *args],
+                command,
                 cwd=self.workdir,
                 capture_output=True,
                 text=True,
                 timeout=GIT_TIMEOUT_SECONDS,
+                input=input,
+                env=self._clean_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise GitTimeout(
                 f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s "
                 f"in {self.workdir}",
-                command=("git", *args),
+                command=tuple(command),
                 timeout=GIT_TIMEOUT_SECONDS,
+            ) from exc
+        except (ValueError, OSError) as exc:
+            # Malformed arguments or an OS-level failure must stay inside the
+            # Agent Room contract rather than leaking a raw Python error.
+            raise AgentRoomError(
+                f"git {' '.join(args)} could not be executed in "
+                f"{self.workdir}: {type(exc).__name__}: {exc}"
             ) from exc
         if check and proc.returncode != 0:
             raise AgentRoomError(
@@ -276,6 +305,43 @@ class GitMessageStore:
             )
 
     # -- history (the authority for what was actually committed) -----------
+    def assert_no_history_overrides(self) -> None:
+        """Refuse a checkout whose history can be locally rewritten.
+
+        `refs/replace/*` and the legacy `.git/info/grafts` both make Git show
+        a history that is not the committed one. Verification runs with
+        `--no-replace-objects`, but a checkout carrying such overrides is not
+        a trustworthy place to verify from, so their presence is rejected
+        outright rather than merely bypassed.
+
+        Local-checkout integrity; distinct from the documented pre-clone
+        force-push boundary, which Git cannot settle at all.
+        """
+        replaced = self._git("for-each-ref", "--format=%(refname)", "refs/replace/",
+                             check=False)
+        if replaced.returncode != 0:
+            raise HistoryUnavailable(
+                f"cannot enumerate replacement refs in {self.workdir}: "
+                f"{replaced.stderr.strip()}"
+            )
+        refs = [line for line in replaced.stdout.split() if line]
+        if refs:
+            raise HistoryUnavailable(
+                f"{self.workdir} has history replacement refs ({refs[:3]}); "
+                "refusing to verify a checkout whose history can be locally "
+                "rewritten. Remove them with `git replace -d`."
+            )
+
+        grafts = self._git_dir() / "info" / "grafts"
+        try:
+            if grafts.exists() and grafts.read_text(encoding="utf-8").strip():
+                raise HistoryUnavailable(
+                    f"{grafts} is a non-empty legacy graft file; refusing to "
+                    "verify a checkout whose history can be locally rewritten."
+                )
+        except OSError as exc:
+            raise HistoryUnavailable(f"cannot read {grafts}: {exc}") from exc
+
     def assert_history_available(self) -> None:
         """Fail closed unless complete local history is readable.
 
@@ -284,6 +350,7 @@ class GitMessageStore:
         history" and "the history is clean" are different answers, and only
         one of them is safe to act on.
         """
+        self.assert_no_history_overrides()
         shallow = self._git("rev-parse", "--is-shallow-repository", check=False)
         if shallow.returncode != 0:
             raise HistoryUnavailable(
@@ -479,8 +546,12 @@ class GitMessageStore:
                 f"{path} is missing from its own add commit {commit}"
             )
         envelope = canonical.strict_loads(raw)
+        canonical.require_mapping(envelope, f"stored artifact {path}")
         canonical.verify(envelope)
-        validate_envelope(envelope, agent_facing=False, check_references=False)
+        validate_envelope(
+            envelope, agent_facing=False, check_references=False,
+            resolver=self._artifact_verifier,
+        )
 
         # The path is how history indexes a message; the envelope is what
         # consumers read. If they disagree, resolve_message() would hand back
@@ -510,6 +581,30 @@ class GitMessageStore:
         if path is None:
             return None
         return self._load_raw(path, self._history()[path])
+
+    @property
+    def _artifact_verifier(self):
+        """Artifact verification without any graph traversal.
+
+        Phase-one loading may defer resolving *other messages* to avoid
+        recursion, but it must never defer checking this message's own
+        evidence. Otherwise a `supported` claim could cite an out-of-band
+        evidence message whose repo/run locator is itself invalid, and the
+        citation would be admitted because the referenced message merely
+        carried `kind=repo`.
+        """
+        store = self
+
+        class _Verifier:
+            @staticmethod
+            def commit_object_state(sha: str) -> str:
+                return store.commit_object_state(sha)
+
+            @staticmethod
+            def commit_path_state(sha: str, path: str) -> str:
+                return store.commit_path_state(sha, path)
+
+        return _Verifier()
 
     @property
     def _write_resolver(self):
@@ -575,6 +670,34 @@ class GitMessageStore:
 
         return _AsOfResolver()
 
+    def _batch_check(self, spec: str) -> str | None:
+        """Object type for `spec`, or None when Git says it is missing.
+
+        `cat-file --batch-check` reports a missing object as data ("missing")
+        with a zero exit status, which is the point: a non-zero status then
+        means a real operational failure and can be raised instead of being
+        misread as "this object does not exist". Treating every non-zero code
+        as absence would silently downgrade an unreadable object database to
+        "foreign evidence we cannot check".
+        """
+        if any(c in spec for c in ("\0", "\n")):
+            raise AgentRoomError(f"refusing to query malformed object spec {spec!r}")
+        proc = self._git("cat-file", "--batch-check", check=False, input=f"{spec}\n")
+        if proc.returncode != 0:
+            raise AgentRoomError(
+                f"object lookup for {spec!r} failed in {self.workdir}: "
+                f"{proc.stderr.strip() or 'git exited ' + str(proc.returncode)}"
+            )
+        line = proc.stdout.strip()
+        if not line:
+            raise AgentRoomError(f"empty object lookup result for {spec!r}")
+        parts = line.split()
+        if parts[-1] in ("missing", "ambiguous"):
+            return None
+        if len(parts) < 2:
+            raise AgentRoomError(f"unparseable object lookup result {line!r}")
+        return parts[1]
+
     def commit_object_state(self, sha: str) -> str:
         """Whether a pinned object id is locally present, and if so what it is.
 
@@ -583,9 +706,9 @@ class GitMessageStore:
         that case the full locator is preserved and existence is deliberately
         not fabricated. Only objects we actually hold are checked.
         """
-        if self._git("cat-file", "-e", sha, check=False).returncode != 0:
+        kind = self._batch_check(sha)
+        if kind is None:
             return "absent"
-        kind = self._git("cat-file", "-t", sha, check=False).stdout.strip()
         return "commit" if kind == "commit" else "not-a-commit"
 
     def commit_path_state(self, sha: str, path: str) -> str:
@@ -597,8 +720,7 @@ class GitMessageStore:
         """
         if self.commit_object_state(sha) != "commit":
             return "unknown"
-        found = self._git("cat-file", "-e", f"{sha}:{path}", check=False)
-        return "present" if found.returncode == 0 else "absent"
+        return "absent" if self._batch_check(f"{sha}:{path}") is None else "present"
 
     def _load(self, path: str, commit: str) -> dict:
         """Read one message as committed, with references resolved.
@@ -801,31 +923,47 @@ class GitMessageStore:
                 commit = self._commit(
                     f"agent-room: {envelope['type']} {message_id}", rel
                 )
-            except GitTimeout as exc:
-                # The commit may or may not have landed. Guessing either way is
-                # wrong: reporting failure invites a repost under a fresh UUID,
-                # reporting success may be false. Look and say what is true.
-                landed = self.current_add_commit(rel)
-                if landed is None:
-                    raise
+                commit_known = True
+            except AgentRoomError as exc:
+                # The commit sequence includes `git commit` AND the rev-parse
+                # that reads its result; either can fail after the commit has
+                # actually landed. Guessing is unsafe in both directions:
+                # "failed" invites a repost that duplicates the message,
+                # "succeeded" may be false. Reconcile, then say what is known.
+                landed, landed_known, recovery_error = self.recover_add_commit(rel)
+                if landed_known:
+                    raise DeliveryError(
+                        f"message {message_id} was committed at {landed} but the "
+                        f"commit sequence did not return cleanly: {exc}. "
+                        "The message is durable; retry delivery with push(), "
+                        "do not repost.",
+                        message_id=message_id, path=rel,
+                        commit=landed, commit_known=True,
+                        locally_committed=True, locally_committed_known=True,
+                        pushed=False, pushed_known=True,
+                        cause=exc, recovery_error=recovery_error,
+                    ) from exc
                 raise DeliveryError(
-                    f"message {message_id} was committed at {landed} but the "
-                    f"commit command did not return cleanly: {exc}. "
-                    "Retry delivery with push(); do not repost.",
-                    message_id=message_id,
-                    commit=landed,
-                    path=rel,
-                    cause=exc,
+                    f"message {message_id} may or may not have been committed: "
+                    f"{exc}; reconciliation also failed. Do NOT repost - inspect "
+                    f"{rel} on {self.branch} first.",
+                    message_id=message_id, path=rel,
+                    commit=None, commit_known=False,
+                    locally_committed=None, locally_committed_known=False,
+                    pushed=False, pushed_known=True,
+                    cause=exc, recovery_error=recovery_error,
                 ) from exc
 
             result = {
                 "status": "created",
                 "locally_committed": True,
+                "locally_committed_known": True,
                 "pushed": False,
+                "pushed_known": True,
                 "message_id": message_id,
                 "thread_id": thread_id,
                 "commit": commit,
-                "commit_known": True,
+                "commit_known": commit_known,
                 "path": rel,
             }
             if self.remote:
@@ -839,23 +977,34 @@ class GitMessageStore:
                     # A rebase during the push may have rewritten our commit,
                     # so re-derive it - and say so honestly if we cannot.
                     current, known, recovery_error = self.recover_add_commit(rel)
+                    ambiguous = isinstance(exc, PushAmbiguous)
+                    delivered = exc.pushed if ambiguous else False
+                    delivered_known = exc.pushed_known if ambiguous else True
+                    verdict = (
+                        "delivery is UNKNOWN - the remote may already hold it"
+                        if not delivered_known else
+                        f"was not delivered to {self.remote}"
+                    )
                     raise DeliveryError(
                         f"message {message_id} is committed locally at "
-                        f"{current if known else '<commit unknown>'} but was not "
-                        f"delivered to {self.remote}: {exc}. "
-                        "Retry delivery with push(); do not repost.",
+                        f"{current if known else '<commit unknown>'} but {verdict}"
+                        f": {exc}. Retry delivery with push() for this same "
+                        "message; do not repost.",
                         message_id=message_id,
                         commit=current,
                         commit_known=known,
                         path=rel,
                         cause=exc,
-                        recovery_error=recovery_error,
+                        recovery_error=recovery_error or getattr(exc, "recovery_error", None),
+                        pushed=delivered,
+                        pushed_known=delivered_known,
                     ) from exc
 
                 # Push succeeded. A failed receipt lookup afterwards must not
                 # be reported as a delivery failure - the message did land.
                 result["push"] = push_result
-                result["pushed"] = bool(push_result.get("pushed"))
+                result["pushed"] = push_result.get("pushed")
+                result["pushed_known"] = push_result.get("pushed_known", True)
                 current, known, recovery_error = self.recover_add_commit(rel)
                 result["commit"] = current
                 result["commit_known"] = known
@@ -877,6 +1026,30 @@ class GitMessageStore:
         with self.writer_lock():
             return self._push_locked()
 
+    def _reconcile_push(self, tip: str) -> tuple:
+        """Bounded check of whether the remote already has our tip.
+
+        One `ls-remote`, no fetch. Returns `(pushed, known, error)`. We can
+        prove delivery when the remote ref equals what we pushed, and prove
+        non-delivery when the branch is absent entirely; anything else stays
+        honestly unknown rather than being guessed either way.
+        """
+        try:
+            proc = self._git("ls-remote", self.remote, self.branch, check=False)
+        except AgentRoomError as exc:
+            return None, False, exc
+        if proc.returncode != 0:
+            return None, False, AgentRoomError(
+                f"ls-remote {self.remote} failed: {proc.stderr.strip()}"
+            )
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            return False, True, None
+        remote_sha = lines[0].split()[0]
+        if remote_sha == tip:
+            return True, True, None
+        return None, False, None
+
     def _push_locked(self) -> dict:
         """Push body, assuming the writer lock is already held."""
         self.assert_room_branch()
@@ -887,9 +1060,25 @@ class GitMessageStore:
         self.verify_store()
         last_error = ""
         for attempt in range(1, self.push_retries + 1):
-            proc = self._git("push", self.remote, f"{self.branch}:{self.branch}", check=False)
+            tip = self._git("rev-parse", self.branch, check=False).stdout.strip()
+            try:
+                proc = self._git(
+                    "push", self.remote, f"{self.branch}:{self.branch}", check=False)
+            except AgentRoomError as exc:
+                # The remote may have accepted the ref before the connection
+                # or the result was lost. Reporting "not pushed" here would be
+                # a guess, and the damaging kind: it invites a repost.
+                pushed, known, recon_error = self._reconcile_push(tip)
+                if pushed is True:
+                    return {"pushed": True, "pushed_known": True,
+                            "attempts": attempt, "reconciled": True}
+                raise PushAmbiguous(
+                    f"push to {self.remote} did not return a result: {exc}",
+                    pushed=pushed, pushed_known=known,
+                    cause=exc, recovery_error=recon_error,
+                ) from exc
             if proc.returncode == 0:
-                return {"pushed": True, "attempts": attempt}
+                return {"pushed": True, "pushed_known": True, "attempts": attempt}
             last_error = proc.stderr.strip()
 
             # Only a *fetchable* remote branch can have moved under us. If the

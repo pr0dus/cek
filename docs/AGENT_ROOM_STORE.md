@@ -83,6 +83,15 @@ the body, so a mismatch would let `resolve_message()` return an envelope
 claiming an identity it is not filed under. Checked before the artifact can
 participate in any reference resolution.
 
+**Local history overrides are refused.** A checkout carrying `refs/replace/*`
+or a non-empty legacy `.git/info/grafts` shows a history that is not the
+committed one, so verification refuses to run from it at all. Every Git call
+additionally uses `--no-replace-objects` and a **sanitised environment** —
+`GIT_DIR`, `GIT_REPLACE_REF_BASE`, `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG*` and
+friends are stripped — so a caller's environment cannot change what
+verification sees. This is local-checkout integrity, distinct from the remote
+force-push boundary below, which Git cannot settle at all.
+
 **Complete history is a precondition.** A shallow repository is refused for
 verification, append and push (`git rev-parse --is-shallow-repository`): a
 truncated clone cannot prove append-only semantics, because the commits that
@@ -120,6 +129,13 @@ sibling and forward references are all refused — a message may only rely on st
 that existed when it was committed, otherwise a claim could become
 retrospectively supported by evidence added later. In-message evidence ids are
 unaffected: they live inside the same envelope.
+
+**Phase one defers graph traversal, never artifact validation.** A raw load
+still validates every evidence locator and every locally-decidable artifact
+fact; only resolution of *other messages* is deferred to bound recursion. A
+`supported` claim therefore cannot become admissible by citing an out-of-band
+evidence message whose own locator is invalid — the cited message must pass
+its own intrinsic validation first.
 
 **Reads are two-phase**, which is what bounds reference validation: phase one
 loads a message and validates it structurally with no resolution; phase two
@@ -218,6 +234,15 @@ entry is a redundant citation.
 
 ## Safe identifiers
 
+**Defaults apply only to `None`.** `build_envelope` never uses `x or default`,
+so `recipient=[]` cannot silently become a broadcast, `message_id=""` cannot be
+replaced by a fresh UUID, and a malformed `sender` cannot become a valid empty
+metadata object. Anything explicitly passed is preserved so validation can
+refuse it.
+
+**Stored roots must be JSON objects.** `null`, arrays, booleans, numbers and
+bare strings fail as `SchemaError` before any `.get()` is attempted.
+
 Every field is type-checked before it is used: `schema_version` must be a real
 `int` equal to 1 (`True` is not 1 here), `timestamp` must parse as canonical
 UTC `%Y-%m-%dT%H:%M:%SZ`, `claim.scope` and `claim.revision_condition` must be
@@ -268,9 +293,22 @@ This boundary is deliberate, and future validators should hold it:
 
 | Situation | The store does |
 |---|---|
-| Pinned object **is** in this machine's object database | require it to be a commit, **and** require the cited repo-relative path to exist in it |
+| Pinned object **is** in this machine's object database | require it to be a commit, **and** require the cited repo-relative path to exist in it (`repo` and `run` alike) |
+| Object lookup itself **fails** (unreadable object DB, permissions, transport) | raise an Agent Room error — **never** downgrade to "foreign evidence" |
 | Pinned object is **not** local (foreign repository) | keep the full immutable locator; make **no** claim that it exists; **never** fetch |
 | `external.url` | validate URL **syntax** only — absolute `http`/`https` with a host; **never** make an HTTP request |
+
+Absence is distinguished from failure by `git cat-file --batch-check`, which
+reports a missing object as *data* with a zero exit status — so a non-zero
+status means a real operational failure and is raised instead of being misread
+as "this object does not exist".
+
+`run_id`-only locators imply no filesystem lookup. Artifact paths are rejected
+for NUL/control characters, absolute form and `..` traversal **before** they
+reach a Git argument, and external URLs must be absolute `http`/`https` with a
+valid authority, host and port — whitespace, control characters, malformed IPv6
+and out-of-range ports are refused, with parser `ValueError` converted to
+`SchemaError`.
 
 The store preserves evidence references; it does not decide scientific truth
 or external availability. A `supported` claim citing an unavailable foreign
@@ -380,6 +418,27 @@ lookup and returns `(commit, known, error)`:
 If the push itself succeeded and only the receipt lookup failed, `pushed`
 stays **true** — a successful delivery is not converted into an apparent
 pre-commit failure.
+
+### Truth, falsehood and "unknown"
+
+Every outcome field is paired with an explicit knowledge flag, because the
+damaging failure mode is not an error — it is a confident wrong answer that
+invites a repost and duplicates a message permanently.
+
+| Field | `true` | `false` | `null` + `*_known: false` |
+|---|---|---|---|
+| `locally_committed` | commit proven in history | never reached staging | commit sequence failed **and** reconciliation failed |
+| `pushed` | push returned success, or remote ref proven to match | remote **responded** with a rejection | result lost (timeout/transport) and reconciliation could not prove inclusion |
+| `commit` | add commit proven | — | lookup failed or timed out |
+
+A lost push acknowledgement is **not** `pushed: false`: the remote may already
+hold the ref. One bounded `ls-remote` reconciliation is attempted — no fetch —
+and delivery is reported `true` only if the remote ref matches what was pushed,
+`false` only if the branch is absent entirely, and `null` otherwise.
+
+**The safe recovery is always `push()` for the same committed message**, never
+a repost. While `locally_committed_known` is `false` the error says so
+explicitly and tells the operator to inspect the path rather than repost.
 
 **The reported `commit` is always current.** A non-fast-forward rebase rewrites
 local commit SHAs, so both the success result and `DeliveryError.commit` report

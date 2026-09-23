@@ -12,7 +12,12 @@ from typing import Any, Iterable
 
 from . import canonical
 from .cursor import ParticipantCursor
-from .errors import AgentRoomError, ForbiddenOperation, UnresolvedReference
+from .errors import (
+    AgentRoomError,
+    ForbiddenOperation,
+    SchemaError,
+    UnresolvedReference,
+)
 from .gitstore import GitMessageStore
 from .ids import uuid7
 from .schema import SCHEMA_VERSION, validate_envelope
@@ -54,12 +59,22 @@ class AgentRoom:
         message_id: str | None = None,
         timestamp: str | None = None,
     ) -> dict:
-        # Provenance is not caller-supplied. Git authorship is deliberately
-        # not authority (design §7), which makes `sender` the only usable
-        # provenance for filtering and audit - so a room opened as one
-        # participant must not be able to sign as another. Model/operator
-        # metadata stays configurable; the identity itself does not.
-        sender_meta = dict(sender or {})
+        # Defaults apply to "not provided" only. `x or default` would erase
+        # malformed input - `recipient=[]` would silently become a broadcast,
+        # and `message_id=""` would be replaced by a fresh UUID instead of
+        # being rejected. Anything explicitly passed is preserved so schema
+        # validation can refuse it.
+        if sender is None:
+            sender_meta: Any = {}
+        elif isinstance(sender, dict):
+            sender_meta = dict(sender)
+        else:
+            # NB: `type` is a parameter of this method, so the builtin is
+            # shadowed here - use __class__ rather than type().
+            raise SchemaError(
+                f"sender must be an object, got "
+                f"{sender.__class__.__name__} {sender!r}"
+            )
         claimed = sender_meta.pop("agent", None)
         if claimed is not None and claimed != self.participant:
             raise ForbiddenOperation(
@@ -70,15 +85,15 @@ class AgentRoom:
 
         envelope: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
-            "message_id": message_id or uuid7(),
-            "timestamp": timestamp or _now_iso(),
+            "message_id": uuid7() if message_id is None else message_id,
+            "timestamp": _now_iso() if timestamp is None else timestamp,
             "sender": sender_meta,
-            "recipient": recipient or {"broadcast": True},
-            "project": project or {},
+            "recipient": {"broadcast": True} if recipient is None else recipient,
+            "project": {} if project is None else project,
             "thread_id": thread_id,
             "type": type,
             "body": body,
-            "evidence": evidence or [],
+            "evidence": [] if evidence is None else evidence,
             "status": status,
             # Deliberately NOT bool(...): coercing here would silently accept
             # "false", 0, [] and friends. Preserve what the caller passed and
