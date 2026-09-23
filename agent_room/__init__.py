@@ -32,6 +32,8 @@ from .claude_participant import (
     NoWorkAvailable,
     TurnLockTimeout,
 )
+from .codex_participant import CodexInvoker, CodexParticipant
+from .participant import ParticipantAdapter, ParticipantAdapterError
 from .room import AgentRoom
 from .gitstore import GitMessageStore
 from .cursor import ParticipantCursor
@@ -39,6 +41,10 @@ from .cursor import ParticipantCursor
 __all__ = [
     "AgentRoom",
     "ClaudeParticipant",
+    "CodexParticipant",
+    "CodexInvoker",
+    "ParticipantAdapter",
+    "ParticipantAdapterError",
     "ClaudeInvoker",
     "ClaudeAdapterError",
     "MalformedResponse",

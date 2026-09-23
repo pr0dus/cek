@@ -2,6 +2,13 @@
 
 Issue #3. One bounded turn against the durable store from Issue #2.
 
+The turn protocol described here — single-flight, idempotent reconciliation,
+three-valued persistence, authority boundary — lives in
+`agent_room/participant.py` and is **shared with every participant**, so a new
+one inherits these properties rather than re-deriving them. See
+`AGENT_ROOM_CODEX.md` for the Codex adapter, whose invocation boundary differs
+substantially.
+
 **No daemon, no poller, no loop.** The adapter selects one message, asks Claude
 once, posts the reply, acknowledges, and exits. Autonomous Claude↔OpenAI
 exchange is Issue #5's problem, not this one.

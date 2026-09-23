@@ -115,6 +115,23 @@ def build_parser() -> argparse.ArgumentParser:
     turn.add_argument("--turn-timeout", type=float, default=None,
                       help="bounded wait for another in-flight turn (seconds)")
 
+    codex = sub.add_parser(
+        "codex-turn",
+        help="run ONE bounded Codex turn against an unread message "
+             "(one shot; no daemon, no loop)",
+    )
+    codex.add_argument("--message-id", default=None)
+    codex.add_argument("--dry-run", action="store_true")
+    codex.add_argument("--codex-bin", default=None)
+    codex.add_argument("--model", default=None)
+    codex.add_argument("--project-dir", default=None)
+    codex.add_argument("--timeout", type=int, default=None)
+    codex.add_argument("--turn-timeout", type=float, default=None)
+    codex.add_argument("--sandbox", default=None,
+                       choices=["read-only", "workspace-write"],
+                       help="Codex sandbox policy (default read-only). "
+                            "danger-full-access is deliberately not offered.")
+
     sub.add_parser(
         "push",
         help="retry delivery of already-committed messages to --remote "
@@ -174,6 +191,25 @@ def main(argv=None) -> int:
             _emit(room.store.thread_ids())
         elif args.command == "push":
             _emit(room.store.push())
+        elif args.command == "codex-turn":
+            from .codex_participant import (
+                DEFAULT_CODEX_BIN, DEFAULT_SANDBOX, DEFAULT_TIMEOUT_SECONDS,
+                DEFAULT_TURN_LOCK_TIMEOUT_SECONDS as CODEX_TURN_TIMEOUT,
+                CodexInvoker, CodexParticipant,
+            )
+            invoker = CodexInvoker(
+                args.codex_bin or DEFAULT_CODEX_BIN,
+                cwd=args.project_dir,
+                model=args.model,
+                timeout=args.timeout or DEFAULT_TIMEOUT_SECONDS,
+                sandbox=args.sandbox or DEFAULT_SANDBOX,
+            )
+            participant = CodexParticipant(
+                room, invoker,
+                turn_timeout=args.turn_timeout
+                if args.turn_timeout is not None else CODEX_TURN_TIMEOUT,
+            )
+            _emit(participant.run_turn(args.message_id, dry_run=args.dry_run))
         elif args.command == "claude-turn":
             from .claude_participant import (
                 DEFAULT_CLAUDE_BIN, DEFAULT_TIMEOUT_SECONDS,
