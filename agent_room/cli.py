@@ -98,6 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--thread-id", default=None)
 
     sub.add_parser("threads", help="list thread ids in commit order")
+    turn = sub.add_parser(
+        "claude-turn",
+        help="run ONE bounded Claude Code turn against an unread message "
+             "(one shot; no daemon, no loop)",
+    )
+    turn.add_argument("--message-id", default=None,
+                      help="target message; default is the oldest unread")
+    turn.add_argument("--dry-run", action="store_true",
+                      help="select and build the prompt without invoking Claude")
+    turn.add_argument("--claude-bin", default=None, help="claude executable")
+    turn.add_argument("--model", default=None)
+    turn.add_argument("--project-dir", default=None,
+                      help="working directory for the Claude turn")
+    turn.add_argument("--timeout", type=int, default=None)
+
     sub.add_parser(
         "push",
         help="retry delivery of already-committed messages to --remote "
@@ -157,6 +172,21 @@ def main(argv=None) -> int:
             _emit(room.store.thread_ids())
         elif args.command == "push":
             _emit(room.store.push())
+        elif args.command == "claude-turn":
+            from .claude_participant import (
+                DEFAULT_CLAUDE_BIN, DEFAULT_TIMEOUT_SECONDS,
+                ClaudeInvoker, ClaudeParticipant,
+            )
+            # `restricted` is not exposed: the adapter must not offer a way to
+            # silently widen the installed client's permission system.
+            invoker = ClaudeInvoker(
+                args.claude_bin or DEFAULT_CLAUDE_BIN,
+                cwd=args.project_dir,
+                model=args.model,
+                timeout=args.timeout or DEFAULT_TIMEOUT_SECONDS,
+            )
+            participant = ClaudeParticipant(room, invoker)
+            _emit(participant.run_turn(args.message_id, dry_run=args.dry_run))
         elif args.command == "verify":
             _emit({"verified": room.store.verify_store()})
         elif args.command == "query":

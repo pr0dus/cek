@@ -24,12 +24,24 @@ from .errors import (
     UnresolvedReference,
     WrongBranchError,
 )
+from .claude_participant import (
+    ClaudeAdapterError,
+    ClaudeInvoker,
+    ClaudeParticipant,
+    MalformedResponse,
+    NoWorkAvailable,
+)
 from .room import AgentRoom
 from .gitstore import GitMessageStore
 from .cursor import ParticipantCursor
 
 __all__ = [
     "AgentRoom",
+    "ClaudeParticipant",
+    "ClaudeInvoker",
+    "ClaudeAdapterError",
+    "MalformedResponse",
+    "NoWorkAvailable",
     "GitMessageStore",
     "ParticipantCursor",
     "AgentRoomError",
