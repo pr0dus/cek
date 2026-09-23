@@ -83,9 +83,24 @@ the body, so a mismatch would let `resolve_message()` return an envelope
 claiming an identity it is not filed under. Checked before the artifact can
 participate in any reference resolution.
 
+**Every branch reference is fully qualified.** `refs/heads/<branch>` is the
+only revision authority — a short name can be shadowed by a same-name tag, so
+it is never used to resolve a tip, scan history, fetch, rebase, push or
+reconcile a remote. Remote reconciliation queries exactly that ref, so a remote
+tag can never stand in as proof of branch delivery.
+
+**Reachable object integrity is verified, not assumed.** A loose object file
+can be replaced with different, validly compressed content under its old name;
+Git will hand that content back and the envelope can simply be resealed around
+it. Two gates close that: `git fsck --strict --no-dangling --no-reflogs` runs
+on **every** full verification (never cached — corruption does not move the ref
+tip), and every blob read recomputes the object id from the bytes and refuses
+any mismatch.
+
 **Local history overrides are refused.** A checkout carrying `refs/replace/*`
-or a non-empty legacy `.git/info/grafts` shows a history that is not the
-committed one, so verification refuses to run from it at all. Every Git call
+or a non-empty legacy `info/grafts` — checked in the **common** Git directory
+as well as the worktree one, because a linked worktree keeps grafts in the
+common dir — shows a history that is not the committed one, so verification refuses to run from it at all. Every Git call
 additionally uses `--no-replace-objects` and a **sanitised environment** —
 `GIT_DIR`, `GIT_REPLACE_REF_BASE`, `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG*` and
 friends are stripped — so a caller's environment cannot change what
@@ -234,11 +249,27 @@ entry is a redundant citation.
 
 ## Safe identifiers
 
+**CLI defaults also apply only to `None`.** An explicit `--body ''` or
+`--recipient ''` is input — and invalid input — never silently replaced by a
+default.
+
 **Defaults apply only to `None`.** `build_envelope` never uses `x or default`,
 so `recipient=[]` cannot silently become a broadcast, `message_id=""` cannot be
 replaced by a fresh UUID, and a malformed `sender` cannot become a valid empty
 metadata object. Anything explicitly passed is preserved so validation can
 refuse it.
+
+**No parser or serialiser exception escapes.** `strict_loads` converts
+malformed JSON to `SchemaError` and rejects `NaN`/`Infinity`;
+`canonical_bytes` wraps unsupported types, non-finite floats, recursion and
+lone surrogates that cannot be UTF-8 encoded; `seal()` checks the root is a
+mapping before copying it. `JSONDecodeError`, `TypeError`, `ValueError` and
+`UnicodeEncodeError` never reach the caller or the CLI.
+
+**External URL syntax is strict** (still syntax only, never a request):
+backslashes, invalid percent escapes, any userinfo/credentials, malformed IP
+literals, invalid IDNA/DNS labels, out-of-range ports and non-`http(s)` schemes
+are all refused.
 
 **Stored roots must be JSON objects.** `null`, arrays, booleans, numbers and
 bare strings fail as `SchemaError` before any `.get()` is attempted.
@@ -301,7 +332,10 @@ This boundary is deliberate, and future validators should hold it:
 Absence is distinguished from failure by `git cat-file --batch-check`, which
 reports a missing object as *data* with a zero exit status — so a non-zero
 status means a real operational failure and is raised instead of being misread
-as "this object does not exist".
+as "this object does not exist". **Stderr is also consulted**: Git can exit 0
+and print `<sha> missing` while reporting an inflate/unpack/permission error
+for a locally corrupt object, and that is an operational failure, not a clean
+absence.
 
 `run_id`-only locators imply no filesystem lookup. Artifact paths are rejected
 for NUL/control characters, absolute form and `..` traversal **before** they
@@ -427,9 +461,21 @@ invites a repost and duplicates a message permanently.
 
 | Field | `true` | `false` | `null` + `*_known: false` |
 |---|---|---|---|
-| `locally_committed` | commit proven in history | never reached staging | commit sequence failed **and** reconciliation failed |
+| `locally_committed` | commit proven in history | **proven** absent — the add-commit query succeeded and found nothing | commit sequence failed **and** reconciliation failed |
 | `pushed` | push returned success, or remote ref proven to match | remote **responded** with a rejection | result lost (timeout/transport) and reconciliation could not prove inclusion |
 | `commit` | add commit proven | — | lookup failed or timed out |
+
+`status` agrees with local persistence: `created`, `not_created` or `unknown`.
+When absence is **proven**, the staged-but-uncommitted artifact is discarded so
+a retry is not blocked by a dirty checkout — never when persistence is unknown,
+where deleting a file that may already be committed content would be precisely
+the wrong move.
+
+A nonzero push result is reconciled before being called a rejection: the remote
+can accept a ref while the client still sees a failure. Reconciliation queries
+the exact ref, and if the remote head has moved it bounded-fetches that ref and
+tests whether the attempted tip is an ancestor — so delivery stays provable
+even when another writer has built on top.
 
 A lost push acknowledgement is **not** `pushed: false`: the remote may already
 hold the ref. One bounded `ls-remote` reconciliation is attempted — no fetch —

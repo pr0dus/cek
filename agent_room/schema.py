@@ -15,6 +15,7 @@ claim by itself — only a later message asserting the change can.
 from typing import Any, Mapping
 
 import datetime as dt
+import ipaddress
 import re
 from urllib.parse import urlsplit
 
@@ -295,6 +296,37 @@ def _validate_run_locator(ref: dict, i: int, verifier=None) -> None:
                 )
 
 
+def _validate_url_host(host: str, url: str, i: int) -> None:
+    """Host must be a valid IP literal or a valid DNS/IDNA hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    if host.startswith("[") or ":" in host:
+        raise SchemaError(
+            f"evidence[{i}].url {url!r} has a malformed IP literal host {host!r}"
+        )
+    try:
+        encoded = host.encode("idna").decode("ascii")
+    except (UnicodeError, UnicodeDecodeError) as exc:
+        raise SchemaError(
+            f"evidence[{i}].url {url!r} has a host that is not valid IDNA: {exc}"
+        ) from exc
+    labels = encoded.rstrip(".").split(".")
+    _require(
+        all(labels) and len(encoded) <= 253,
+        f"evidence[{i}].url {url!r} has a malformed host {host!r}",
+    )
+    for label in labels:
+        _require(
+            1 <= len(label) <= 63
+            and all(c.isalnum() or c == "-" for c in label)
+            and not label.startswith("-") and not label.endswith("-"),
+            f"evidence[{i}].url {url!r} has an invalid host label {label!r}",
+        )
+
+
 def _validate_external_locator(ref: dict, i: int) -> None:
     """External evidence must be a syntactically usable absolute URL.
 
@@ -309,6 +341,20 @@ def _validate_external_locator(ref: dict, i: int) -> None:
         f"evidence[{i}].url contains whitespace or control characters "
         f"{[hex(ord(c)) for c in bad]}",
     )
+    # A backslash is not a path separator in a URL, but several parsers treat
+    # it as one - an ambiguity that has no place in a stored locator.
+    _require(
+        "\\" not in url,
+        f"evidence[{i}].url {url!r} must not contain a backslash",
+    )
+    for pos, char in enumerate(url):
+        if char == "%":
+            escape = url[pos + 1:pos + 3]
+            _require(
+                len(escape) == 2 and all(c in "0123456789abcdefABCDEF" for c in escape),
+                f"evidence[{i}].url {url!r} has an invalid percent escape "
+                f"at position {pos}",
+            )
     try:
         parsed = urlsplit(url)
         host, port = parsed.hostname, parsed.port
@@ -322,11 +368,22 @@ def _validate_external_locator(ref: dict, i: int) -> None:
     )
     _require(bool(parsed.netloc), f"evidence[{i}].url {url!r} has no authority")
     _require(bool(host), f"evidence[{i}].url {url!r} has no host")
+    # Credentials never belong in a stored evidence locator, and their
+    # presence is also what makes `user@@host` ambiguous to parse.
+    _require(
+        "@" not in parsed.netloc,
+        f"evidence[{i}].url {url!r} must not carry userinfo/credentials",
+    )
+    _require(
+        parsed.username is None and parsed.password is None,
+        f"evidence[{i}].url {url!r} must not carry userinfo/credentials",
+    )
     if port is not None:
         _require(
             1 <= port <= 65535,
             f"evidence[{i}].url {url!r} has an out-of-range port {port}",
         )
+    _validate_url_host(host, url, i)
 
 
 def validate_evidence(evidence: Any, verifier=None) -> None:

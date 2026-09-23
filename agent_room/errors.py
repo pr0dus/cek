@@ -88,7 +88,7 @@ class DeliveryError(AgentRoomError):
     def __init__(self, message, *, message_id, commit, path, cause=None,
                  commit_known=True, pushed=False, recovery_error=None,
                  locally_committed=True, locally_committed_known=True,
-                 pushed_known=True):
+                 pushed_known=True, status="created"):
         super().__init__(message)
         #: True / False / None. None means reconciliation could not settle it;
         #: a caller must not repost while persistence is unknown.
@@ -106,11 +106,13 @@ class DeliveryError(AgentRoomError):
         self.path = path
         self.cause = cause
         self.recovery_error = recovery_error
+        #: "created" | "not_created" | "unknown" - agrees with the local state.
+        self.status = status
 
     def as_result(self) -> dict:
         """The same facts in the shape `append()` returns on success."""
         result = {
-            "status": "created",
+            "status": self.status,
             "locally_committed": self.locally_committed,
             "locally_committed_known": self.locally_committed_known,
             "pushed": self.pushed,

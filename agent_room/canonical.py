@@ -38,20 +38,56 @@ def _reject_duplicate_keys(pairs):
     return dict(pairs)
 
 
+def _reject_constant(name: str):
+    """NaN/Infinity are JavaScript extensions, not JSON, and never round-trip."""
+    raise SchemaError(f"stored JSON contains the non-standard constant {name}")
+
+
 def strict_loads(text: str):
-    """Parse JSON, rejecting duplicate object keys."""
-    return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    """Parse JSON, rejecting duplicate keys and non-standard constants.
+
+    Malformed stored JSON must surface as a SchemaError: a raw
+    JSONDecodeError would escape the Agent Room contract the CLI relies on.
+    """
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except json.JSONDecodeError as exc:
+        raise SchemaError(f"stored artifact is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise SchemaError("stored artifact nests too deeply to parse") from exc
 
 
 def canonical_bytes(obj: Any) -> bytes:
-    """Serialise `obj` to the pinned canonical form."""
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=SEPARATORS,
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    """Serialise `obj` to the pinned canonical form.
+
+    Every serialisation failure is converted: an unsupported type, a
+    non-finite float, a lone surrogate that cannot be UTF-8 encoded, or a
+    cycle must all fail as SchemaError rather than leaking TypeError /
+    ValueError / UnicodeEncodeError to the caller.
+    """
+    try:
+        text = json.dumps(
+            obj,
+            sort_keys=True,
+            separators=SEPARATORS,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(f"value is not canonically serialisable: {exc}") from exc
+    except RecursionError as exc:
+        raise SchemaError("value nests too deeply to serialise") from exc
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SchemaError(
+            f"value contains text that is not encodable as UTF-8 "
+            f"(lone surrogate?): {exc}"
+        ) from exc
 
 
 def canonical_text(obj: Any) -> str:
@@ -87,6 +123,7 @@ def envelope_digest(envelope: Mapping[str, Any]) -> str:
 
 def seal(envelope: Mapping[str, Any]) -> dict:
     """Return a copy of `envelope` carrying its computed digest."""
+    require_mapping(envelope)
     sealed = dict(envelope)
     sealed[DIGEST_FIELD] = envelope_digest(envelope)
     return sealed

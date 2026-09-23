@@ -27,6 +27,7 @@ be physically unable to commit onto `main` or repurpose someone's checkout.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -83,6 +84,10 @@ class GitMessageStore:
     ) -> None:
         self.workdir = Path(workdir)
         self.branch = branch
+        #: The only revision authority. A short name can be shadowed by a tag
+        #: of the same name, so `agent-room` must never be used to resolve a
+        #: tip, scan history, fetch, push or reconcile a remote.
+        self.ref = f"refs/heads/{branch}"
         self.remote = remote
         self.push_retries = int(push_retries)
         if self.push_retries < 1:
@@ -93,6 +98,35 @@ class GitMessageStore:
         self.author = author
 
     # -- git plumbing ------------------------------------------------------
+    def _git_bytes(self, *args: str) -> bytes:
+        """Run git and return stdout as exact bytes.
+
+        Hashing must see the object's real bytes; a text-mode round trip could
+        normalise them and make a forged object hash correctly.
+        """
+        command = ["git", "--no-replace-objects", *args]
+        try:
+            proc = subprocess.run(
+                command, cwd=self.workdir, capture_output=True,
+                timeout=GIT_TIMEOUT_SECONDS, env=self._clean_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitTimeout(
+                f"git {' '.join(args)} timed out", command=tuple(command),
+                timeout=GIT_TIMEOUT_SECONDS,
+            ) from exc
+        except (ValueError, OSError) as exc:
+            raise AgentRoomError(
+                f"git {' '.join(args)} could not be executed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            raise AgentRoomError(
+                f"git {' '.join(args)} failed ({proc.returncode}): "
+                f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+            )
+        return proc.stdout
+
     #: Caller environment variables that can redirect object lookup, replace
     #: history, or move the repository out from under us. Verification must not
     #: inherit them: the answer has to describe *this* checkout.
@@ -233,6 +267,26 @@ class GitMessageStore:
             raise AgentRoomError(f"{self.workdir} is not a git repository")
         return Path(out.stdout.strip())
 
+    def _git_common_dir(self) -> Path:
+        """The repository-wide Git directory.
+
+        In a linked worktree the worktree-specific git dir is *not* where
+        legacy grafts live - they live in the common dir, so checking only the
+        worktree dir would miss a graft installed there.
+        """
+        out = self._git("rev-parse", "--path-format=absolute",
+                        "--git-common-dir", check=False)
+        if out.returncode != 0 or not out.stdout.strip():
+            # Older Git without --path-format: fall back to the worktree dir
+            # rather than silently skipping the check.
+            legacy = self._git("rev-parse", "--git-common-dir", check=False)
+            if legacy.returncode != 0 or not legacy.stdout.strip():
+                raise HistoryUnavailable(
+                    f"cannot resolve the common Git directory for {self.workdir}"
+                )
+            return (self.workdir / legacy.stdout.strip()).resolve()
+        return Path(out.stdout.strip())
+
     @contextmanager
     def writer_lock(self):
         """Exclusive lock over mutation of this one checkout.
@@ -332,15 +386,19 @@ class GitMessageStore:
                 "rewritten. Remove them with `git replace -d`."
             )
 
-        grafts = self._git_dir() / "info" / "grafts"
-        try:
-            if grafts.exists() and grafts.read_text(encoding="utf-8").strip():
-                raise HistoryUnavailable(
-                    f"{grafts} is a non-empty legacy graft file; refusing to "
-                    "verify a checkout whose history can be locally rewritten."
-                )
-        except OSError as exc:
-            raise HistoryUnavailable(f"cannot read {grafts}: {exc}") from exc
+        # Both the worktree dir and the common dir: a linked worktree keeps
+        # grafts in the latter.
+        candidates = {self._git_dir() / "info" / "grafts",
+                      self._git_common_dir() / "info" / "grafts"}
+        for grafts in sorted(candidates):
+            try:
+                if grafts.exists() and grafts.read_text(encoding="utf-8").strip():
+                    raise HistoryUnavailable(
+                        f"{grafts} is a non-empty legacy graft file; refusing to "
+                        "verify a checkout whose history can be locally rewritten."
+                    )
+            except OSError as exc:
+                raise HistoryUnavailable(f"cannot read {grafts}: {exc}") from exc
 
     def assert_history_available(self) -> None:
         """Fail closed unless complete local history is readable.
@@ -363,7 +421,7 @@ class GitMessageStore:
                 "cannot be verified from a truncated clone. Fetch full history "
                 "(git fetch --unshallow) before verifying, appending or pushing."
             )
-        if self._git("rev-parse", "--verify", self.branch, check=False).returncode != 0:
+        if self._git("rev-parse", "--verify", self.ref, check=False).returncode != 0:
             raise HistoryUnavailable(
                 f"configured room branch {self.branch!r} does not exist in "
                 f"{self.workdir}; refusing to report an empty history for a "
@@ -379,7 +437,7 @@ class GitMessageStore:
         could be rewritten or deleted inside one and never appear in the scan.
         Linear history is what makes the scan complete.
         """
-        proc = self._git("rev-list", "--merges", self.branch, check=False)
+        proc = self._git("rev-list", "--merges", self.ref, check=False)
         if proc.returncode != 0:
             raise HistoryUnavailable(
                 f"merge scan of {self.branch} failed: {proc.stderr.strip()}"
@@ -412,10 +470,10 @@ class GitMessageStore:
         rather than being skipped.
         """
         self.assert_history_available()
-        tip = self._git("rev-parse", self.branch, check=False)
+        tip = self._git("rev-parse", self.ref, check=False)
         if tip.returncode != 0:
             raise HistoryUnavailable(
-                f"cannot resolve {self.branch}: {tip.stderr.strip()}"
+                f"cannot resolve {self.ref}: {tip.stderr.strip()}"
             )
         tip_sha = tip.stdout.strip()
         cached = getattr(self, "_history_cache", None)
@@ -425,14 +483,14 @@ class GitMessageStore:
         self._assert_linear()
 
         proc = self._git(
-            "log", self.branch, "--reverse", "--format=%H",
+            "log", self.ref, "--reverse", "--format=%H",
             "--name-status", "-z", "--no-renames", "--", MESSAGES_DIR,
             check=False,
         )
         if proc.returncode != 0:
             # Never a silent {}: an unreadable history is not an empty room.
             raise HistoryUnavailable(
-                f"history query for {MESSAGES_DIR} on {self.branch} failed: "
+                f"history query for {MESSAGES_DIR} on {self.ref} failed: "
                 f"{proc.stderr.strip()}"
             )
 
@@ -517,10 +575,18 @@ class GitMessageStore:
         if cache is None:
             cache = self._ancestry_cache = {}
         key = (earlier, later)
-        if key not in cache:
-            cache[key] = self._git(
-                "merge-base", "--is-ancestor", earlier, later, check=False
-            ).returncode == 0
+        if key in cache:
+            return cache[key]
+        proc = self._git("merge-base", "--is-ancestor", earlier, later, check=False)
+        if proc.returncode not in (0, 1):
+            # Anything other than the documented yes/no is an operational
+            # failure. Caching it as "not an ancestor" would poison every
+            # later answer for this store instance.
+            raise AgentRoomError(
+                f"ancestry query {earlier[:8]}..{later[:8]} failed "
+                f"({proc.returncode}): {proc.stderr.strip()}"
+            )
+        cache[key] = proc.returncode == 0
         return cache[key]
 
     def verify_append_only(self) -> int:
@@ -528,9 +594,84 @@ class GitMessageStore:
         return len(self._history())
 
     # -- reads (from the add commit, never the branch tip) -----------------
+    def _object_format(self) -> str:
+        cached = getattr(self, "_object_format_cache", None)
+        if cached is None:
+            proc = self._git("rev-parse", "--show-object-format", check=False)
+            cached = self._object_format_cache = (
+                proc.stdout.strip() if proc.returncode == 0 else "sha1"
+            ) or "sha1"
+        return cached
+
+    def _hash_blob(self, content: bytes) -> str:
+        """Git's object id for this blob content, computed locally."""
+        algo = self._object_format()
+        header = b"blob %d\0" % len(content)
+        if algo == "sha256":
+            return hashlib.sha256(header + content).hexdigest()
+        return hashlib.sha1(header + content).hexdigest()
+
     def _blob_at(self, commit: str, path: str) -> str | None:
-        proc = self._git("show", f"{commit}:{path}", check=False)
-        return proc.stdout if proc.returncode == 0 else None
+        """Blob content, proven to hash to the object id the tree names.
+
+        A loose object file can be replaced with different, validly compressed
+        content under its old name: Git will hand that content back, and the
+        envelope can simply be resealed around it. Only recomputing the object
+        id from the bytes catches that.
+        """
+        spec = f"{commit}:{path}"
+        oid_proc = self._git("rev-parse", "--verify", "--quiet", spec, check=False)
+        oid = oid_proc.stdout.strip()
+        if oid_proc.returncode != 0 or not oid:
+            return None
+        content = self._git_bytes("cat-file", "blob", oid)
+        actual = self._hash_blob(content)
+        if actual != oid:
+            raise AppendOnlyViolation(
+                f"object corruption: {path} at {commit[:8]} is stored as {oid} "
+                f"but its content hashes to {actual}; the object database has "
+                "been altered under the committed object id"
+            )
+        return content.decode("utf-8")
+
+    def _discard_uncommitted(self, rel: str) -> None:
+        """Unstage and remove a message artifact that was never committed.
+
+        Called only when absence is *proven*. Never when persistence is
+        unknown - deleting a file that may already be committed content would
+        be exactly the wrong move.
+        """
+        try:
+            self._git("reset", "-q", "--", rel, check=False)
+            target = self.workdir / rel
+            if target.exists():
+                target.unlink()
+        except (AgentRoomError, OSError):
+            # Cleanup is best-effort; failing to tidy must not mask the real
+            # outcome we are about to report.
+            pass
+
+    def assert_object_integrity(self) -> None:
+        """Fail closed on any reachable-object corruption in the room history.
+
+        Run on every full verification rather than cached: `_history_cache` is
+        keyed on the ref tip, and object corruption does not move the tip.
+        """
+        # fsck takes an object, not a ref name; resolving first also means a
+        # missing branch is reported as unavailable history, not corruption.
+        self.assert_history_available()
+        tip = self._git("rev-parse", "--verify", self.ref, check=False).stdout.strip()
+        if not tip:
+            raise HistoryUnavailable(f"cannot resolve {self.ref} for integrity check")
+        proc = self._git(
+            "fsck", "--strict", "--no-dangling", "--no-reflogs", tip,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AppendOnlyViolation(
+                f"git fsck --strict rejected the object database backing "
+                f"{self.ref}: {(proc.stderr or proc.stdout).strip()[:500]}"
+            )
 
     def _load_raw(self, path: str, commit: str) -> dict:
         """Phase one: the message itself, with no reference resolution.
@@ -688,6 +829,16 @@ class GitMessageStore:
                 f"object lookup for {spec!r} failed in {self.workdir}: "
                 f"{proc.stderr.strip() or 'git exited ' + str(proc.returncode)}"
             )
+        # Git can exit 0 and print "<sha> missing" while stderr carries an
+        # inflate/unpack/permission diagnostic for a locally *corrupt* object.
+        # Reporting that as a clean absence would downgrade a damaged object
+        # database to "foreign evidence we are not expected to have".
+        diagnostics = proc.stderr.strip()
+        if diagnostics:
+            raise AgentRoomError(
+                f"object lookup for {spec!r} reported a read failure in "
+                f"{self.workdir}: {diagnostics}"
+            )
         line = proc.stdout.strip()
         if not line:
             raise AgentRoomError(f"empty object lookup result for {spec!r}")
@@ -739,32 +890,40 @@ class GitMessageStore:
         )
         return envelope
 
-    def recover_add_commit(self, path: str) -> tuple:
-        """Prove the surviving add commit, or admit that it is unknown.
+    def local_persistence_state(self, path: str) -> tuple:
+        """Three-state answer: `(commit | None, state, error | None)`.
 
-        Returns `(commit | None, known, error | None)`. The lookup itself can
-        fail or time out; when it does we report uncertainty rather than a
-        stale pre-rebase SHA dressed up as current. A wrong commit is worse
-        than an honest "unknown" - the whole point of the field is audit.
+        `state` is "present", "absent" or "unknown". Proven absence is a fact,
+        not uncertainty: a caller that knows nothing was written can safely
+        retry, while a caller facing genuine uncertainty must not.
         """
         try:
             proc = self._git(
-                "log", self.branch, "--reverse", "--diff-filter=A",
+                "log", self.ref, "--reverse", "--diff-filter=A",
                 "--format=%H", "-z", "--", path, check=False,
             )
         except AgentRoomError as exc:
-            return None, False, exc
+            return None, "unknown", exc
         if proc.returncode != 0:
-            return None, False, AgentRoomError(
+            return None, "unknown", AgentRoomError(
                 f"add-commit lookup for {path} failed: {proc.stderr.strip()}"
             )
         for token in proc.stdout.split("\0"):
             token = token.strip()
             if len(token) >= 40 and all(c in "0123456789abcdef" for c in token):
-                return token, True, None
-        return None, False, AgentRoomError(
-            f"{path} has no add commit on {self.branch}"
-        )
+                return token, "present", None
+        return None, "absent", None
+
+    def recover_add_commit(self, path: str) -> tuple:
+        """`(commit | None, known, error | None)` - known covers present/absent.
+
+        A wrong commit is worse than an honest "unknown"; the whole point of
+        the field is audit.
+        """
+        commit, state, error = self.local_persistence_state(path)
+        if state == "absent":
+            return None, True, None
+        return commit, state == "present", error
 
     def current_add_commit(self, path: str, fallback: str | None = None) -> str | None:
         """The commit that currently adds `path`, after any rebase.
@@ -775,7 +934,7 @@ class GitMessageStore:
         reporting a stale SHA is still better than reporting none.
         """
         proc = self._git(
-            "log", self.branch, "--reverse", "--diff-filter=A",
+            "log", self.ref, "--reverse", "--diff-filter=A",
             "--format=%H", "-z", "--", path, check=False,
         )
         if proc.returncode == 0:
@@ -795,6 +954,7 @@ class GitMessageStore:
         would not notice a freshly fetched artifact that is malformed,
         misfiled, or cites something that did not yet exist.
         """
+        self.assert_object_integrity()
         history = self._history()
         for path, commit in history.items():
             self._load(path, commit)
@@ -930,7 +1090,25 @@ class GitMessageStore:
                 # actually landed. Guessing is unsafe in both directions:
                 # "failed" invites a repost that duplicates the message,
                 # "succeeded" may be false. Reconcile, then say what is known.
-                landed, landed_known, recovery_error = self.recover_add_commit(rel)
+                landed, state, recovery_error = self.local_persistence_state(rel)
+                if state == "absent":
+                    # Proven absence is a fact, not uncertainty. Drop the
+                    # staged-but-uncommitted artifact so the checkout is not
+                    # left dirty and blocking an honest retry. Only safe
+                    # because we have *proof* nothing was committed.
+                    self._discard_uncommitted(rel)
+                    raise DeliveryError(
+                        f"message {message_id} was NOT committed: {exc}. "
+                        "Nothing was written; the staged artifact has been "
+                        "discarded and the message may be posted again.",
+                        message_id=message_id, path=rel,
+                        commit=None, commit_known=True,
+                        locally_committed=False, locally_committed_known=True,
+                        pushed=False, pushed_known=True,
+                        status="not_created",
+                        cause=exc, recovery_error=recovery_error,
+                    ) from exc
+                landed_known = state == "present"
                 if landed_known:
                     raise DeliveryError(
                         f"message {message_id} was committed at {landed} but the "
@@ -941,6 +1119,7 @@ class GitMessageStore:
                         commit=landed, commit_known=True,
                         locally_committed=True, locally_committed_known=True,
                         pushed=False, pushed_known=True,
+                        status="created",
                         cause=exc, recovery_error=recovery_error,
                     ) from exc
                 raise DeliveryError(
@@ -951,6 +1130,7 @@ class GitMessageStore:
                     commit=None, commit_known=False,
                     locally_committed=None, locally_committed_known=False,
                     pushed=False, pushed_known=True,
+                    status="unknown",
                     cause=exc, recovery_error=recovery_error,
                 ) from exc
 
@@ -1035,7 +1215,7 @@ class GitMessageStore:
         honestly unknown rather than being guessed either way.
         """
         try:
-            proc = self._git("ls-remote", self.remote, self.branch, check=False)
+            proc = self._git("ls-remote", self.remote, self.ref, check=False)
         except AgentRoomError as exc:
             return None, False, exc
         if proc.returncode != 0:
@@ -1044,11 +1224,30 @@ class GitMessageStore:
             )
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         if not lines:
+            # The exact branch ref is absent, so nothing we pushed landed.
             return False, True, None
         remote_sha = lines[0].split()[0]
         if remote_sha == tip:
             return True, True, None
-        return None, False, None
+
+        # The remote moved. Our push may still have landed and been built on
+        # by another writer, so fetch that exact ref and test ancestry rather
+        # than assuming rejection.
+        fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
+        if fetched.returncode != 0:
+            return None, False, AgentRoomError(
+                f"reconciliation fetch of {self.ref} failed: {fetched.stderr.strip()}"
+            )
+        head = self._git("rev-parse", "FETCH_HEAD", check=False).stdout.strip()
+        if not head:
+            return None, False, AgentRoomError("reconciliation fetch produced no head")
+        try:
+            if head == tip or self.is_strict_ancestor(tip, head):
+                return True, True, None
+        except AgentRoomError as exc:
+            return None, False, exc
+        # The ref exists and demonstrably does not contain our tip.
+        return False, True, None
 
     def _push_locked(self) -> dict:
         """Push body, assuming the writer lock is already held."""
@@ -1060,10 +1259,10 @@ class GitMessageStore:
         self.verify_store()
         last_error = ""
         for attempt in range(1, self.push_retries + 1):
-            tip = self._git("rev-parse", self.branch, check=False).stdout.strip()
+            tip = self._git("rev-parse", self.ref, check=False).stdout.strip()
             try:
                 proc = self._git(
-                    "push", self.remote, f"{self.branch}:{self.branch}", check=False)
+                    "push", self.remote, f"{self.ref}:{self.ref}", check=False)
             except AgentRoomError as exc:
                 # The remote may have accepted the ref before the connection
                 # or the result was lost. Reporting "not pushed" here would be
@@ -1079,18 +1278,40 @@ class GitMessageStore:
                 ) from exc
             if proc.returncode == 0:
                 return {"pushed": True, "pushed_known": True, "attempts": attempt}
+
+            # A nonzero result is not proof of non-delivery either: the remote
+            # can accept the ref while the client still sees a failure.
+            # Reconcile before classifying this as a rejection or a race.
             last_error = proc.stderr.strip()
+            settled, settled_known, recon_error = self._reconcile_push(tip)
+            if settled is True:
+                return {"pushed": True, "pushed_known": True,
+                        "attempts": attempt, "reconciled": True}
+            if not settled_known:
+                raise PushAmbiguous(
+                    f"push to {self.remote} returned {proc.returncode} and "
+                    f"delivery could not be settled: {last_error}",
+                    pushed=None, pushed_known=False,
+                    cause=AgentRoomError(last_error or "push failed"),
+                    recovery_error=recon_error,
+                )
 
             # Only a *fetchable* remote branch can have moved under us. If the
             # fetch fails there is nothing to rebase onto, and the rejection
             # was something other than a race (a hook, permissions, a missing
             # branch) - retry within the bound and report that instead of
             # misattributing it to a failed rebase.
-            fetched = self._git("fetch", "-q", self.remote, self.branch, check=False)
+            fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
             if fetched.returncode != 0:
                 continue
 
-            rebase = self._git("rebase", "-q", "FETCH_HEAD", check=False)
+            # Transport bookkeeping identity only - it carries no approval
+            # authority. Without it a participant checkout with no global Git
+            # config cannot complete an ordinary concurrent-writer rebase.
+            rebase = self._git(
+                "-c", f"user.name={self.author[0]}",
+                "-c", f"user.email={self.author[1]}",
+                "rebase", "-q", "FETCH_HEAD", check=False)
             if rebase.returncode != 0:
                 self._git("rebase", "--abort", check=False)
                 raise PushRaceError(

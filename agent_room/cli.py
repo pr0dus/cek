@@ -31,8 +31,16 @@ def _emit(obj) -> None:
 
 
 def _json_arg(value: str | None, default):
-    """Parse a CLI JSON argument, rejecting duplicate keys like stored JSON."""
-    return canonical.strict_loads(value) if value else default
+    """Parse a CLI JSON argument, rejecting duplicate keys like stored JSON.
+
+    The default applies only when the option was *not given*. An explicit
+    empty string is input, and invalid input at that - silently turning
+    `--recipient ''` into a broadcast would be exactly the coercion the
+    library boundary refuses.
+    """
+    if value is None:
+        return default
+    return canonical.strict_loads(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
