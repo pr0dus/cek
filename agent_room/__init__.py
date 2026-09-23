@@ -34,6 +34,14 @@ from .claude_participant import (
 )
 from .codex_participant import CodexInvoker, CodexParticipant
 from .participant import ParticipantAdapter, ParticipantAdapterError
+from .tool_profiles import (
+    KNOWN_PROFILES,
+    QUALIFIED_PROFILES,
+    ToolProfile,
+    ToolProfileError,
+    ToolProfileUnavailable,
+    UnknownToolProfile,
+)
 from .room import AgentRoom
 from .gitstore import GitMessageStore
 from .cursor import ParticipantCursor
@@ -45,6 +53,12 @@ __all__ = [
     "CodexInvoker",
     "ParticipantAdapter",
     "ParticipantAdapterError",
+    "ToolProfile",
+    "ToolProfileError",
+    "ToolProfileUnavailable",
+    "UnknownToolProfile",
+    "KNOWN_PROFILES",
+    "QUALIFIED_PROFILES",
     "ClaudeInvoker",
     "ClaudeAdapterError",
     "MalformedResponse",

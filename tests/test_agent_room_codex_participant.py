@@ -444,12 +444,15 @@ def test_invoker_defaults_are_narrow():
     assert "danger-full-access" not in " ".join(command)
 
 
-def test_tool_profile_is_an_explicit_opt_in_seam():
+def test_tool_profile_is_named_not_a_raw_argument_vector():
+    """The seam takes a NAME. A raw vector is flag injection, not an allowlist."""
+    from agent_room.tool_profiles import UnknownToolProfile
+
     plain = CodexInvoker().command("/s", "/o")
-    profiled = CodexInvoker(tool_profile=("-c", "mcp_servers.serena.command=serena")
-                            ).command("/s", "/o")
     assert "serena" not in " ".join(plain), "no tooling by default"
-    assert profiled[-2:] == ["-c", "mcp_servers.serena.command=serena"]
+
+    with pytest.raises(UnknownToolProfile):
+        CodexInvoker(tool_profile=("-c", "mcp_servers.serena.command=serena"))
 
 
 def test_cli_does_not_offer_danger_full_access(store, tmp_path, addressed, capsys):

@@ -37,20 +37,35 @@ codex exec - --sandbox read-only --skip-git-repo-check --ephemeral \
      --ignore-user-config [--model …] [-C <project dir>]
 ```
 
-- **`read-only` by default.** Connectivity needs no write access. `workspace-write`
-  is an explicit caller decision; **`danger-full-access` is not offered by the
-  CLI at all**, and `--dangerously-bypass-approvals-and-sandbox` is never used.
-- **`--ignore-user-config`** means user and global MCP servers are **not
-  silently enabled** — while authentication still resolves normally.
+- **`read-only` by default.** Connectivity needs no write access.
+  `workspace-write` is an explicit caller decision, and the sandbox is checked
+  against `ALLOWED_SANDBOXES` **at construction** — `danger-full-access` cannot
+  enter through the library, not merely through the CLI parser.
+  `--dangerously-bypass-approvals-and-sandbox` is never used.
+- **`--ignore-user-config` is fixed, not optional**: user and global MCP
+  servers are never silently enabled, while authentication still resolves
+  normally.
 - **`--ephemeral`** leaves no session files on disk.
 - Prompt on **stdin**, so a long thread cannot overflow the argument list.
 
 ### Tooling seam (Serena / Graphify)
 
-`CodexInvoker(tool_profile=(...))` appends arguments verbatim. Nothing is
-enabled by default and no test depends on any plugin or MCP server. A later
-**explicit allowlisted** profile can expose qualified Serena or Graphify
-without touching the participant protocol.
+Capability is **named, never spelled**. `tool_profile` takes a name — `none`,
+`serena`, `graphify`, `serena+graphify` — and any arguments are constructed
+inside `agent_room/tool_profiles.py` from that name. A caller cannot hand over
+a raw argument vector; that would be arbitrary flag injection, not an
+allowlist, and could override the very defaults the adapter guarantees.
+
+**Only `none` is qualified today**, and it adds nothing. The other names are
+declared so the seam has a shape; resolving one raises
+`ToolProfileUnavailable` rather than guessing launch flags for tooling that
+has not been independently inspected.
+
+A profile may add tooling. It may **never** touch sandbox/restriction,
+approval or permission mode, user-config or rules isolation, authentication,
+the output schema and result channel, the model, or the project path — a
+defensive check refuses any profile argument that tries, so a future
+contributor cannot quietly reopen the hole.
 
 A tool's output is not evidence merely because a tool produced it — the prompt
 says so, and claims still need repository, test or artifact evidence.

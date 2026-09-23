@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import tool_profiles
 from .participant import (
     AGENT_MESSAGE_TYPES,
     DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
@@ -36,6 +37,12 @@ CodexAdapterError = ParticipantAdapterError
 DEFAULT_CODEX_BIN = "codex"
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_SANDBOX = "read-only"
+
+#: The only sandbox policies a participant turn may use. `danger-full-access`
+#: is deliberately absent: an Agent Room turn never needs it, and offering it
+#: at the library boundary would make the safety claim depend on the CLI
+#: parser rather than on the API.
+ALLOWED_SANDBOXES = ("read-only", "workspace-write")
 
 #: Audit marker in `sender.via`, distinguishing an automatic turn from a reply
 #: a human drove by hand. Not a security control - provenance rests on
@@ -146,10 +153,12 @@ class CodexInvoker:
     - `--output-schema` (a file) and `--output-last-message` (a file) give the
       structured reply without parsing conversational stdout.
 
-    `tool_profile` is the seam for a later *explicit allowlist* of qualified
-    tooling such as Serena or Graphify: extra arguments are appended verbatim,
-    so that capability can be added without touching the participant protocol.
-    A tool's output is not evidence merely because a tool produced it.
+    Capability arrives only as a **named** `tool_profile` whose arguments are
+    constructed in `tool_profiles` - never as a caller-supplied argument
+    vector, which would be arbitrary flag injection rather than an allowlist.
+    `--ignore-user-config` and the output channel are fixed, and the sandbox
+    is checked against `ALLOWED_SANDBOXES`, so no construction path can widen
+    them. A tool's output is not evidence merely because a tool produced it.
     """
 
     def __init__(
@@ -160,16 +169,21 @@ class CodexInvoker:
         model: str | None = None,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
         sandbox: str = DEFAULT_SANDBOX,
-        ignore_user_config: bool = True,
-        tool_profile: tuple = (),
+        tool_profile=tool_profiles.NONE,
     ) -> None:
+        if sandbox not in ALLOWED_SANDBOXES:
+            raise CodexAdapterError(
+                f"sandbox {sandbox!r} is not permitted for a participant turn; "
+                f"allowed: {list(ALLOWED_SANDBOXES)}"
+            )
         self.executable = executable
         self.cwd = cwd
         self.model = model
         self.timeout = timeout
         self.sandbox = sandbox
-        self.ignore_user_config = ignore_user_config
-        self.tool_profile = tuple(tool_profile)
+        #: Resolved at construction, so an unknown or unqualified profile can
+        #: never reach a command line.
+        self.tool_profile = tool_profiles.resolve(tool_profile)
 
     def command(self, schema_path: str, output_path: str) -> list:
         resolved = shutil.which(self.executable) or self.executable
@@ -180,14 +194,13 @@ class CodexInvoker:
             "--ephemeral",
             "--output-schema", schema_path,
             "--output-last-message", output_path,
+            "--ignore-user-config",
         ]
-        if self.ignore_user_config:
-            args.append("--ignore-user-config")
         if self.model:
             args += ["--model", self.model]
         if self.cwd:
             args += ["-C", self.cwd]
-        return args + list(self.tool_profile)
+        return args + list(self.tool_profile.codex_arguments())
 
     def __call__(self, prompt: str) -> str:
         workdir = Path(tempfile.mkdtemp(prefix="agent-room-codex-"))

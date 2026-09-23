@@ -114,6 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     turn.add_argument("--timeout", type=int, default=None)
     turn.add_argument("--turn-timeout", type=float, default=None,
                       help="bounded wait for another in-flight turn (seconds)")
+    turn.add_argument("--tool-profile", default=None,
+                      help="named tool profile (default: none). Only qualified "
+                           "profiles are accepted; raw client flags are not.")
 
     codex = sub.add_parser(
         "codex-turn",
@@ -127,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     codex.add_argument("--project-dir", default=None)
     codex.add_argument("--timeout", type=int, default=None)
     codex.add_argument("--turn-timeout", type=float, default=None)
+    codex.add_argument("--tool-profile", default=None,
+                       help="named tool profile (default: none). Only qualified "
+                            "profiles are accepted; raw client flags are not.")
     codex.add_argument("--sandbox", default=None,
                        choices=["read-only", "workspace-write"],
                        help="Codex sandbox policy (default read-only). "
@@ -192,6 +198,7 @@ def main(argv=None) -> int:
         elif args.command == "push":
             _emit(room.store.push())
         elif args.command == "codex-turn":
+            from . import tool_profiles
             from .codex_participant import (
                 DEFAULT_CODEX_BIN, DEFAULT_SANDBOX, DEFAULT_TIMEOUT_SECONDS,
                 DEFAULT_TURN_LOCK_TIMEOUT_SECONDS as CODEX_TURN_TIMEOUT,
@@ -203,6 +210,7 @@ def main(argv=None) -> int:
                 model=args.model,
                 timeout=args.timeout or DEFAULT_TIMEOUT_SECONDS,
                 sandbox=args.sandbox or DEFAULT_SANDBOX,
+                tool_profile=args.tool_profile or tool_profiles.NONE,
             )
             participant = CodexParticipant(
                 room, invoker,
@@ -217,11 +225,13 @@ def main(argv=None) -> int:
             )
             # `restricted` is not exposed: the adapter must not offer a way to
             # silently widen the installed client's permission system.
+            from . import tool_profiles
             invoker = ClaudeInvoker(
                 args.claude_bin or DEFAULT_CLAUDE_BIN,
                 cwd=args.project_dir,
                 model=args.model,
                 timeout=args.timeout or DEFAULT_TIMEOUT_SECONDS,
+                tool_profile=args.tool_profile or tool_profiles.NONE,
             )
             from .claude_participant import DEFAULT_TURN_LOCK_TIMEOUT_SECONDS
             participant = ClaudeParticipant(

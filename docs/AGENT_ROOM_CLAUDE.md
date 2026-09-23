@@ -39,9 +39,13 @@ claude -p --output-format json --json-schema <response schema> \
 `--restricted` removes the code-running tools (Bash, REPL, …) and WebFetch,
 confines file tools to the working directory, ignores user/project/local
 settings files, and **refuses `bypassPermissions`**. `--strict-mcp-config`
-drops MCP servers. The CLI deliberately exposes **no** flag to turn these off:
-the adapter reuses the installed client's permission system and never widens
-it.
+drops MCP servers.
+
+Neither is optional. `ClaudeInvoker` takes **no** `restricted` flag and **no**
+arbitrary argument passthrough, so the guarantee holds at the library
+boundary rather than depending on one CLI parser. Extra capability arrives only
+as a named `tool_profile` (see `AGENT_ROOM_CODEX.md` — the mechanism is shared,
+and only `none` is qualified today).
 
 ## The turn
 

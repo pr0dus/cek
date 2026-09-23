@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 
+from . import tool_profiles
 from .participant import (
     AGENT_MESSAGE_TYPES,
     DEFAULT_TURN_LOCK_TIMEOUT_SECONDS,
@@ -47,11 +48,14 @@ class ClaudeInvoker:
     Injectable: the tests substitute a stub so the suite never spends tokens,
     needs a login, or depends on model behaviour.
 
-    Defaults are deliberately narrow - `--restricted` drops the code-running
-    tools and WebFetch and confines file tools to the working directory,
-    `--strict-mcp-config` drops MCP servers, and the prompt goes over stdin so
-    a large thread cannot overflow the argument list. The installed client's
-    own permission system is reused, never widened.
+    The boundary is fixed, not configurable. `--restricted` drops the
+    code-running tools and WebFetch and confines file tools to the working
+    directory, `--strict-mcp-config` drops MCP servers, and the prompt goes
+    over stdin so a large thread cannot overflow the argument list. There is
+    deliberately **no** way to disable either and **no** arbitrary argument
+    passthrough: the installed client's permission system is reused, never
+    widened. Extra capability arrives only as a named, allowlisted
+    `tool_profile` whose arguments are constructed in `tool_profiles`.
     """
 
     def __init__(
@@ -61,15 +65,15 @@ class ClaudeInvoker:
         cwd: str | None = None,
         model: str | None = None,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
-        restricted: bool = True,
-        extra_args: tuple = (),
+        tool_profile=tool_profiles.NONE,
     ) -> None:
         self.executable = executable
         self.cwd = cwd
         self.model = model
         self.timeout = timeout
-        self.restricted = restricted
-        self.extra_args = tuple(extra_args)
+        #: Resolved at construction, so an unknown or unqualified profile can
+        #: never reach a command line.
+        self.tool_profile = tool_profiles.resolve(tool_profile)
 
     def command(self) -> list:
         resolved = shutil.which(self.executable) or self.executable
@@ -78,12 +82,11 @@ class ClaudeInvoker:
             "--output-format", "json",
             "--json-schema", json.dumps(RESPONSE_SCHEMA),
             "--strict-mcp-config",
+            "--restricted",
         ]
-        if self.restricted:
-            args.append("--restricted")
         if self.model:
             args += ["--model", self.model]
-        return args + list(self.extra_args)
+        return args + list(self.tool_profile.claude_arguments())
 
     def __call__(self, prompt: str) -> str:
         command = self.command()
