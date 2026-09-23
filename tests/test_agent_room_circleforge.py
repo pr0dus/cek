@@ -6,6 +6,7 @@ situation must never be reported as a verified one.
 """
 
 import json
+import os
 import subprocess
 import zlib
 
@@ -267,6 +268,84 @@ def test_warm_cache_read_fails_on_a_forged_tree(store, room):
         store.read("t1", victim["message_id"])
     with pytest.raises(AppendOnlyViolation):
         store.verify_store()
+
+
+def test_warm_read_rejects_forged_tree_with_unchanged_object_metadata(store, room):
+    """Object paths, sizes and mtimes cannot authenticate the selected blob."""
+    victim = room.post(thread_id="t1", type="observation", body={"text": "original"})
+    tip = git(store.workdir, "rev-parse", store.ref).strip()
+    tree_oid = git(store.workdir, "rev-parse", f"{tip}:.agent-room/messages/t1").strip()
+    old_blob = git(store.workdir, "rev-parse", f"{tip}:{victim['path']}").strip()
+    tree = subprocess.run(
+        ["git", "cat-file", "tree", tree_oid], cwd=store.workdir,
+        capture_output=True, check=True,
+    ).stdout
+    forged_text = _forged_envelope(store, victim, "forged with restored metadata")
+    # Prepare the valid replacement blob before warming the integrity path:
+    # the attack must not add an object file that would invalidate the old cache.
+    new_blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"], cwd=store.workdir,
+        input=forged_text.encode("utf-8"), capture_output=True, check=True,
+    ).stdout.decode().strip()
+    forged_tree = tree.replace(bytes.fromhex(old_blob), bytes.fromhex(new_blob))
+    assert forged_tree != tree and len(forged_tree) == len(tree)
+
+    # Stored DEFLATE blocks give equal-length encodings for equal-length trees.
+    # Re-encoding the genuine tree preserves its OID and passes the warm read.
+    header = b"tree %d\0" % len(tree)
+    original = zlib.compress(header + tree, level=0)
+    replacement = zlib.compress(header + forged_tree, level=0)
+    assert len(replacement) == len(original)
+    target = loose_object_path(store, tree_oid)
+    target.chmod(0o644)
+    target.write_bytes(original)
+    assert store.read("t1", victim["message_id"])["body"]["text"] == "original"
+    assert store.verify_store() == 1
+
+    objects = store._git_common_dir() / "objects"
+
+    def object_metadata():
+        return {
+            str(path.relative_to(objects)): (path.stat().st_size, path.stat().st_mtime_ns)
+            for path in objects.rglob("*") if path.is_file()
+        }
+
+    before = object_metadata()
+    original_stat = target.stat()
+    target.write_bytes(replacement)
+    os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert target.read_bytes() != original
+    assert object_metadata() == before
+    assert git(store.workdir, "rev-parse", store.ref).strip() == tip
+    assert git(store.workdir, "show", f"{tip}:{victim['path']}") == forged_text
+    fsck = subprocess.run(["git", "fsck", "--strict"], cwd=store.workdir,
+                          capture_output=True, text=True)
+    assert fsck.returncode != 0, "the forged tree must fail Git object integrity"
+
+    with pytest.raises(AppendOnlyViolation, match="git fsck --strict"):
+        store.read("t1", victim["message_id"])
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_verify_rejects_forged_tree_that_hides_message_namespace(store, room, warm):
+    """Integrity must precede discovery, even when no paths would be loaded."""
+    room.post(thread_id="t1", type="observation", body={"text": "original"})
+    if warm:
+        assert store.verify_store() == 1
+    reader = store if warm else GitMessageStore(store.workdir, branch="agent-room")
+    tree_oid = git(store.workdir, "rev-parse", "HEAD^{tree}").strip()
+    tree = subprocess.run(
+        ["git", "cat-file", "tree", tree_oid], cwd=store.workdir,
+        capture_output=True, check=True,
+    ).stdout
+    forged_tree = tree.replace(b".agent-room\0", b".agent-roon\0")
+    assert forged_tree != tree
+    target = loose_object_path(store, tree_oid)
+    target.chmod(0o644)
+    target.write_bytes(zlib.compress(b"tree %d\0" % len(forged_tree) + forged_tree))
+
+    with pytest.raises(AppendOnlyViolation, match="git fsck --strict"):
+        reader.verify_store()
 
 
 def test_forged_tree_also_fails_thread_and_iteration(store, room):

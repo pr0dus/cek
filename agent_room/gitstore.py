@@ -520,7 +520,9 @@ class GitMessageStore:
         never again; a path that is not a canonical message path fails closed
         rather than being skipped.
         """
-        self.assert_history_available()
+        # Authenticate before discovery or cache reuse: a corrupt tree can
+        # hide paths that would otherwise trigger the per-artifact gate.
+        self.assert_object_integrity()
         tip = self._git("rev-parse", self.ref, check=False)
         if tip.returncode != 0:
             raise HistoryUnavailable(
@@ -702,36 +704,12 @@ class GitMessageStore:
             # outcome we are about to report.
             pass
 
-    def _object_store_fingerprint(self) -> tuple:
-        """A cheap signature that changes when the local object store does.
-
-        A ref-tip cache is not a valid invalidation source for integrity:
-        rewriting an object under its existing id does not move the tip. Size
-        and mtime of every object file does change, so this is what the
-        integrity cache is keyed on.
-        """
-        objects = self._git_common_dir() / "objects"
-        entries = []
-        try:
-            for root, _dirs, files in os.walk(objects):
-                for name in files:
-                    full = Path(root) / name
-                    try:
-                        stat = full.stat()
-                    except OSError:
-                        entries.append((str(full), -1, -1))
-                        continue
-                    entries.append((str(full), stat.st_size, stat.st_mtime_ns))
-        except OSError as exc:
-            raise AgentRoomError(f"cannot inspect the object store: {exc}") from exc
-        return tuple(sorted(entries))
-
     def assert_object_integrity(self) -> None:
         """Fail closed on any reachable-object corruption in the room history.
 
-        Cached only against the ref tip *and* an object-store fingerprint, so
-        a rewrite under an existing object id - which leaves the tip untouched
-        - always invalidates the cache.
+        Always check the object contents: an object can be replaced under its
+        existing OID while preserving its file size and mtime. Neither file
+        metadata nor an unchanged ref tip can authenticate the object graph.
         """
         # fsck takes an object, not a ref name; resolving first also means a
         # missing branch is reported as unavailable history, not corruption.
@@ -739,9 +717,6 @@ class GitMessageStore:
         tip = self._git("rev-parse", "--verify", self.ref, check=False).stdout.strip()
         if not tip:
             raise HistoryUnavailable(f"cannot resolve {self.ref} for integrity check")
-        key = (tip, self._object_store_fingerprint())
-        if getattr(self, "_integrity_cache", None) == key:
-            return
         proc = self._git(
             "fsck", "--strict", "--no-dangling", "--no-reflogs", tip,
             check=False,
@@ -751,7 +726,6 @@ class GitMessageStore:
                 f"git fsck --strict rejected the object database backing "
                 f"{self.ref}: {(proc.stderr or proc.stdout).strip()[:500]}"
             )
-        self._integrity_cache = key
 
     def _load_raw(self, path: str, commit: str) -> dict:
         """Phase one: the message itself, with no reference resolution.

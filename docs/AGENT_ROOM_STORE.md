@@ -106,12 +106,13 @@ it. Hashing the blob is not sufficient on its own either: the **commit and tree
 objects that select** that blob can themselves be forged under their existing
 ids, so a read could return authentic-looking content chosen by a corrupt tree.
 
-The gate therefore runs before **every authoritative read**, not only full
-verification: `git fsck --strict --no-dangling --no-reflogs` over the room
-head, plus a per-read recomputation of the blob object id. Its cache is keyed
-on the ref tip **and an object-store fingerprint** (size and mtime of every
-object file), because rewriting an object under its existing id does not move
-the tip — a ref-tip-only cache would be no invalidation source at all.
+The gate therefore runs before **every authoritative read**, including history
+discovery and history-cache returns: `git fsck --strict --no-dangling --no-reflogs`
+over the room head, plus a per-read recomputation of the blob object id as
+defense in depth. Integrity results are never cached: rewriting an object under
+its existing id can preserve its size and mtime as well as the ref tip. Checking
+before history discovery also rejects corrupt trees that hide message paths,
+rather than accepting them as a smaller or empty room.
 
 **Local history overrides are refused.** A checkout carrying `refs/replace/*`
 or a non-empty legacy `info/grafts` — checked in the **common** Git directory
