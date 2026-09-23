@@ -21,6 +21,7 @@ from .errors import (
     PushAmbiguous,
     PushRaceError,
     SchemaError,
+    SyncDivergedError,
     UnresolvedReference,
     WrongBranchError,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "LockTimeout",
     "PushAmbiguous",
     "PushRaceError",
+    "SyncDivergedError",
     "UnresolvedReference",
     "WrongBranchError",
 ]

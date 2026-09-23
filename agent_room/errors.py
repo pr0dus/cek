@@ -191,3 +191,14 @@ class LockTimeout(AgentRoomError):
     Bounded by construction: the wait has a deadline and then fails, so a
     stuck holder can never hang a caller indefinitely.
     """
+
+
+class SyncDivergedError(AgentRoomError):
+    """A read-side sync found local and remote history have diverged.
+
+    Both sides carry commits the other lacks - unlike `push()`, a read-only
+    sync must never resolve this by rebasing or force-resetting either side:
+    doing so could silently discard locally committed (but not yet pushed)
+    messages, or silently accept a rewritten remote. The caller must push
+    (which does the bounded fetch/rebase dance) before syncing reads again.
+    """

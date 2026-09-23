@@ -50,6 +50,7 @@ from .errors import (
     PushAmbiguous,
     PushRaceError,
     SchemaError,
+    SyncDivergedError,
     UnresolvedReference,
     WrongBranchError,
 )
@@ -1265,6 +1266,84 @@ class GitMessageStore:
         with self.writer_lock():
             return self._push_locked()
 
+    # -- read-side sync (bounded, one-shot) ---------------------------------
+    def sync_from_remote(self) -> dict:
+        """Fetch the exact configured ref and fast-forward this checkout.
+
+        One `git fetch` of `refs/heads/<branch>` - not a short name, so a
+        same-named tag can never stand in for it - followed by at most one
+        fast-forward. There is no retry loop and nothing runs in the
+        background: a caller invokes this once, immediately before reading,
+        so a read does not silently operate on local history that is behind
+        the remote (design §Issue #3, stale-read prevention).
+
+        Three honest outcomes when the ref has moved at all:
+
+        - the remote is strictly ahead -> fast-forward and report it;
+        - local is strictly ahead (unpushed local commits) -> nothing is
+          stale, report `local_ahead` and change nothing;
+        - the two have diverged -> raise `SyncDivergedError` rather than
+          guessing. Force-resetting local would risk discarding committed
+          local messages; accepting the remote unconditionally would risk
+          silently trusting a rewritten history. Both are refused; the caller
+          pushes (which already does bounded fetch/rebase) and syncs again.
+        """
+        with self.writer_lock():
+            return self._sync_from_remote_locked()
+
+    def _sync_from_remote_locked(self) -> dict:
+        if not self.remote:
+            raise AgentRoomError("no remote configured; nothing to sync from")
+        self.assert_room_branch()
+        self.assert_clean_checkout()
+        self.assert_history_available()
+
+        local_tip = self._git("rev-parse", self.ref, check=False).stdout.strip()
+        if not local_tip:
+            raise HistoryUnavailable(f"cannot resolve {self.ref} to sync")
+
+        fetched = self._git("fetch", "-q", "--no-tags", "--no-recurse-submodules",
+                            self.remote, self.ref, check=False)
+        if fetched.returncode != 0:
+            raise AgentRoomError(
+                f"sync fetch of {self.ref} from {self.remote} failed: "
+                f"{fetched.stderr.strip()}"
+            )
+        remote_tip = self._git("rev-parse", "FETCH_HEAD", check=False).stdout.strip()
+        if not remote_tip:
+            raise AgentRoomError("sync fetch produced no FETCH_HEAD")
+
+        if remote_tip == local_tip:
+            return {"synced": True, "action": "up_to_date",
+                     "local": local_tip, "remote": remote_tip}
+
+        if self.is_strict_ancestor(local_tip, remote_tip):
+            merge = self._git(
+                "-c", f"user.name={self.author[0]}",
+                "-c", f"user.email={self.author[1]}",
+                "merge", "-q", "--ff-only", remote_tip, check=False,
+            )
+            if merge.returncode != 0:
+                raise HistoryUnavailable(
+                    f"fast-forward of {self.ref} to {remote_tip} failed: "
+                    f"{merge.stderr.strip()}"
+                )
+            return {"synced": True, "action": "fast_forwarded",
+                     "local": remote_tip, "remote": remote_tip}
+
+        if self.is_strict_ancestor(remote_tip, local_tip):
+            # Local already holds everything the remote reports, plus
+            # unpushed commits of its own - not stale, nothing to fetch in.
+            return {"synced": True, "action": "local_ahead",
+                     "local": local_tip, "remote": remote_tip}
+
+        raise SyncDivergedError(
+            f"{self.ref} has diverged from {self.remote} "
+            f"(local {local_tip[:8]}, remote {remote_tip[:8]}); refusing to "
+            "force-reset local history. Run push() first - it fetches and "
+            "rebases local commits onto the remote - then sync again."
+        )
+
     def _reconcile_push(self, tip: str) -> tuple:
         """Bounded check of whether the remote already has our tip.
 
@@ -1292,7 +1371,8 @@ class GitMessageStore:
         # The remote moved. Our push may still have landed and been built on
         # by another writer, so fetch that exact ref and test ancestry rather
         # than assuming rejection.
-        fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
+        fetched = self._git("fetch", "-q", "--no-tags", "--no-recurse-submodules",
+                            self.remote, self.ref, check=False)
         if fetched.returncode != 0:
             return None, False, AgentRoomError(
                 f"reconciliation fetch of {self.ref} failed: {fetched.stderr.strip()}"
@@ -1361,7 +1441,8 @@ class GitMessageStore:
             # was something other than a race (a hook, permissions, a missing
             # branch) - retry within the bound and report that instead of
             # misattributing it to a failed rebase.
-            fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
+            fetched = self._git("fetch", "-q", "--no-tags", "--no-recurse-submodules",
+                            self.remote, self.ref, check=False)
             if fetched.returncode != 0:
                 continue
 
