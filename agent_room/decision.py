@@ -48,13 +48,20 @@ from .schema import (
 GATE_STATES = (
     "blocked_unbound",
     "blocked_no_decision",
+    "blocked_unmeasured",
     "blocked_rejected",
     "blocked_stale",
     "released",
 )
 
+#: The measurements a caller must take *now* for an approval to release.
+#: Both, always: an approval bound to a snapshot and a context releases only
+#: while both still hold, and a gate that checked neither has established
+#: nothing about either.
+REQUIRED_OBSERVATIONS = ("snapshot_sha256", "supervisor_context_sha256")
+
 __all__ = [
-    "HUMAN_PARTICIPANT", "GATE_STATES", "DecisionError", "GateBlocked",
+    "HUMAN_PARTICIPANT", "GATE_STATES", "REQUIRED_OBSERVATIONS", "DecisionError", "GateBlocked",
     "HumanDecisionAuthority", "binding_digest", "evaluate_gate",
     "assert_releasable", "pending_requests",
 ]
@@ -190,6 +197,14 @@ def evaluate_gate(
         },
         "decisions": [],
         "effective_decision": None,
+        # Named here so every report - including the early returns above a
+        # decision - says which measurements the caller did not take.
+        "unmeasured": [
+            name for name, value in (
+                ("snapshot_sha256", snapshot_sha256),
+                ("supervisor_context_sha256", supervisor_context_sha256),
+            ) if value is None
+        ],
         "reasons": [],
         "state": "blocked_unbound",
         "releasable": False,
@@ -282,16 +297,20 @@ def evaluate_gate(
             "the decision's own binding digest does not match its contents"
         )
 
-    # What the world looks like now, if the caller measured it.
+    # What the world looks like now. An unmeasured field is not a warning to
+    # note alongside a release - it is a fact the gate does not have, and an
+    # approval cannot be shown to still hold without it.
     observed = {
         "snapshot_sha256": snapshot_sha256,
         "supervisor_context_sha256": supervisor_context_sha256,
     }
-    for field, value in observed.items():
+    unmeasured = []
+    for field in REQUIRED_OBSERVATIONS:
+        value = observed[field]
         if value is None:
-            report["reasons"].append(
-                f"{field} was not measured at gate time, so this report cannot "
-                "show whether the approved state still holds"
+            unmeasured.append(
+                f"{field} was not measured at gate time, so the gate cannot "
+                "establish that the approved state still exists"
             )
             continue
         if value != action["binding"][field]:
@@ -299,7 +318,6 @@ def evaluate_gate(
                 f"{field} has moved since the decision: approved "
                 f"{action['binding'][field][:12]}…, now {value[:12]}…"
             )
-
     if record["decision"] == "reject":
         report["state"] = "blocked_rejected"
         report["reasons"].append(
@@ -307,11 +325,20 @@ def evaluate_gate(
             f"(decision {record['decision_id']})"
         )
         report["reasons"].extend(mismatches)
+        report["reasons"].extend(unmeasured)
         return report
 
+    # A measured mismatch is reported ahead of a missing measurement: we
+    # looked, and it had moved, which is the more actionable of the two.
     if mismatches:
         report["state"] = "blocked_stale"
         report["reasons"].extend(mismatches)
+        report["reasons"].extend(unmeasured)
+        return report
+
+    if unmeasured:
+        report["state"] = "blocked_unmeasured"
+        report["reasons"].extend(unmeasured)
         return report
 
     report["state"] = "released"
@@ -319,9 +346,25 @@ def evaluate_gate(
     return report
 
 
-def assert_releasable(store, request_message_id: str, **observed) -> dict:
-    """Raise `GateBlocked` unless the action is releasable right now."""
-    report = evaluate_gate(store, request_message_id, **observed)
+def assert_releasable(
+    store,
+    request_message_id: str,
+    *,
+    snapshot_sha256: str | None = None,
+    supervisor_context_sha256: str | None = None,
+) -> dict:
+    """Raise `GateBlocked` unless the action is releasable right now.
+
+    Both current measurements are required. They are named explicitly rather
+    than swept up by `**kwargs` so a misspelled one is a `TypeError` at the
+    call site instead of silently becoming an unmeasured - and therefore
+    blocked, but for the wrong reason - gate check.
+    """
+    report = evaluate_gate(
+        store, request_message_id,
+        snapshot_sha256=snapshot_sha256,
+        supervisor_context_sha256=supervisor_context_sha256,
+    )
     if not report["releasable"]:
         raise GateBlocked(
             f"action {report['action_id']!r} is {report['state']}: "

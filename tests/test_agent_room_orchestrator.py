@@ -132,13 +132,24 @@ def test_a_turn_is_refused_before_the_model_is_invoked(store, tmp_path):
 
 
 def test_no_unbounded_loop_exists_in_the_coordinator():
-    """Structural: there is no scheduler, retry loop or recursion here."""
+    """Structural: there is no scheduler, retry loop or recursion here.
+
+    Parsed rather than grepped. A substring search over the source also
+    matches the word "while" in a comment, which is how this test first
+    failed - on prose, not on a loop.
+    """
+    import ast
     import pathlib
 
-    source = (pathlib.Path(__file__).resolve().parents[1]
-              / "agent_room" / "orchestrator.py").read_text(encoding="utf-8")
-    assert "while " not in source
-    assert "time.sleep" not in source
+    module = ast.parse(
+        (pathlib.Path(__file__).resolve().parents[1]
+         / "agent_room" / "orchestrator.py").read_text(encoding="utf-8"))
+    nodes = list(ast.walk(module))
+    assert not [n for n in nodes if isinstance(n, ast.While)]
+    assert not [
+        n for n in nodes
+        if isinstance(n, ast.Attribute) and n.attr == "sleep"
+    ]
 
 
 def test_an_inspector_querying_the_task_does_not_spend_the_budget(
@@ -290,6 +301,31 @@ def test_a_recorded_decision_shows_up_in_reconstructed_state(
         "decision_id": "hd-live",
     }]
     assert state["pending_decisions"] == []
+
+
+def test_reconstruction_after_an_approval_is_never_releasable(store, tmp_path,
+                                                             coordinator):
+    """Reconstruction reads durable state; it measures nothing.
+
+    So an approval it finds must never come back as a live release. The gate
+    fails closed on unmeasured state, and reconstruction says outright that it
+    measured none.
+    """
+    _task, _claim, request = build_thread(store, tmp_path)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve",
+                                         decision_id="hd-approved")
+
+    state = coordinator.reconstruct()
+    assert state["gates_measured"] is False
+    assert state["recorded_decisions"][0]["decision"] == "approve"
+    assert state["pending_decisions"] == [], "it has been decided"
+
+    gates = state["bound_decision_gates"]
+    assert [g["request_message_id"] for g in gates] == [request["message_id"]]
+    assert gates[0]["state"] == "blocked_unmeasured"
+    assert not any(g["releasable"] for g in gates)
+    assert gates[0]["unmeasured"] == ["snapshot_sha256",
+                                      "supervisor_context_sha256"]
 
 
 def test_a_fresh_process_reconstructs_the_identical_state(store, tmp_path):

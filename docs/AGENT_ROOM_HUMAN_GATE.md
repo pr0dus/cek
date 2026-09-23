@@ -27,9 +27,29 @@ narrower and mechanically checkable:
 A model cannot author an approval by being clever about JSON, because there is no agent
 path to the write at all.
 
-What this does **not** establish: that the person at the keyboard is who they say they
-are. `sender.agent` remains provenance, not authentication — the same caveat the design
-states, unchanged.
+What this does **not** establish, stated plainly because the wording above could be read
+as stronger than it is:
+
+- **`--confirm-human` is an operator assertion, not authentication.** It is a flag. It
+  proves that whoever ran the command meant to run it, and nothing more. There is no
+  signature, no hardware token, no challenge, and no check of who is at the keyboard.
+- **The isolation is within Agent Room, not on this host.** The guarantee is that the
+  qualified participant and orchestrator surfaces cannot reach
+  `HumanDecisionAuthority` — not that no process on the machine can. Any process with
+  shell execution in this repository can invoke the CLI. The existing ChatGPT-Ubuntu
+  bridge is one such process: its bounded `run_command` can target
+  `/home/pr0/projects/cek`, so the human surface is reachable from it by construction.
+- `sender.agent` remains provenance, not authentication — the same caveat the design
+  states, unchanged.
+
+This is not a gap that opened here. Signed and hardware-backed human identity was
+deliberately deferred by the design (§6), and this issue does not reintroduce it. What
+matters is that nothing in this document claims a cryptographic or process-isolation
+guarantee that does not exist.
+
+The operating rule that does the real work is therefore procedural, not mechanical: the
+supervisor does not invoke `human-decide` until the user has explicitly approved or
+rejected in ChatGPT.
 
 ---
 
@@ -87,17 +107,29 @@ returns one state:
 |---|---|
 | `blocked_unbound` | no bound action, or a malformed one |
 | `blocked_no_decision` | nobody has decided; blocks indefinitely |
+| `blocked_unmeasured` | approved, but current state was not measured |
 | `blocked_rejected` | the human said no |
 | `blocked_stale` | the decision no longer matches what is bound or observed |
-| `released` | exact match, and only for this action |
+| `released` | exact match on **both** measurements, and only for this action |
 
-The observed digests are what a caller measured **now**. Supplying them is what makes an
-approval stop releasing once the code or the reviewed conversation moves; omitting them
-checks only the record's internal consistency, and the report says so in `reasons`
-rather than quietly checking less.
+The observed digests are what a caller measured **now**, and **both are required**. An
+approval says "this state, as I reviewed it, may go ahead"; a gate that has not looked at
+current state has established nothing about whether that state still exists, so it
+reports `blocked_unmeasured` rather than releasing on the record's internal consistency
+alone. `assert_releasable` names both parameters explicitly, so a misspelled one is a
+`TypeError` at the call site instead of a silently unmeasured check.
 
-Last decision wins, so a human may reject what they earlier approved. There is no
-timeout and no auto-approval.
+A measured mismatch outranks a missing measurement: if one digest was checked and had
+moved, the state is `blocked_stale`, because "we looked and it moved" is the more
+actionable answer. Either way the `unmeasured` field lists what was not checked.
+
+`Coordinator.reconstruct()` measures nothing — it reads durable state. Every gate it
+reports therefore comes back blocked, it says so with `gates_measured: false`, and it
+raises rather than ever emitting a releasable gate. Finding an approval in history is not
+the same as a live release.
+
+Last decision wins, so a human may reject what they earlier approved. There is no timeout
+and no auto-approval.
 
 ---
 
@@ -169,6 +201,7 @@ rather than a mutable path.
 agent-room --repo <room> --participant coordinator snapshot \
     --target <checkout> --base-commit <full oid>
 
+# both measurements, or the answer is blocked_unmeasured
 agent-room --repo <room> --participant coordinator gate-status \
     --request-id <id> --snapshot-sha256 <…> --context-sha256 <…>
 
@@ -180,4 +213,5 @@ agent-room --repo <room> --participant human human-decide \
 ```
 
 `--confirm-human` is required, and `human-decide` is never invoked by participant or
-orchestrator code. That is the point at which the machine stops and waits for a person.
+orchestrator code. That is the point at which the machine stops and waits for a person —
+enforced by capability separation, and by the operating rule in §1, not by authentication.

@@ -35,6 +35,7 @@ from .claude_participant import (
 from .codex_participant import CodexInvoker, CodexParticipant
 from .decision import (
     GATE_STATES,
+    REQUIRED_OBSERVATIONS,
     DecisionError,
     GateBlocked,
     HumanDecisionAuthority,
@@ -82,6 +83,7 @@ __all__ = [
     "DecisionError",
     "GateBlocked",
     "GATE_STATES",
+    "REQUIRED_OBSERVATIONS",
     "evaluate_gate",
     "assert_releasable",
     "binding_digest",

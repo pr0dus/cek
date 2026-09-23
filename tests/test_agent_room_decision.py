@@ -379,14 +379,110 @@ def test_a_decision_from_a_non_human_identity_carries_no_authority(store, room):
     assert any("not the reserved human identity" in r for r in report["reasons"])
 
 
-def test_gate_status_without_measuring_current_state_says_so(store, room):
+# ===== 3b. an unmeasured gate never releases ===============================
+
+def test_an_approval_does_not_release_when_nothing_was_measured(store, room):
+    """The gate must fail closed, not warn and release anyway.
+
+    An approval says "this state, as I reviewed it, may go ahead". A gate that
+    has not looked at current state has established nothing about whether that
+    state still exists, so it cannot say the action is releasable - however
+    internally consistent the stored record is.
+    """
     request = post_decision_request(room)
     HumanDecisionAuthority(store).record(request["message_id"], "approve")
+
     report = evaluate_gate(store, request["message_id"])
-    assert report["releasable"], "internally consistent"
-    assert any("was not measured at gate time" in r for r in report["reasons"]), (
-        "a gate check that measured nothing must admit it"
-    )
+    assert report["state"] == "blocked_unmeasured"
+    assert report["releasable"] is False
+    assert report["unmeasured"] == ["snapshot_sha256",
+                                    "supervisor_context_sha256"]
+    assert all("cannot establish that the approved state still exists" in r
+               for r in report["reasons"])
+
+
+@pytest.mark.parametrize("measured,missing", [
+    ("snapshot_sha256", "supervisor_context_sha256"),
+    ("supervisor_context_sha256", "snapshot_sha256"),
+])
+def test_measuring_only_one_of_the_two_still_blocks(store, room, measured,
+                                                    missing):
+    """Half a measurement is not half a release; it is no release."""
+    request = post_decision_request(room)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve")
+
+    observations = {"snapshot_sha256": SNAPSHOT_SHA,
+                    "supervisor_context_sha256": CONTEXT_SHA}
+    report = evaluate_gate(
+        store, request["message_id"],
+        **{measured: observations[measured], missing: None})
+    assert report["state"] == "blocked_unmeasured"
+    assert report["releasable"] is False
+    assert report["unmeasured"] == [missing]
+
+
+def test_only_both_exact_measurements_release(store, room):
+    request = post_decision_request(room)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve")
+    report = evaluate_gate(store, request["message_id"],
+                           snapshot_sha256=SNAPSHOT_SHA,
+                           supervisor_context_sha256=CONTEXT_SHA)
+    assert report["state"] == "released"
+    assert report["releasable"] is True
+    assert report["unmeasured"] == []
+
+
+def test_a_measured_mismatch_is_reported_ahead_of_a_missing_measurement(
+        store, room):
+    """We looked and it had moved - that is more actionable than "we did not look"."""
+    request = post_decision_request(room)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve")
+    report = evaluate_gate(store, request["message_id"],
+                           snapshot_sha256="9" * 64,
+                           supervisor_context_sha256=None)
+    assert report["state"] == "blocked_stale"
+    assert report["unmeasured"] == ["supervisor_context_sha256"]
+    assert any("snapshot_sha256 has moved" in r for r in report["reasons"])
+    assert any("was not measured" in r for r in report["reasons"])
+
+
+def test_assert_releasable_requires_both_measurements(store, room):
+    request = post_decision_request(room)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve")
+
+    for observations in (
+        {},
+        {"snapshot_sha256": SNAPSHOT_SHA},
+        {"supervisor_context_sha256": CONTEXT_SHA},
+    ):
+        with pytest.raises(GateBlocked) as caught:
+            assert_releasable(store, request["message_id"], **observations)
+        assert caught.value.report["state"] == "blocked_unmeasured"
+
+    assert assert_releasable(
+        store, request["message_id"],
+        snapshot_sha256=SNAPSHOT_SHA,
+        supervisor_context_sha256=CONTEXT_SHA)["releasable"]
+
+
+def test_assert_releasable_rejects_a_misspelled_observation(store, room):
+    """Named parameters, so a typo cannot quietly become "unmeasured"."""
+    request = post_decision_request(room)
+    with pytest.raises(TypeError):
+        assert_releasable(store, request["message_id"], snapshot_sha="x" * 64)
+
+
+def test_the_cli_gate_status_without_both_measurements_blocks(store, room,
+                                                              capsys):
+    from agent_room.cli import main
+
+    request = post_decision_request(room)
+    HumanDecisionAuthority(store).record(request["message_id"], "approve")
+    main(["--repo", str(store.workdir), "--participant", "coordinator",
+          "gate-status", "--request-id", request["message_id"]])
+    report = json.loads(capsys.readouterr().out)
+    assert report["state"] == "blocked_unmeasured"
+    assert report["releasable"] is False
 
 
 def test_gate_blocked_carries_the_full_report(store, room):

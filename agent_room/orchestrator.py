@@ -259,6 +259,12 @@ class Coordinator:
             if action:
                 snapshots.add(action["binding"]["snapshot_sha256"])
 
+        # Reconstruction measures nothing: it reads durable state, it does not
+        # go and look at a checkout or re-derive a supervisor packet. So every
+        # gate it reports is an unmeasured one, and an unmeasured gate is
+        # blocked by construction. Saying so explicitly matters more after an
+        # approval exists than before - that is exactly when a reconstructed
+        # record could otherwise be mistaken for a live release.
         gates = []
         for pending in pending_requests(self.store, thread_id):
             report = evaluate_gate(self.store, pending["request_message_id"])
@@ -267,6 +273,28 @@ class Coordinator:
                 "action_id": pending["action_id"],
                 "state": report["state"],
                 "releasable": report["releasable"],
+            })
+
+        bound_gates = []
+        for message in messages:
+            if message["type"] != "decision_request" or not message.get("action"):
+                continue
+            report = evaluate_gate(self.store, message["message_id"])
+            if report["releasable"]:
+                # Unreachable while evaluate_gate fails closed on unmeasured
+                # state. Kept because the alternative to an assertion here is
+                # a reconstructed report that quietly says "go ahead".
+                raise AgentRoomError(
+                    f"reconstruction reported action "
+                    f"{report['action_id']!r} as releasable without measuring "
+                    "current state; the gate must fail closed"
+                )
+            bound_gates.append({
+                "request_message_id": message["message_id"],
+                "action_id": message["action"]["action_id"],
+                "state": report["state"],
+                "releasable": False,
+                "unmeasured": report["unmeasured"],
             })
         decided = [
             {
@@ -292,6 +320,10 @@ class Coordinator:
             "proof_run_ids": sorted(proofs),
             "snapshot_sha256s": sorted(snapshots),
             "pending_decisions": gates,
+            #: Every bound decision request, decided or not, with the state it
+            #: has when nothing has been measured. Never releasable.
+            "bound_decision_gates": bound_gates,
+            "gates_measured": False,
             "recorded_decisions": decided,
             "message_ids": [m["message_id"] for m in messages],
         }
