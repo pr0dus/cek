@@ -366,5 +366,57 @@ class TrustCheckpoint:
                 "advanced": candidate != accepted,
                 "trust_generation": generation}
 
+    def verify_candidate(self, candidate_store) -> dict:
+        """Verify a fetched candidate **without advancing anything**.
+
+        The mutating path (`accept`) reads the ref it is about to record, so
+        using it on a candidate would mean installing first and checking
+        afterwards — the shape this whole module exists to avoid. This runs
+        every check against the candidate where it sits, on its own ref, and
+        returns a report. Nothing is written, so a candidate that fails leaves
+        the last accepted state exactly as it was.
+        """
+        candidate = candidate_store.current_tip()
+        if not _is_oid(candidate):
+            raise CheckpointError(
+                f"candidate tip {candidate!r} must be a full Git object id")
+
+        genesis = candidate_store.room_id()
+        if genesis != self.document["genesis"]:
+            raise AnchorMismatch(
+                f"the candidate's root is {genesis[:12]}, not the anchored "
+                f"genesis {self.document['genesis'][:12]}; an unrelated "
+                "history is not an update")
+
+        accepted = self.document["last_accepted_tip"]
+        if candidate != accepted and not candidate_store.is_strict_ancestor(
+                accepted, candidate):
+            raise RollbackRejected(
+                f"candidate {candidate[:12]} does not descend from the last "
+                f"accepted {accepted[:12]}. A rolled-back remote and a "
+                "rewritten one look identical from here, and both are refused "
+                "before anything local moves.")
+
+        generation = getattr(candidate_store.trust, "generation", None)
+        previous = self.document.get("trust_generation")
+        if generation is not None and previous is not None and \
+                generation < previous:
+            raise RollbackRejected(
+                f"the trust policy generation went backwards "
+                f"({previous} -> {generation})")
+        digest = _policy_digest(candidate_store.trust)
+        if generation == previous and \
+                digest != self.document.get("trust_policy_sha256"):
+            raise RollbackRejected(
+                "the trust policy changed without advancing its generation")
+
+        # Full verification of the candidate itself: namespace, append-only
+        # history, digests, references, receipt lifecycle, signatures.
+        verified = candidate_store.verify_store()
+        return {"candidate_tip": candidate, "accepted_tip": accepted,
+                "verified_messages": verified,
+                "advances": candidate != accepted,
+                "trust_generation": generation}
+
     def status(self) -> dict:
         return {k: v for k, v in self.document.items()}

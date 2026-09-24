@@ -286,12 +286,14 @@ def test_TRANSPORT_CHECKPOINT_REJECTS_ROLLBACK(env):
     advanced = env["checkpoint"].document["last_accepted_tip"]
 
     git(env["room"].workdir, "reset", "-q", "--hard", env["room"].room_id())
-    request_id = submit(env, request_document("status"))
-    run_worker(env)
+    submit(env, request_document("status"))
+    summary = run_worker(env)
 
-    result = result_for(env, request_id)
-    assert result["status"] == "failed"
-    assert "RollbackRejected" in result["detail"]["error_type"]
+    # A synchronisation failure is not a per-request result: nothing about the
+    # room can be trusted, so nothing is attempted and nothing is claimed.
+    assert summary["lifecycle"]["status"] == "failed"
+    assert summary["lifecycle"]["error_type"] == "RollbackRejected"
+    assert summary["processed"] == 0
     reloaded = TrustCheckpoint.load(env["config"].checkpoint_path)
     assert reloaded.document["last_accepted_tip"] == advanced
 
@@ -312,13 +314,12 @@ def test_TRANSPORT_BAD_ROOM_SIGNATURE_BLOCKS_BEFORE_OPERATION(env):
     git(env["room"].workdir, "add", "-f", "--", rel)
     git(env["room"].workdir, "commit", "-q", "-m", "forged")
 
-    request_id = submit(env, request_document(
+    submit(env, request_document(
         "supervisor_export", {"message_id": env["target"]}))
-    run_worker(env)
-    result = result_for(env, request_id)
-    assert result["status"] == "failed"
-    assert "Unauthenticated" in result["detail"]["error_type"]
-    assert "packet" not in result["detail"]
+    summary = run_worker(env)
+    assert summary["lifecycle"]["status"] == "failed"
+    assert "Unauthenticated" in summary["lifecycle"]["error_type"]
+    assert summary["processed"] == 0, "no operation ran on unverified state"
 
 
 # ===== replay, races, crash ================================================
@@ -568,11 +569,17 @@ def test_the_transport_imports_no_authority_or_model_surface():
 
 
 def test_the_only_git_surface_is_the_fixed_control_helper():
-    source = code_of(PACKAGE / "control_store.py")
-    assert "shell=True" not in source
-    # argv is built from constants and validated ids, never from a request.
-    assert "run_bounded(" in source
-    assert "subprocess" not in source, "it goes through the reviewed runner"
+    """One reviewed Git runner for the whole transport, not three."""
+    for name in ("control_store.py", "transport.py"):
+        source = code_of(PACKAGE / name)
+        assert "shell=True" not in source
+        assert "subprocess" not in source, f"{name} should use run_git"
+    runner = code_of(PACKAGE / "remote_sync.py")
+    assert "run_bounded(" in runner, "the runner goes through the bounded one"
+    assert "shell=True" not in runner
+    assert "subprocess" not in runner
+    # argv is built from constants and values this module validated.
+    assert "_validate(" in runner
 
 
 # ===== the deployment template =============================================

@@ -45,7 +45,7 @@ the existing bridge on this host as it stands.
 
 That is not something S3 fixes. Changing sudo policy is a server security
 change and is human-gated. It is recorded here as an **activation blocker**:
-the dedicated-user boundary in §6 is real and correct, and it is worth
+the dedicated-user boundary in §7 is real and correct, and it is worth
 nothing on this machine until passwordless root for `pr0` is resolved. The
 permission-boundary script refuses to report success while it holds, rather
 than reporting a boundary that does not exist.
@@ -87,11 +87,13 @@ trust-policy update, checkpoint path, release operation, proof, model
 invocation, tool profile, or permission widening. Unknown operation and
 unknown field both fail closed.
 
-`agent_room/transport.py` contains no `subprocess`, `exec`, `eval`, shell or
-`run_bounded` reference at all; the only subprocess surface in the transport
-is the fixed Git helper in `control_store.py`, whose argv is built from
-constants and validated uuid7 ids. Static tests enforce both, scanning code
-with comments and docstrings stripped.
+`agent_room/transport.py` and `control_store.py` contain no `subprocess`,
+`exec`, `eval` or shell reference at all. The whole transport has **one**
+subprocess surface — `remote_sync.run_git` — whose argv is built from
+constants, configured names it validated, and object ids it read from Git
+itself. Static tests enforce this, scanning code with comments and docstrings
+stripped, because scanning raw text finds the modules' own prose about not
+having one.
 
 ### It is not a signing oracle
 
@@ -154,35 +156,118 @@ content is a conflict and is never overwritten.
 | requests per invocation | 8 |
 | tracked control paths | 4096 |
 | Git command | 60 s, 8 MiB output |
-| service runtime | `RuntimeMaxSec=900` |
+| worker deadline | `worker_timeout_seconds`, enforced across the run |
+| service runtime | `RuntimeMaxSec=900` — the cgroup-level hard stop |
 
 Oversize input fails before anything durable or expensive happens.
 
 ---
 
-## 4. Checkpoint before trust
+## 4. Synchronisation, verification and delivery
 
-Every operation that reads or mutates the room runs the S2 monotonic
-checkpoint acceptance first — full namespace, history, digest, reference,
-receipt-lifecycle and signature verification, descendant-only advance. A fetch
-is not a reason to trust what arrived.
+The worker owns the whole lifecycle. Nothing outside it runs Git for Agent
+Room — the previous version operated on local checkouts, which is either a
+service that never sees new work or an unspecified broad synchronisation path,
+and both are what S3 exists to remove. Measured against that version:
 
-If the checkpoint refuses — rollback, non-descendant replacement, invalid
-signature, a policy that moved without a signed update — no export, no import,
-no status, no result claiming success, and the checkpoint does not move.
+```
+REMOTE_ONLY_REQUEST_SEEN        processed 0   — the worker never saw it
+LOCAL_RESULT_REACHES_REMOTE     on_remote false
+REMOTE_CONTEXT_RACE_SAME_THREAD posted        — a review of a head that had moved
+```
 
-After a legitimate import the worker re-accepts, so success is never reported
-against a room state nobody verified.
+### The run, in order
 
-No request field supplies or overrides the checkpoint path, trust-policy path,
-repo path, room ref or remote.
+1. **Recover.** A crash can leave a room commit that was never pushed. If the
+   remote already has it, it stays; otherwise it is discarded back to the last
+   accepted checkpoint. Nobody has seen an undelivered commit, so discarding
+   it loses nothing durable — and keeping it would mean either delivering a
+   review of a head that has since moved, or carrying an unauditable local
+   divergence forward.
+2. **Synchronise the room.** Fetch the fixed remote ref onto a **separate
+   local candidate ref**; verify it *there* — genesis, descent from the
+   accepted checkpoint, policy generation and digest, and the full S2
+   verification of that exact candidate; install with `merge --ff-only` only
+   after it passes; then persist the checkpoint for the state now installed. A
+   candidate that fails leaves the local room exactly where it was. This is
+   deliberately not `git pull` or fetch-then-reset, both of which install
+   first and check afterwards.
+3. **Synchronise the control queue.** Fetch, verify closed namespace and
+   append-only history on the candidate, require descent from the service's
+   own anchor, install.
+4. **Deliver.** Results this service produced but has not confirmed on the
+   remote go out before any new work is taken on.
+5. **Process.** Bounded new requests, each against verified state.
+
+If any of 1–4 fails, the run reports a lifecycle failure and processes
+nothing: no export, no import, no status, no result claiming success for work
+that was never attempted, and no checkpoint movement.
+
+### Delivery is a compare-and-swap
+
+A supervisor response reviewed against head H must not be rebased onto H+1 and
+delivered as though it still applied. The generic `GitMessageStore.push()`
+rebases on a non-fast-forward, so the transport's room store is constructed
+with **no remote** and delivery is done here instead:
+
+1. synchronise and verify remote head H;
+2. the import boundary checks `context_sha256` against H;
+3. sign and commit the response locally on top of H;
+4. push with `--force-with-lease=refs/heads/<room>:H` — it lands only while
+   the remote is still H. The push is a fast-forward from H, so the lease is
+   an atomic comparison and never discards valid history;
+5. if the ref moved: discard the local commit, re-synchronise, recompute the
+   reviewed thread's context against the new head. **Changed context fails
+   stale and is not delivered.** Identical context — an unrelated thread
+   moved — may be reconstructed and retried, at most 3 times;
+6. after delivery, re-observe the settled head and advance the checkpoint.
+
+No request field supplies or overrides any ref, remote, repository, path,
+checkpoint or policy.
+
+### Control egress
+
+Push the exact ref; never forced. On a non-fast-forward, fetch and verify the
+remote candidate first, then re-apply the pending results on top — request and
+result paths are unique per id, so nothing of the other writer's is discarded
+and nothing of ours is overwritten. An identical result already present is
+idempotent; a *different* result at the same id is a conflict and fails
+closed. Bounded at 3 attempts.
+
+## 5. Result authenticity: what a forged result can and cannot do
+
+The control-repository writer is in the threat model and can write a
+syntactically valid `results/<request_id>.json`. So: **how does anyone know a
+result came from the worker rather than from that writer?**
+
+The answer taken here is option B — control results are **untrusted
+telemetry, never authority** — with one thing made explicit that was
+previously an unexamined trust decision.
+
+The worker does **not** decide what to run by looking for result files. It
+keeps a service-owned ledger in its own owner-only state directory and selects
+requests that are not in it. A forged result therefore cannot make the service
+skip an operation. The earlier version filtered by "has a result", which handed
+that decision to the attacker; a regression now covers it.
+
+For success claims, every result carries `room_tip` — the room head at
+completion — which the far side can check against the signed, checkpointed
+room rather than trusting the artifact's provenance.
+
+What a forged result *can* do, stated as the documented limit: because
+artifacts are immutable, a pre-written result at a request id means the real
+result can never be stored there, and the worker records a `conflict`. That is
+a denial of service by a party that could equally stop sending requests. It
+cannot cause or suppress a consequential Agent Room side effect: selection is
+ledger-driven, and the room mutation is idempotent through the participant
+turn protocol.
 
 ---
 
-## 5. Replay, crashes and races
+## 6. Replay, crashes and races
 
-- Each immutable request id is processed at most once; a result artifact means
-  done, whatever happened to the worker that produced it.
+- Each immutable request id is processed at most once, decided by the
+  service's ledger — not by the presence of a result in the untrusted queue.
 - A crash after the room mutation but before the result write reconciles on
   restart rather than importing twice: the participant turn protocol finds the
   durable response and returns `already_responded`. There is a regression for
@@ -195,7 +280,7 @@ repo path, room ref or remote.
 
 ---
 
-## 6. Filesystem, Unix identity and key separation
+## 7. Filesystem, Unix identity and key separation
 
 ### Root-owned, immutable
 
@@ -238,7 +323,7 @@ policy.
 
 ---
 
-## 7. Least-privilege repository and credential design
+## 8. Least-privilege repository and credential design
 
 A **dedicated private repository**, used only for Agent Room transport and
 control, separate from public `pr0dus/cek`, from the authoritative NEWI/CEK
@@ -274,7 +359,7 @@ checkpoint remain mandatory regardless of what the account plan offers.
 
 ---
 
-## 8. The unit, and what it scores
+## 9. The unit, and what it scores
 
 A **one-shot service plus a timer**, not a daemon: the lifecycle and the
 cgroup belong to systemd, each run is bounded, and a failure is a failed unit
@@ -309,7 +394,7 @@ not the goal.
 
 ---
 
-## 9. The detached-`setsid()` escape, closed in production
+## 10. The detached-`setsid()` escape, closed in production
 
 S1 documented, and still asserts, that `run_bounded()` cannot kill a
 descendant which calls `setsid()`: `killpg` signals a process *group*, and the
@@ -338,9 +423,9 @@ service.
 
 ---
 
-## 10. Deployment, migration and rollback — *not executed*
+## 11. Deployment, migration and rollback — *not executed*
 
-1. Host precheck: pending security updates and reboot state (§12); resolve the
+1. Host precheck: pending security updates and reboot state (§13); resolve the
    passwordless-root blocker in §1 with the human.
 2. `groupadd --system agentroom && useradd --system --gid agentroom
    --home-dir /var/lib/agent-room --shell /usr/sbin/nologin agentroom`.
@@ -384,7 +469,7 @@ this stage removed.
 
 ---
 
-## 11. What the transport cannot reach
+## 12. What the transport cannot reach
 
 It does not open project files, check out source repositories, run tests or
 proofs, apply patches, or browse `/home/pr0/projects` — `InaccessiblePaths`
@@ -395,7 +480,7 @@ not smuggled in here.
 
 ---
 
-## 12. Host patch state (read-only, 2026-09-24)
+## 13. Host patch state (read-only, 2026-09-24)
 
 - 10 pending upgrades, **none from the security pocket**: `krb5` and
   `netplan` from `noble-updates`, plus `google-chrome-stable` from Google's own

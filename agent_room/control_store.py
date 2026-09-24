@@ -11,11 +11,19 @@ signed research state; this one carries an RPC queue for exactly three narrow
 operations. Sharing a store between them would mean one namespace rule, one
 set of limits and one blast radius for two very different kinds of content.
 
-The Git helper here is the only subprocess surface the transport has, and it
-exists because Git is unavoidable. Its argv is constructed internally, never
-from a request; there is no shell, the environment is sanitised, hooks are
-disabled, and every call is bounded in time and output. `transport.py` itself
-contains no subprocess reference at all, and a static test keeps it that way.
+Git goes through the single reviewed runner in `remote_sync`, so the whole
+transport has one subprocess surface rather than three. Its argv is
+constructed from constants and validated uuid7 ids, never from a request;
+there is no shell, the environment is sanitised, hooks are disabled, and every
+call is bounded. `transport.py` itself contains no subprocess reference at all,
+and a static test keeps it that way.
+
+**Rollback matters here even though the content does not.** The writer is
+untrusted, so nothing on this branch is authority — but if a force-push erases
+a result the service already produced, the worker must not conclude the request
+was never handled and do it again. The local control history is therefore a
+monotonic availability anchor: a remote candidate must descend from the last
+one the service accepted, or the sync is refused.
 """
 
 import datetime as dt
@@ -27,7 +35,7 @@ from pathlib import Path
 from . import canonical
 from .errors import AgentRoomError
 from .ids import is_uuid7
-from .process import run_bounded, sanitised_env
+from .remote_sync import run_git
 
 CONTROL_SCHEMA_VERSION = 1
 
@@ -44,16 +52,6 @@ RESULT_RE = re.compile(
 #: Regular, non-executable files. A symlink, an executable bit or a gitlink on
 #: a branch a hostile writer controls is not content, it is a lever.
 ALLOWED_BLOB_MODE = "100644"
-
-GIT_TIMEOUT_SECONDS = 60
-
-#: Applied to every Git call. A hook on an attacker-writable branch would be
-#: attacker-supplied code running inside the transport.
-HARDENED_GIT_CONFIG = (
-    "-c", "core.hooksPath=/dev/null",
-    "-c", "core.fsmonitor=false",
-    "-c", "protocol.ext.allow=never",
-)
 
 #: Hard bounds. The writer is untrusted, so every one of these is a promise
 #: about memory and work rather than a formatting preference.
@@ -116,25 +114,17 @@ class ControlStore:
 
     # -- git ---------------------------------------------------------------
     def _git(self, *args: str, check: bool = True):
-        """Fixed argv, no shell, sanitised environment, bounded.
+        """The one reviewed Git runner, with this store's working directory.
 
-        Nothing from a request ever reaches this. The only caller-varying
-        values are paths this class constructs from validated uuid7 ids.
+        Nothing from a request ever reaches it. The only caller-varying values
+        are paths this class builds from validated uuid7 ids.
         """
-        result = run_bounded(
-            ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args],
-            cwd=self.workdir, timeout=GIT_TIMEOUT_SECONDS,
-            env=sanitised_env(GIT_NO_REPLACE_OBJECTS="1",
-                              GIT_TERMINAL_PROMPT="0"),
-            max_output_bytes=8 * 1024 * 1024,
-        )
-        if result.timed_out:
-            raise ControlError(f"git {args[0]} timed out in {self.workdir}")
-        if check and result.returncode != 0:
-            raise ControlError(
-                f"git {' '.join(args)} failed ({result.returncode}): "
-                f"{result.stderr.decode('utf-8', 'replace').strip()[:300]}")
-        return result
+        from .remote_sync import SyncError
+
+        try:
+            return run_git(self.workdir, *args, check=check)
+        except SyncError as exc:
+            raise ControlError(str(exc)) from exc
 
     @classmethod
     def initialise(cls, workdir, branch: str = "agent-room-control"):
@@ -254,8 +244,50 @@ class ControlStore:
             raise ControlError(f"{path} is not a JSON object")
         return document
 
+    def current_tip(self) -> str | None:
+        result = self._git("rev-parse", "--verify", self.ref, check=False)
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode().strip()
+
+    def genesis(self) -> str:
+        """The control branch's root commit: its identity across fetches."""
+        result = self._git("rev-list", "--max-parents=0", self.ref)
+        roots = [line for line in result.stdout.decode().split() if line]
+        if len(roots) != 1:
+            raise ControlError(
+                f"the control branch has {len(roots)} root commits; one "
+                "origin means one queue")
+        return roots[0]
+
+    def verify_history(self) -> dict:
+        """Namespace and append-only history. Safe on an unverified candidate."""
+        history = self._history()
+        return {"tracked": len(history), "tip": self.current_tip()}
+
+    def requests(self) -> list:
+        """Every request artifact, oldest first.
+
+        Deliberately not filtered by whether a result exists: the result files
+        are written by the same untrusted party as the requests, so "has a
+        result" is that party's claim, not a record of what this service did.
+        The worker filters against its own ledger instead.
+        """
+        history = self._history()
+        entries = []
+        for path, commit in history.items():
+            match = REQUEST_RE.match(path)
+            if match:
+                entries.append({"request_id": match.group(1), "path": path,
+                                "commit": commit})
+        return entries
+
     def pending(self) -> list:
-        """Requests with no result yet, oldest first, bounded."""
+        """Requests with no result yet, oldest first, bounded.
+
+        A backlog measure for the queue's own health. It is *not* how the
+        worker decides what to run — see `requests()`.
+        """
         history = self._history()
         requests, results = {}, set()
         for path, commit in history.items():
