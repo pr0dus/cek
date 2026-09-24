@@ -321,16 +321,14 @@ class TransportWorker:
 
     The order matters and is the state machine:
 
-    1. **Recover.** A crash can leave a room commit that was never delivered.
-       Reset to the last accepted checkpoint unless the remote already has it.
-    2. **Synchronise the room.** Fetch to a candidate ref, verify it there in
-       full, install only on success.
-    3. **Synchronise the control queue.** Fetch, verify namespace and
-       append-only history, require descent from the service's own anchor,
-       install.
-    4. **Deliver.** Results this service produced but has not confirmed on the
+    1. **Reconcile.** Require both configured refs, verify the control queue,
+       and reconcile uncertain imports before generic recovery or new work.
+       Unknown delivery is never a terminal processed request.
+    2. **Recover and synchronise the room.** Fetch to a candidate ref, verify
+       it there in full, install only on success.
+    3. **Deliver.** Results this service produced but has not confirmed on the
        remote go out before any new work is taken on.
-    5. **Process.** Bounded new requests, each against verified state.
+    4. **Process.** Bounded new requests, each against verified state.
 
     A deadline runs across all of it, so `worker_timeout_seconds` is enforced
     here and not merely declared; `RuntimeMaxSec` remains the cgroup-level
@@ -370,13 +368,13 @@ class TransportWorker:
             trust=TrustPolicy.load(self.config.trust_policy_path))
 
     def _room_remote(self) -> RoomRemote | None:
-        if not self.config.room_remote:
+        if self.config.room_remote is None:
             return None
         return RoomRemote(self.config.room_workdir, self.config.room_remote,
                           self.config.room_branch)
 
     def _control_remote(self) -> ControlRemote | None:
-        if not self.config.control_remote:
+        if self.config.control_remote is None:
             return None
         return ControlRemote(self.config.control_workdir,
                              self.config.control_remote,
@@ -416,6 +414,8 @@ class TransportWorker:
         un-auditable local divergence forward. If the remote turns out to have
         it after all, it stays and the ordinary sync installs it.
         """
+        if self._ledger().get("uncertain_imports"):
+            raise TransportError("uncertain imports must be reconciled before room recovery")
         remote = self._room_remote()
         store = self._room_store()
         local = store.current_tip()
@@ -424,8 +424,8 @@ class TransportWorker:
             # and local commits are simply the room. Nothing to recover.
             return {"recovered": False, "mode": "local", "tip": local}
 
-        remote_tip = remote.remote_tip()
-        if remote_tip is None or local == remote_tip:
+        remote_tip = remote.required_remote_tip()
+        if local == remote_tip:
             return {"recovered": False, "tip": local}
         if remote.contains_remotely(local):
             # The crash was after the push: it is durable, leave it.
@@ -463,10 +463,6 @@ class TransportWorker:
 
         candidate_branch = f"{self.config.room_branch}{CANDIDATE_SUFFIX}"
         candidate = remote.fetch_candidate(candidate_branch)
-        if candidate is None:
-            store = self._room_store()
-            return {"mode": "no-remote-ref", **checkpoint.accept(store)}
-
         report = checkpoint.verify_candidate(self._candidate_store())
         remote.install(report["candidate_tip"])
         # Persist for exactly the state now installed locally, re-verifying
@@ -494,11 +490,6 @@ class TransportWorker:
 
         candidate_branch = f"{self.config.control_branch}{CANDIDATE_SUFFIX}"
         candidate = remote.fetch_candidate(candidate_branch)
-        if candidate is None:
-            control.verify_history()
-            self._anchor_control(anchor, control)
-            return {"mode": "no-remote-ref", "tip": control.current_tip()}
-
         probe = ControlStore(self.config.control_workdir, candidate_branch)
         probe.verify_history()
         if probe.genesis() != self._expected_control_genesis(anchor, probe):
@@ -659,8 +650,7 @@ class TransportWorker:
         """The remote's own result artifacts, or None if it cannot be read."""
         probe_branch = f"{self.config.control_branch}{CANDIDATE_SUFFIX}-confirm"
         try:
-            if remote.fetch_candidate(probe_branch) is None:
-                return {}
+            remote.fetch_candidate(probe_branch)
             probe = ControlStore(self.config.control_workdir, probe_branch)
             history = probe._history()
             return {
@@ -702,7 +692,8 @@ class TransportWorker:
         return {"packet": packet}
 
     def _op_supervisor_import(self, store: GitMessageStore,
-                              params: dict) -> dict:
+                              params: dict, *, request_id: str,
+                              request_sha256: str, attempts: int = 0) -> dict:
         """Import under an exact lease on the head the review was bound to.
 
         The freshness check inside `import_response` is against local state.
@@ -715,50 +706,116 @@ class TransportWorker:
         """
         remote = self._room_remote()
         document = params["response"]
-        thread_before = self._reviewed_context(store, document)
+        if attempts == 0 and request_id in (self._ledger().get("uncertain_imports") or {}):
+            raise TransportError("request has an uncertain import; reconcile it before new work")
+        self._check_clock("constructing a supervisor response")
+        expected = store.current_tip()
+        result = self._boundary(store).import_response(json.dumps(document))
+        if remote is None:
+            return {"import": result, "delivery": {"mode": "local"}}
+        message = store.resolve_message(result["response_message_id"])
+        # Durable before the first push, including the crash-after-acceptance
+        # window. Only reconciliation or a proven stale refusal removes this.
+        ledger = self._ledger()
+        uncertain = dict(ledger.get("uncertain_imports") or {})
+        uncertain[request_id] = {
+            "state": "uncertain_delivery", "request_id": request_id,
+            "request_sha256": request_sha256, "params": params,
+            "target_message_id": document["target_message_id"],
+            "context_sha256": document["context_sha256"],
+            "response_message_id": result["response_message_id"],
+            "response_sha256": message[canonical.DIGEST_FIELD],
+            "local_tip": store.current_tip(), "expected_remote_head": expected,
+            "attempts": attempts + 1, "import": result,
+        }
+        ledger.set(uncertain_imports=uncertain)
+        return self._deliver_uncertain_import(request_id)
 
-        for attempt in range(MAX_DELIVERY_ATTEMPTS):
-            self._check_clock("delivering a supervisor response")
-            expected = store.current_tip()
-            result = self._boundary(store).import_response(
-                json.dumps(document))
-            if remote is None:
-                return {"import": result, "delivery": {"mode": "local"}}
+    def _deliver_uncertain_import(self, request_id: str, *, inspections: int = 0) -> dict:
+        """Reconcile one exact signed artifact before it can become terminal.
+
+        Unknown: leave it and stop. Present: verify and accept. Absent on the
+        same head: push the very same commit. Absent on a moved head: only a
+        verified candidate may replace it; recompute context before rebuilding.
+        """
+        remote = self._room_remote()
+        if remote is None:
+            raise TransportError("an uncertain remote import cannot become local mode")
+        if inspections >= MAX_DELIVERY_ATTEMPTS:
+            raise AmbiguousDelivery("bounded remote reconciliation pass exhausted")
+        entry = self._ledger().get("uncertain_imports")[request_id]
+        self._check_clock("reconciling a supervisor response")
+        local = self._room_store()
+        candidate = remote.fetch_candidate(f"{self.config.room_branch}{CANDIDATE_SUFFIX}")
+        checkpoint = TrustCheckpoint.load(self.config.checkpoint_path)
+        checkpoint.verify_candidate(self._candidate_store())
+        probe = self._candidate_store()
+        found = probe.resolve_message(entry["response_message_id"])
+        if found is not None:
+            if found[canonical.DIGEST_FIELD] != entry["response_sha256"] or not remote.is_ancestor(
+                    entry["local_tip"], candidate):
+                raise TransportError("uncertain response identity/commit mismatch")
+            remote.install(candidate)
+            settled = checkpoint.accept(self._room_store())
+            return {"import": entry["import"], "checkpoint": settled,
+                    "delivery": {"mode": "remote", "tip": candidate,
+                                 "lease": entry["expected_remote_head"],
+                                 "status": "reconciled", "attempts": entry["attempts"]}}
+
+        expected = entry["expected_remote_head"]
+        if local.current_tip() != entry["local_tip"]:
+            # A crash may have occurred after installing the verified absent
+            # candidate below. That exact independently verified state is safe
+            # to re-evaluate, but an arbitrary local branch is not.
+            if local.current_tip() != candidate:
+                raise TransportError("uncertain response local tip changed unexpectedly")
+        elif candidate == expected:
+            local.verify_store()
+            message = local.resolve_message(entry["response_message_id"])
+            if message is None or message[canonical.DIGEST_FIELD] != entry["response_sha256"]:
+                raise TransportError("retained signed response is missing or changed")
             try:
                 pushed = remote.push_with_lease(expected)
-            except AmbiguousDelivery as exc:
-                # Neither delivered nor demonstrably refused. Do not sign a
-                # second response: the local commit stays, and the next run's
-                # recovery reconciles whether it landed.
-                return {"import": result,
-                        "delivery": {"mode": "remote", "status": "ambiguous",
-                                     "tip": store.current_tip(),
-                                     "lease": expected,
-                                     "detail": _bounded(exc)}}
             except RemoteRefMoved:
-                # The ref moved. Recompute the reviewed context against what
-                # is there now; a changed context is stale, full stop.
-                discarded = store.current_tip()
-                run_git(self.config.room_workdir, "reset", "--hard", "--quiet",
-                        expected)
-                self.sync_room()
-                fresh = self._room_store()
-                if self._reviewed_context(fresh, document) != thread_before:
-                    raise TransportRefused(
-                        "the reviewed thread changed on the remote while this "
-                        "response was being delivered. The review was of a "
-                        "context that no longer exists, so it is not "
-                        "delivered; export a fresh packet and review again.")
-                store = fresh
-                continue
-            settled = self._accept_after_delivery(store)
-            return {"import": result,
+                # Reinspect and verify; never discard on an exit-code guess.
+                return self._deliver_uncertain_import(request_id, inspections=inspections + 1)
+            settled = self._accept_after_delivery(local)
+            return {"import": entry["import"], "checkpoint": settled,
                     "delivery": {"mode": "remote", "tip": pushed["tip"],
-                                 "lease": expected, "attempts": attempt + 1},
-                    "checkpoint": settled}
-        raise TransportError(
-            f"the room remote moved {MAX_DELIVERY_ATTEMPTS} times while "
-            "delivering one supervisor response; stopping rather than looping")
+                                 "lease": expected, "attempts": entry["attempts"]}}
+
+        # The exact response is proven absent from this verified descendant.
+        # Only that known undelivered local suffix may be discarded. Installing
+        # and checkpointing the verified remote leaves a deterministic restart
+        # position if the worker dies before rechecking/rebuilding the request.
+        if local.current_tip() == entry["local_tip"]:
+            if not remote.is_ancestor(expected, entry["local_tip"]):
+                raise TransportError("uncertain response does not descend from its lease")
+            run_git(self.config.room_workdir, "reset", "--hard", "--quiet", candidate)
+        checkpoint.accept(self._room_store())
+        document = entry["params"]["response"]
+        if self._reviewed_context(probe, document) != entry["context_sha256"]:
+            raise TransportRefused("the reviewed thread changed remotely; proven-undelivered review is stale")
+        if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS:
+            raise TransportRefused("bounded CAS reconstruction attempts exhausted; response proven absent")
+        return self._op_supervisor_import(
+            self._room_store(), entry["params"], request_id=request_id,
+            request_sha256=entry["request_sha256"], attempts=entry["attempts"])
+
+    def reconcile_imports(self) -> list:
+        """Finish all uncertain imports before recovery or any new request."""
+        results = []
+        for request_id, entry in (self._ledger().get("uncertain_imports") or {}).items():
+            try:
+                detail = self._deliver_uncertain_import(request_id)
+                status = "ok"
+            except TransportRefused as exc:
+                status, detail = "refused", {"error": _bounded(exc)}
+            # Other errors deliberately escape: no terminal result can be
+            # inferred when the remote or local evidence cannot be inspected.
+            results.append(self._record(request_id, "supervisor_import",
+                                        entry["request_sha256"], status, detail))
+        return results
 
     def _reviewed_context(self, store: GitMessageStore, document: dict) -> str:
         """The digest of the thread this response claims to review, now."""
@@ -786,10 +843,21 @@ class TransportWorker:
     def run(self) -> dict:
         self._start_clock()
         try:
+            # Read owner state and require both configured refs before any
+            # checkpoint, replay or result work. None is explicit test mode;
+            # an absent configured branch is never local mode.
+            self._ledger()
+            self._control_anchor()
+            for remote in (self._room_remote(), self._control_remote()):
+                if remote is not None:
+                    remote.required_remote_tip()
+            control_sync = self.sync_control()
+            reconciled = self.reconcile_imports()
             lifecycle = {
                 "recover": self.recover_room(),
                 "room": self.sync_room(),
-                "control": self.sync_control(),
+                "control": control_sync,
+                "reconciled": reconciled,
                 "delivered": self.deliver_results(),
             }
         except AgentRoomError as exc:
@@ -828,6 +896,10 @@ class TransportWorker:
                 break
             self._check_clock("selecting the next request")
             summary.append(self._process(control, entry))
+            if summary[-1]["status"] == "uncertain_delivery":
+                # Stop this pass; no later request may build on the unaccepted
+                # local response. The request remains unprocessed in the ledger.
+                break
             processed += 1
         pending = unprocessed
 
@@ -838,12 +910,16 @@ class TransportWorker:
             "pending": len(pending),
             "processed": processed,
             "remaining": max(len(pending) - processed, 0),
-            "results": summary,
-            "lifecycle": {"status": "ok", **lifecycle},
+            "results": reconciled + summary,
+            "lifecycle": {"status": "uncertain_delivery" if self._ledger().get("uncertain_imports")
+                          else "ok", **lifecycle},
         }
 
     def _process(self, control: ControlStore, entry: dict) -> dict:
         request_id = entry["request_id"]
+        if request_id in (self._ledger().get("uncertain_imports") or {}):
+            return {"request_id": request_id, "operation": "supervisor_import",
+                    "status": "uncertain_delivery"}
         try:
             document, request_sha256 = control.read_request(entry)
         except (ControlError, AgentRoomError) as exc:
@@ -864,11 +940,18 @@ class TransportWorker:
                 "supervisor_export": self._op_supervisor_export,
                 "supervisor_import": self._op_supervisor_import,
             }[operation]
-            detail = handler(store, validated["params"])
+            if operation == "supervisor_import":
+                detail = handler(store, validated["params"], request_id=request_id,
+                                 request_sha256=request_sha256)
+            else:
+                detail = handler(store, validated["params"])
             status = "ok"
         except TransportRefused as exc:
             status, detail = "refused", {"error": _bounded(exc)}
         except AgentRoomError as exc:
+            if request_id in (self._ledger().get("uncertain_imports") or {}):
+                return {"request_id": request_id, "operation": operation,
+                        "status": "uncertain_delivery", "error": _bounded(exc)}
             status = "failed"
             detail = {"error": _bounded(exc), "error_type": type(exc).__name__}
         return self._record(request_id, operation, request_sha256, status,
@@ -911,6 +994,9 @@ class TransportWorker:
         # `delivered` or a terminal `conflict`.
         pending[request_id] = {"document": result, "state": "produced",
                                "at": result["completed_at"]}
-        ledger.set(requests=requests, pending_results=pending)
+        uncertain = dict(ledger.get("uncertain_imports") or {})
+        uncertain.pop(request_id, None)
+        ledger.set(requests=requests, pending_results=pending,
+                   uncertain_imports=uncertain)
         return {"request_id": request_id, "operation": operation,
                 "status": status}

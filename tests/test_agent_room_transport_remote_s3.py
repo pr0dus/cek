@@ -661,13 +661,13 @@ def test_ROOM_PUSH_UNKNOWN_does_not_produce_a_second_response(net, monkeypatch):
 
     monkeypatch.setattr(RoomRemote, "push_with_lease", unknown)
     summary = run(net)
-    assert summary["results"][0]["status"] == "ok"
-    assert summary["processed"] == 1
+    assert summary["results"][0]["status"] == "uncertain_delivery"
+    assert summary["processed"] == 0
 
     monkeypatch.undo()
-    # A restart reconciles rather than signing again.
+    # A restart must deliver the retained response, not merely avoid duplicates.
     run(net)
-    assert len(remote_supervisor_messages(net)) <= 1, "never two responses"
+    assert len(remote_supervisor_messages(net)) == 1, "exactly one response"
 
 
 # ===== the ledger fails closed =============================================

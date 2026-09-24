@@ -5,7 +5,6 @@
   "control_workdir": "/var/lib/agent-room/control",
   "control_branch": "agent-room-control",
   "control_remote": "origin",
-  "__control_genesis": "the control branch's root commit, recorded OUT OF BAND when the branch is created. Required: without it the first remote history a fresh service sees would choose its own replay anchor.",
   "trust_policy_path": "/etc/agent-room/trust-policy.json",
   "checkpoint_path": "/var/lib/agent-room/checkpoint.json",
   "state_dir": "/var/lib/agent-room/state",

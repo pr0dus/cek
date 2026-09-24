@@ -83,6 +83,10 @@ class RemoteRefMoved(SyncError):
     """The remote ref was not what the lease expected."""
 
 
+class RemoteRefMissing(SyncError):
+    """A configured remote no longer advertises its mandatory exact ref."""
+
+
 class CandidateRejected(SyncError):
     """A fetched candidate did not verify, so it was not installed."""
 
@@ -212,13 +216,23 @@ class _Remote:
         """What the remote says the ref is, without fetching objects."""
         result = run_git(self.workdir, "ls-remote", "--exit-code", self.remote,
                          self.ref, check=False)
-        if result.returncode != 0:
+        if result.returncode == 2:
             return None
-        line = _out(result).splitlines()[0] if _out(result) else ""
-        oid = line.split()[0] if line else ""
-        return oid if OID_RE.match(oid) else None
+        if result.returncode != 0:
+            raise SyncError(f"cannot inspect configured remote ref {self.ref}")
+        lines = _out(result).splitlines()
+        fields = lines[0].split() if len(lines) == 1 else []
+        if len(fields) != 2 or fields[1] != self.ref or not OID_RE.fullmatch(fields[0]):
+            raise SyncError(f"invalid exact-ref advertisement for {self.ref}")
+        return fields[0]
 
-    def fetch_candidate(self, candidate_branch: str) -> str | None:
+    def required_remote_tip(self) -> str:
+        tip = self.remote_tip()
+        if tip is None:
+            raise RemoteRefMissing(f"remote ref missing: {self.remote} {self.ref}")
+        return tip
+
+    def fetch_candidate(self, candidate_branch: str) -> str:
         """Park the remote head on a separate local ref. Verify it there.
 
         Deliberately not `git pull`: installing first and checking afterwards
@@ -231,12 +245,15 @@ class _Remote:
             f"+{self.ref}:refs/heads/{candidate_branch}", check=False)
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace").strip()
-            if "couldn't find remote ref" in stderr or "not found" in stderr:
-                return None
+            # Only ls-remote's documented no-match status establishes absence;
+            # an authentication/network error containing "not found" does not.
+            self.required_remote_tip()
             raise SyncError(f"fetch of {self.ref} failed: {stderr[:300]}")
         observed = run_git(self.workdir, "rev-parse", "--verify",
                            f"refs/heads/{candidate_branch}", check=False)
-        return _out(observed) if observed.returncode == 0 else None
+        if observed.returncode != 0 or not OID_RE.fullmatch(_out(observed)):
+            raise SyncError(f"cannot resolve fetched candidate for {self.ref}")
+        return _out(observed)
 
     def is_ancestor(self, earlier: str, later: str) -> bool:
         result = run_git(self.workdir, "merge-base", "--is-ancestor",
@@ -269,7 +286,7 @@ class RoomRemote(_Remote):
                 f"verified candidate {candidate_oid[:12]}")
         return installed
 
-    def push_with_lease(self, expected_remote_oid: str | None) -> dict:
+    def push_with_lease(self, expected_remote_oid: str) -> dict:
         """Push only while the remote ref is still exactly what we reviewed.
 
         The lease is the atomic comparison, not a licence to rewrite: our
@@ -284,14 +301,15 @@ class RoomRemote(_Remote):
         local = self.local_tip()
         if local is None:
             raise SyncError("nothing to push: the local room branch is unborn")
-        if expected_remote_oid is None:
-            lease = f"{self.ref}:"
-        else:
-            _validate(expected_remote_oid, OID_RE, "expected remote oid")
-            lease = f"{self.ref}:{expected_remote_oid}"
-        result = run_git(
-            self.workdir, "push", f"--force-with-lease={lease}",
-            self.remote, f"{self.ref}:{self.ref}", check=False)
+        self.required_remote_tip()  # Never bootstrap/recreate a production ref.
+        _validate(expected_remote_oid, OID_RE, "expected remote oid")
+        lease = f"{self.ref}:{expected_remote_oid}"
+        try:
+            result = run_git(
+                self.workdir, "push", f"--force-with-lease={lease}",
+                self.remote, f"{self.ref}:{self.ref}", check=False)
+        except SyncError as exc:
+            return self._classify_failed_push(local, expected_remote_oid, str(exc))
         if result.returncode == 0:
             return {"pushed": True, "tip": local}
 
@@ -327,9 +345,7 @@ class RoomRemote(_Remote):
 
     def contains_remotely(self, oid: str) -> bool:
         """Is this commit already on the remote ref? Reconciliation, not hope."""
-        remote = self.remote_tip()
-        if remote is None:
-            return False
+        remote = self.required_remote_tip()
         if remote == oid:
             return True
         fetched = self.fetch_candidate(f"{self.branch}{CANDIDATE_SUFFIX}-probe")
@@ -340,7 +356,7 @@ class ControlRemote(_Remote):
     """The untrusted control branch: bounded fetch in, bounded push out."""
 
     def push(self) -> dict:
-        """Ordinary fast-forward push. Never forced, never discarding.
+        """Fast-forward-only push with an exact lease. Never discarding.
 
         Like the room push, a failure is reconciled rather than believed: the
         caller confirms each pending result against the remote's own content,
@@ -348,7 +364,13 @@ class ControlRemote(_Remote):
         a second one.
         """
         local = self.local_tip()
-        result = run_git(self.workdir, "push", self.remote,
+        observed = self.fetch_candidate(f"{self.branch}{CANDIDATE_SUFFIX}-push")
+        # Retain fast-forward-only semantics, with an exact lease so deletion
+        # between inspection and push cannot silently recreate the queue.
+        if local is None or not self.is_ancestor(observed, local):
+            raise RemoteRefMoved("the control remote moved before delivery")
+        result = run_git(self.workdir, "push",
+                         f"--force-with-lease={self.ref}:{observed}", self.remote,
                          f"{self.ref}:{self.ref}", check=False)
         if result.returncode == 0:
             return {"pushed": True, "tip": local}

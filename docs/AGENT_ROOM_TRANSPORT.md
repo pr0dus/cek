@@ -275,7 +275,51 @@ facts. Neither push infers delivery from an exit code.
 from the exact local response tip, classify **delivered**; if it demonstrably
 moved without containing it, `RemoteRefMoved`; otherwise `AmbiguousDelivery`.
 An ambiguous room delivery never causes a second signed response: the local
-commit stays and the next run's recovery reconciles whether it landed.
+commit stays and the next run reconciles it **before** generic room recovery
+or selecting any new request. Unknown is not terminal success or failure.
+
+### S3 closure: uncertain imports are not processed requests
+
+Before the first room push, the owner-only processed ledger also records an
+`uncertain_imports[request_id]` entry. It binds the request id and SHA-256,
+the exact response parameters, target id and context digest, signed response
+message id and envelope digest, local signed tip, expected remote head/lease,
+bounded construction-attempt count, and original import receipt. Its state
+is `uncertain_delivery`. There is no terminal `requests` entry or final
+control result yet. The ledger is persisted before remote delivery can occur.
+
+On every restart, after requiring both exact remote refs and verifying the
+control queue, each uncertain import is reconciled against a fetched, fully
+verified room candidate:
+
+| Observed remote evidence | Permitted transition |
+|---|---|
+| Exact response message/digest and signed commit present | Install/verify, advance checkpoint, atomically record `ok` and enqueue its final control result. |
+| Response absent; remote still equals original lease | Retry the **same signed commit**, same id, same lease; no new signature. |
+| Response absent; verified remote moved; reviewed thread changed | Discard only the proven-undelivered suffix, install verified state, finalize `refused`/stale. |
+| Response absent; only unrelated traffic changed | Recompute context, reconstruct on the verified base within the existing total CAS attempt bound. |
+| Inspection, evidence, or delivery unknown | Retain entry and signed commit; stop this pass without marking done or generating another response. |
+
+Removal from `uncertain_imports`, terminal `requests` insertion, and final
+`pending_results` insertion happen in the same owner-only ledger replacement.
+An uncertain first attempt stops the current batch; remaining requests wait.
+Startup reconciliation results are reported separately in the lifecycle and
+also included in the result summary. They are not new-request executions.
+
+### Configured remote refs are mandatory
+
+Only directly constructed test configurations with `remote is None` use local
+mode. A configured exact ref that disappears raises `RemoteRefMissing`: it
+cannot be reinterpreted as a local room/queue, cannot advance a checkpoint or
+control anchor from local-only state, and is not automatically recreated.
+Both remote refs must be observable before recovery or request work starts.
+Authentication/network failures remain `SyncError`, never fabricated absence.
+Both push paths use exact leases; the control push additionally requires a
+fast-forward, so deletion between inspection and push cannot recreate the ref.
+
+The shipped JSON example contains only real configuration fields. Record the
+control branch's root commit **out of band** and substitute its full OID for
+`control_genesis`; production loading still requires that pin and both remotes.
 
 *Control results:* on any failure, fetch the remote and check each pending
 result path for byte-identical content — identical is delivered, absent stays
@@ -320,10 +364,10 @@ turn protocol.
   a permission or I/O error is refused, because a ledger that silently became
   empty would let every processed request run again. Recovery is an explicit
   human procedure, not a default.
-- A crash after the room mutation but before the result write reconciles on
-  restart rather than importing twice: the participant turn protocol finds the
-  durable response and returns `already_responded`. There is a regression for
-  exactly this window.
+- A crash after room delivery but before the result write reconciles the
+  owner-only uncertain record against the exact signed remote artifact, then
+  finalizes without importing or signing again. A local-only orphan with no
+  uncertain record retains the earlier generic recovery behavior.
 - A stale supervisor context is never "retried with force" — it is recorded as
   a failed result and the reviewer re-exports.
 - Ambiguous push outcomes use the existing three-valued delivery rules.
