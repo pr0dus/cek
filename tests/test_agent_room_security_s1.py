@@ -32,7 +32,7 @@ from agent_room.limits import (
     MAX_THREAD_MESSAGES,
     LimitExceeded,
 )
-from agent_room.errors import ReceiptStateError
+from agent_room.errors import LockTimeout, ReceiptStateError
 from agent_room.namespace import NamespaceViolation
 from agent_room.process import run_bounded, sanitised_env
 from agent_room.proof import (
@@ -1324,3 +1324,162 @@ def test_an_ordinary_descendant_is_still_killed(tmp_path, target):
                        proof_id="ordinary", timeout=2)
     assert record["status"] == "timeout"
     assert wait_gone(int(pidfile.read_text()))
+
+
+# ----- S1 final corrective: writer-lock re-entrancy is thread-owned --------
+
+def test_SAME_STORE_CONCURRENT_RESERVE(store, room, target, consequential):
+    """Two threads, **one** store instance, one one-shot nonce.
+
+    The first re-entrant lock counted depth on the store alone, so a second
+    thread sharing that store saw a non-zero depth, concluded it was a nested
+    call, and entered the critical section the first thread was holding. The
+    earlier concurrency regressions used separate store objects and so never
+    touched this path.
+    """
+    approve(store, consequential)
+
+    def attempt(_index):
+        return reserve(store, consequential["request_id"],
+                       workdir=target["path"])
+
+    results, errors = race(attempt)
+    assert len(results) == 1, f"two reservations succeeded: {results}"
+    assert len(errors) == 1 and isinstance(errors[0], (ReleaseBlocked, ReleaseError))
+
+    receipts = [m["receipt"] for m in store.thread_messages("t1")
+                if m["type"] == "execution_receipt"]
+    assert len(receipts) == 1, "exactly one reservation is durable"
+    assert receipts[0]["status"] == "uncertain"
+    assert store.verify_store() > 0
+
+
+def test_SAME_STORE_CONCURRENT_RECONCILE(store, room, target, consequential):
+    approve(store, consequential)
+    reserve(store, consequential["request_id"], workdir=target["path"])
+
+    def attempt(index):
+        return reconcile(store, consequential["request_id"], status="executed",
+                         result={"worker": index})
+
+    results, errors = race(attempt)
+    assert len(results) == 1, f"two terminal receipts were written: {results}"
+    assert len(errors) == 1
+
+    terminal = [m["receipt"] for m in store.thread_messages("t1")
+                if m["type"] == "execution_receipt"
+                and m["receipt"]["status"] in ("executed", "failed")]
+    assert len(terminal) == 1
+    assert store.verify_store() > 0
+
+
+def test_a_second_thread_cannot_enter_while_the_owner_holds_the_lock(store):
+    """The escape itself, with the owner deliberately holding the lock.
+
+    Ordering is the assertion: the intruder's entry must fall after the
+    owner's exit, not between its entry and exit.
+    """
+    store.lock_timeout = 5.0
+    sequence, ready = [], threading.Event()
+
+    def owner():
+        with store.writer_lock():
+            sequence.append("owner-in")
+            ready.set()
+            time.sleep(1.0)
+            sequence.append("owner-out")
+
+    def intruder():
+        ready.wait(timeout=10)
+        time.sleep(0.2)
+        with store.writer_lock():
+            sequence.append("intruder-in")
+
+    threads = [threading.Thread(target=owner), threading.Thread(target=intruder)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sequence == ["owner-in", "owner-out", "intruder-in"], sequence
+
+
+def test_a_second_thread_times_out_rather_than_entering(store):
+    """Bounded, not indefinite: the waiter fails cleanly on a held lock."""
+    store.lock_timeout = 0.4
+    ready, outcome = threading.Event(), []
+
+    def owner():
+        with store.writer_lock():
+            ready.set()
+            time.sleep(2.0)
+
+    def waiter():
+        ready.wait(timeout=10)
+        try:
+            with store.writer_lock():
+                outcome.append("entered")
+        except LockTimeout:
+            outcome.append("timed-out")
+
+    threads = [threading.Thread(target=owner), threading.Thread(target=waiter)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert outcome == ["timed-out"], outcome
+
+
+def test_nesting_in_the_owning_thread_still_works(store, room):
+    """Three deep, then a real append inside - the reason nesting exists."""
+    with store.writer_lock():
+        with store.writer_lock():
+            with store.writer_lock():
+                assert store._lock_depth == 3
+                assert store._lock_owner == threading.get_ident()
+            assert store._lock_depth == 2
+        assert store._lock_depth == 1
+    assert store._lock_depth == 0 and store._lock_owner is None
+
+    with store.writer_lock():
+        posted = room.post(thread_id="t1", type="observation",
+                           body={"text": "written while nested"})
+    assert store.read("t1", posted["message_id"])["type"] == "observation"
+
+
+def test_the_lock_is_released_when_the_body_raises(store):
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with store.writer_lock():
+            with store.writer_lock():
+                raise Boom()
+    assert store._lock_depth == 0 and store._lock_owner is None
+    with store.writer_lock():
+        assert store._lock_depth == 1
+
+
+def test_re_entrancy_is_never_inherited_by_another_thread(store):
+    """Unit-level: the depth counter alone must not grant entry."""
+    ready, seen = threading.Event(), []
+
+    def owner():
+        with store.writer_lock():
+            ready.set()
+            time.sleep(0.6)
+
+    def observer():
+        ready.wait(timeout=10)
+        # Depth is non-zero, but it belongs to someone else.
+        seen.append((store._lock_depth,
+                     store._lock_owner == threading.get_ident()))
+
+    threads = [threading.Thread(target=owner), threading.Thread(target=observer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert seen == [(1, False)], seen

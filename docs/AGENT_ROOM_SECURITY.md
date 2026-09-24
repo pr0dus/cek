@@ -177,8 +177,17 @@ One-shot is enforced by receipts, and the check is atomic with the write. The
 earlier flow read "unconsumed" and then appended, holding the writer lock only
 during the append, so two callers could both pass the check. `reserve` and
 `reconcile` now hold the store's writer lock across the recheck *and* the
-receipt — the lock is re-entrant within a store instance, so the append inside
-does not deadlock on it — and `flock` still excludes between processes.
+receipt.
+
+The lock is re-entrant **for the thread that holds it**, and that distinction
+was itself a defect once: counting nesting depth on the store alone meant a
+second thread sharing one store saw a non-zero depth, concluded it was a nested
+call, and entered the critical section somebody else was holding. Depth and
+owner are now keyed to the owning thread id, so a different thread always takes
+the ordinary bounded path. That path blocks correctly inside one process as
+well as between processes: `flock` treats two descriptors for the same file
+independently, so the second thread's `LOCK_EX` is denied by the lock this
+store already holds on another descriptor.
 
 The lifecycle is `unused → uncertain → executed|failed`: no second reservation,
 no second terminal receipt, no transition out of a terminal state. An

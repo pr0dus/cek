@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -118,8 +119,12 @@ class GitMessageStore:
         if self.lock_timeout < 0:
             raise ValueError("lock_timeout must be >= 0")
         self.author = author
-        #: Depth of nested `writer_lock()` entries in this process. See the
-        #: re-entrancy note there.
+        #: Who holds `writer_lock()` and how deeply they have nested it.
+        #: Guarded by `_lock_state`, which is held only while these two are
+        #: read or written - never across the critical section itself. See the
+        #: re-entrancy note on `writer_lock`.
+        self._lock_state = threading.Lock()
+        self._lock_owner: int | None = None
         self._lock_depth = 0
 
     # -- git plumbing ------------------------------------------------------
@@ -374,21 +379,40 @@ class GitMessageStore:
         must never hang a caller. This is a lock, not a poller: it acquires and
         returns, and nothing runs in the background.
 
-        **Re-entrant within one store instance.** A caller that must make a
-        decision and write the result atomically - `release.reserve` checking a
-        one-shot nonce and then consuming it - has to hold this across both,
-        and the append inside takes it again. `flock` is per file descriptor,
-        so a second `os.open` in the same process would block on itself
-        forever. Counting the depth and reusing the descriptor is what makes
-        the nesting safe; it changes nothing between processes, which is where
-        the actual exclusion matters.
+        **Re-entrant for the thread that holds it, and only for that thread.**
+        A caller that must decide and write atomically - `release.reserve`
+        checking a one-shot nonce and then consuming it - holds this across
+        both, and the append inside takes it again. `flock` is per open file
+        description, so the nested `os.open` would deny itself; recognising
+        the owning thread and reusing its descriptor is what makes the nesting
+        safe.
+
+        Re-entrancy is owned by a thread, never by the instance. An earlier
+        version counted depth on the store alone, so a *second* thread sharing
+        one store saw a non-zero depth, concluded it was nested, and walked
+        into the critical section somebody else was holding. The counters are
+        now read and written under `_lock_state` and keyed to the owner's
+        thread id, so a different thread is never nested and always takes the
+        ordinary bounded path.
+
+        That path still blocks correctly within one process: `flock` treats
+        two descriptors for the same file independently, so a second thread's
+        `LOCK_EX` is denied by the lock this store already holds on another
+        descriptor - the same answer another process would get. `_lock_state`
+        is deliberately not held across the body, so two stores can never
+        deadlock on each other's guards.
         """
-        if self._lock_depth > 0:
-            self._lock_depth += 1
+        me = threading.get_ident()
+        with self._lock_state:
+            nested = self._lock_depth > 0 and self._lock_owner == me
+            if nested:
+                self._lock_depth += 1
+        if nested:
             try:
                 yield
             finally:
-                self._lock_depth -= 1
+                with self._lock_state:
+                    self._lock_depth -= 1
             return
 
         lock_path = self._git_dir() / WRITER_LOCK_NAME
@@ -402,15 +426,17 @@ class GitMessageStore:
                 except OSError:
                     if time.monotonic() >= deadline:
                         raise LockTimeout(
-                            f"another process holds the Agent Room writer lock for "
-                            f"{self.workdir} (waited {self.lock_timeout}s)"
+                            f"another writer holds the Agent Room writer lock "
+                            f"for {self.workdir} (waited {self.lock_timeout}s)"
                         )
                     time.sleep(LOCK_POLL_SECONDS)
-            self._lock_depth = 1
+            with self._lock_state:
+                self._lock_owner, self._lock_depth = me, 1
             try:
                 yield
             finally:
-                self._lock_depth = 0
+                with self._lock_state:
+                    self._lock_depth, self._lock_owner = 0, None
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
