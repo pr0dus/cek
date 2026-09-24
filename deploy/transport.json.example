@@ -1,0 +1,15 @@
+{
+  "room_workdir": "/var/lib/agent-room/room",
+  "room_branch": "agent-room",
+  "room_remote": "origin",
+  "control_workdir": "/var/lib/agent-room/control",
+  "control_branch": "agent-room-control",
+  "control_remote": "origin",
+  "trust_policy_path": "/etc/agent-room/trust-policy.json",
+  "checkpoint_path": "/var/lib/agent-room/checkpoint.json",
+  "state_dir": "/var/lib/agent-room/state",
+  "signing_key_path": "/var/lib/agent-room/keys/openai-research.ed25519.pem",
+  "signing_key_id": "openai-research-1",
+  "max_requests_per_run": 8,
+  "worker_timeout_seconds": 600
+}

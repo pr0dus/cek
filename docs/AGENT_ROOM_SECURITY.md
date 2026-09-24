@@ -1,10 +1,11 @@
 # Agent Room — security model
 
-Issue #13, through **Stage S2**. S1 was local fail-closed hardening; S2 made
+Issue #13, through **Stage S3**. S1 was local fail-closed hardening; S2 made
 cryptographic provenance the authority boundary and added a monotonic trust
-anchor for the transport. The narrow transport service (S3) is not
-implemented, and this document says so everywhere it matters rather than in a
-footnote.
+anchor; S3 designed and tested the narrow operating path — a three-operation
+transport, a dedicated service identity, and a systemd cgroup that reaches
+what `killpg` cannot. **S3 is versioned, not deployed**: no system user, no
+service, no repository, no credentials.
 
 The honest summary: S1 closed every local integrity, filesystem and release
 defect the red team reproduced. S2 closed identity — a writer to the Git remote
@@ -14,7 +15,17 @@ fails. What remains open is the host itself: participant keys live here, so an
 attacker who holds those files can sign as those participants. The human
 credential deliberately does not live here.
 
-The identity design in full: `docs/AGENT_ROOM_AUTH.md`.
+The identity design in full: `docs/AGENT_ROOM_AUTH.md`. The operating path
+and its deployment procedure: `docs/AGENT_ROOM_TRANSPORT.md`.
+
+**The S3 audit found one result that outranks the rest.** `sudo -n true`
+succeeds for `pr0`, with `(ALL : ALL) NOPASSWD: ALL`. A shell as `pr0` — which
+a write to the existing bridge's control repository already yields — is
+therefore a shell as root. Until that is resolved, the dedicated-user boundary
+S3 designs is correct and worth nothing on this host, and the permission-
+boundary script refuses to report success rather than describing a boundary
+that does not exist. It is an activation blocker for a human, not something
+this stage may change.
 
 ---
 
@@ -35,8 +46,8 @@ Not protected against by S1:
 |---|---|---|
 | 1 | write access to the Agent Room Git remote | closed — every trusted artifact is signed by a pinned key |
 | 9 | remote branch rollback or force replacement | closed — monotonic checkpoint, descendant-only |
-| 2 | injected requests on the existing bridge control branch | **S3** — narrow transport |
-| — | a descendant that detaches from the process group | **S3** — cgroup/PID namespace |
+| 2 | injected requests on the existing bridge control branch | narrow transport designed and tested; **blocked on passwordless root** |
+| — | a descendant that detaches from the process group | closed in production by `KillMode=control-group`, measured |
 | 3 | a compromised Claude or Codex process | partly — capability limits apply; a stolen host key still signs |
 | 4 | a compromised ChatGPT/GitHub connector credential | impersonation closed; **S3** for the shell it still grants |
 
@@ -286,10 +297,13 @@ Keystore key lands in a TEE or StrongBox depends on the handset, and nothing
 verifies it. Treat it as software held on a separate device.
 
 **Local policy and checkpoint files are not tamper-proof.** Both belong to the
-service user. Someone who already controls that user's state can edit the pins
-or rewind the anchor. S3.
+service user. S3's answer is a dedicated `agentroom` identity, root-owned code
+and config, and owner-only state — which works exactly as far as the
+passwordless-root finding above allows, which today is not at all.
 
-**The existing bridge is still a broad remote shell.** `run_command` accepts
+**The existing bridge is still a broad remote shell**, and S3 did not touch
+it by instruction — it stays for manual maintenance and must never be the
+unattended Agent Room path. `run_command` accepts
 arbitrary argv, the service is unsandboxed, and a repository-write credential
 on the control branch is shell-as-`pr0`. S1 changed nothing about it, by
 instruction. The human CLI surface is reachable from it.

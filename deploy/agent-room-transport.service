@@ -1,0 +1,99 @@
+# Agent Room narrow supervisor transport — SYSTEM unit template.
+#
+# NOT INSTALLED. Versioned for review; installation is a later human-gated
+# step (docs/AGENT_ROOM_TRANSPORT.md §deployment).
+#
+# Two things about this unit are load-bearing rather than decorative:
+#
+#   User=agentroom          the whole point of S3. The trust policy, the
+#                           checkpoint and the signing key must not be owned
+#                           by the principal the broad bridge already controls.
+#
+#   KillMode=control-group  closes the detached-setsid() escape that
+#                           killpg() cannot. A descendant that leaves the
+#                           process group does not leave the cgroup.
+#
+# Every directive below was measured against the real workload (python3, git,
+# openssl ed25519) on systemd 255 before being written down.
+
+[Unit]
+Description=Agent Room narrow supervisor transport (one bounded pass)
+Documentation=file:///opt/agent-room/current/docs/AGENT_ROOM_TRANSPORT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agentroom
+Group=agentroom
+UMask=0077
+
+# Frozen, root-owned code. Never /home/pr0/projects/cek.
+WorkingDirectory=/opt/agent-room/current
+ExecStart=/usr/bin/python3 -m agent_room.transport_worker /etc/agent-room/transport.json
+Environment=PYTHONPATH=/opt/agent-room/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+Environment=GIT_TERMINAL_PROMPT=0
+
+# Lifecycle. The cgroup is what kills a detached descendant.
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStartSec=600
+TimeoutStopSec=30
+RuntimeMaxSec=900
+Delegate=no
+
+# Privilege
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# Measured against the real workload — python3, git init/clone/ls-tree,
+# openssl ed25519 sign+verify — on systemd 255 before being written here.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+
+# Filesystem. Only the service's own state is writable.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+StateDirectory=agent-room
+StateDirectoryMode=0700
+ReadOnlyPaths=/opt/agent-room /etc/agent-room
+InaccessiblePaths=/home/pr0
+
+# Kernel and host
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+KeyringMode=private
+
+# Network: only what a private Git remote needs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=
+PrivateNetwork=no
+
+# Bounds
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

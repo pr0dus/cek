@@ -9,11 +9,17 @@ stop before one.
 
 ---
 
-## 1. Why capability separation rather than signatures
+## 1. Capability separation, and — since S2 — signatures behind it
 
-The design deferred signed commits deliberately (§6), and this issue does not reintroduce
-them. So this code never claims to *prove* a human acted. It guarantees something
-narrower and mechanically checkable:
+Issue #5 deferred signed human identity deliberately (design §6) and this document once
+said so. **That is no longer true.** Issue #13 Stage S2 made the human decision
+cryptographic: an `approval` or `rejection` carries authority only when it is signed by
+the credential pinned for the `human` role in the trust policy, and that credential lives
+in a personal device's keystore, unlocked per approval by a fingerprint. Nothing on this
+host can produce a human signature. See `docs/AGENT_ROOM_AUTH.md`.
+
+Capability separation did not go away; it sits one layer in front of the signature, and
+it is what stops an agent *surface* reaching the write path at all:
 
 - `approval` and `rejection` are refused by **every** agent surface — `AgentRoom.post`,
   `GitMessageStore.append`, both participant adapters, and the supervisor import
@@ -39,17 +45,18 @@ as stronger than it is:
   shell execution in this repository can invoke the CLI. The existing ChatGPT-Ubuntu
   bridge is one such process: its bounded `run_command` can target
   `/home/pr0/projects/cek`, so the human surface is reachable from it by construction.
-- `sender.agent` remains provenance, not authentication — the same caveat the design
-  states, unchanged.
+- `sender.agent` is a claim. Since S2 the signature is what corroborates it, and
+  `release.authorise` independently re-checks that the effective decision is signed by
+  the key pinned for the human role.
 
-This is not a gap that opened here. Signed and hardware-backed human identity was
-deliberately deferred by the design (§6), and this issue does not reintroduce it. What
-matters is that nothing in this document claims a cryptographic or process-isolation
-guarantee that does not exist.
+What is still **not** claimed: hardware backing of the device credential is not attested,
+and none of this survives an attacker with arbitrary root on this host — see
+`docs/AGENT_ROOM_SECURITY.md` §3, and the S3 audit finding about passwordless root in
+`docs/AGENT_ROOM_TRANSPORT.md`.
 
-The operating rule that does the real work is therefore procedural, not mechanical: the
-supervisor does not invoke `human-decide` until the user has explicitly approved or
-rejected in ChatGPT.
+The procedural rule still stands alongside the cryptography: the supervisor does not ask
+for a decision until the user has explicitly approved or rejected in ChatGPT, and the
+device is what turns that into authority.
 
 ---
 

@@ -216,7 +216,7 @@ Public material only, versioned by a monotonically increasing generation:
       "key_id": "...", "role": "codex", "method": "ed25519",
       "public_key": "-----BEGIN PUBLIC KEY-----…",
       "custody": "host-file" | "android-keystore-device-bound",
-      "added_generation": 3, "effective_commit": "<oid|null>",
+      "added_generation": 3, "effective_commit": "<full oid>",
       "revoked_generation": null, "revoked_effective_commit": null,
       "replaces": null
     }
@@ -251,7 +251,7 @@ Every change is a signed update in its own domain:
   "action": "add" | "rotate" | "revoke", "participant": "codex",
   "old_key_id": "codex-1", "new_key_id": "codex-2",
   "public_key": "…", "method": "ed25519", "custody": "host-file",
-  "effective_commit": "<oid|null>",
+  "effective_commit": "<full oid, mandatory>",
   "new_key_proof": "<counter-signature, human rotations only>",
   "auth": { …, "signer": "human", "signature": "…" } }
 ```

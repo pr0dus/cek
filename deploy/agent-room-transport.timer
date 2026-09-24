@@ -1,0 +1,18 @@
+# Timer for the narrow transport. NOT INSTALLED.
+#
+# A timer plus a one-shot service, rather than a long-running daemon: the
+# lifecycle and the cgroup belong to systemd, each run is bounded, and a
+# failure is a failed unit rather than a wedged loop nobody is watching.
+
+[Unit]
+Description=Run the Agent Room narrow supervisor transport periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=15s
+RandomizedDelaySec=10s
+Unit=agent-room-transport.service
+
+[Install]
+WantedBy=timers.target
