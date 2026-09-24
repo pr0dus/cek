@@ -237,9 +237,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     decide = sub.add_parser(
         "human-decide",
-        help="HUMAN ONLY: record one approval or rejection. This is the "
-             "separate authority surface; no participant or orchestrator "
-             "code may invoke it.",
+        help="read a pending decision with --show. Recording one in an "
+             "authenticated room happens through human-prepare + "
+             "human-submit, because the human credential lives on a personal "
+             "device and never on this host.",
     )
     decide.add_argument("--request-id", required=True)
     # Not `required`: `--show` must be usable on its own, so a person can read
@@ -521,6 +522,28 @@ def main(argv=None) -> int:
                     "This surface carries human authority and is never invoked "
                     "automatically; run with --show first to see exactly what "
                     "would be decided.",
+                    file=sys.stderr,
+                )
+                return 2
+            if store.authenticated:
+                # The one operational contradiction left in S2: this route
+                # would sign a human decision with a key on this host, while
+                # the whole design says the human credential is never here.
+                # Offering it invites someone to put a real one here. So it
+                # is refused, and the refusal says what to do instead.
+                print(
+                    "Refusing to record a human decision from this host.\n"
+                    "The human credential lives on a trusted personal device "
+                    "and never on Ubuntu, so there is no signing key here that "
+                    "could carry human authority - a --signing-key would only "
+                    "put one where the security model says it must not be.\n"
+                    "Use the device ceremony instead:\n"
+                    "  agent-room ... human-prepare --request-id <id> "
+                    "--decision approve --out <file>\n"
+                    "  (sign payload_b64 on the device after the biometric "
+                    "prompt)\n"
+                    "  agent-room ... human-submit --prepared <file> "
+                    "--signature <base64>",
                     file=sys.stderr,
                 )
                 return 2

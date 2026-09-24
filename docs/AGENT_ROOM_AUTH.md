@@ -140,6 +140,13 @@ inaccurate, and the policy would have to say "unknown".
   decision envelope, raw, with no further hashing or wrapping. `human-prepare`
   prints them as `payload_b64` together with `payload_sha256`; the device signs
   the bytes, not the digest.
+- **There is no host-signed alternative.** `human-decide` records nothing in an
+  authenticated room, even with `--confirm-human` and a host `--signing-key`:
+  that route would sign a human decision with a key on this machine, which is
+  exactly what the credential living on a separate device is meant to prevent,
+  and leaving it available invites someone to put a real credential here. It
+  refuses and names the ceremony instead. `human-decide --show` stays
+  read-only.
 - **Ceremony:** `agent-room human-prepare` shows the action summary — verdict,
   action id, scope, structured parameters, project, snapshot and supervisor
   context digests — the device displays it, the person confirms with a
@@ -315,8 +322,13 @@ history and rewritten history are all "not a descendant", and all refused. A
 trust-policy generation that went backwards is refused too, since an older
 policy may pin keys that have since been revoked.
 
-**The candidate is observed, never supplied.** The checkpoint must name exactly
-the history that passed verification. An earlier version checked a
+**The candidate is observed, never supplied, at bootstrap as well as on every
+acceptance.** The checkpoint must name exactly the history that passed
+verification. Bootstrap observes the head, verifies, re-observes, and refuses —
+writing no anchor at all — if the branch moved meanwhile; a ceremony anchors one
+explicit object rather than silently taking whichever head arrived last. That
+matters most at bootstrap, because the first anchor is what every later
+acceptance is measured against. An earlier version checked a
 caller-supplied candidate for descent, verified the *branch*, and then recorded
 the *candidate* — so any reachable descendant object could become the accepted
 anchor while a different history was the one actually checked. The candidate is

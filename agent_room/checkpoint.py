@@ -32,6 +32,14 @@ verifying the branch head would let an arbitrary reachable object become the
 new anchor, so the candidate is read from the configured ref, verified, and
 re-read afterwards to catch a branch that moved underneath.
 
+That invariant belongs to bootstrap too, and it is arguably more important
+there: the first anchor is the one everything afterwards is measured against.
+A bootstrap that verified a later head while recording an earlier one would
+quietly forget history it had already seen, leaving a divergent descendant of
+the *recorded* tip acceptable later on. So bootstrap observes, verifies,
+re-observes, and refuses — writing nothing — if the branch moved. A ceremony
+has one object; it does not retry against whatever arrived meanwhile.
+
 **The checkpoint only advances after everything else passes.** Namespace,
 append-only history, digests, references, receipt lifecycle and signatures all
 run first; a failure anywhere leaves the checkpoint exactly where it was, so a
@@ -238,6 +246,23 @@ class TrustCheckpoint:
                 )
         # Full verification before the first checkpoint, not after.
         store.verify_store()
+
+        # Re-observe, exactly as `accept()` does. If the branch moved while we
+        # were verifying it, what was checked is not what would be recorded,
+        # and nothing is written at all.
+        settled = store.current_tip()
+        if settled != tip:
+            raise CheckpointError(
+                f"the room head moved from {tip[:12]} to {settled[:12]} during "
+                "bootstrap verification; no anchor is written. A bootstrap "
+                "ceremony anchors one explicit object - run it again against "
+                "the head you mean, rather than silently taking the newer one."
+            )
+        if expected_tip is not None and settled != expected_tip:
+            raise AnchorMismatch(
+                f"the head settled at {settled[:12]}, not the out-of-band "
+                f"{expected_tip[:12]}"
+            )
         document = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "room_id": observed,

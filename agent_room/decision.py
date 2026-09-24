@@ -585,9 +585,11 @@ class HumanDecisionAuthority:
     ) -> dict:
         """Record one human approval or rejection, bound to the request.
 
-        `signer` is for a **disposable or test** credential held on this host.
-        A real human credential is never here, so the real ceremony is
-        `prepare()` on this host and `submit()` with what the device returns.
+        `signer` is for a **disposable or test** credential held on this host,
+        and is deliberately not reachable from the production CLI: a real human
+        credential is never here, so offering a host-signed route would only
+        invite someone to put one here. The real ceremony is `prepare()` on
+        this host and `submit()` with what the trusted device returns.
         """
         envelope = self._build(
             request_message_id, verdict, decision_id=decision_id, note=note,

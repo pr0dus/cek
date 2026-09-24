@@ -1386,3 +1386,166 @@ def test_a_legitimate_signed_update_still_advances(store, room, anchored,
     result = anchored.accept(store)
     assert result["advanced"] is True
     assert anchored.document["trust_policy_sha256"] == policy_digest(store.trust)
+
+
+# ----- S2-F1: bootstrap anchors one object, or none ------------------------
+
+def test_BOOTSTRAP_HEAD_MOVES_DURING_VERIFICATION(store, room, signers,
+                                                  monkeypatch, tmp_path):
+    """Bootstrap used to verify a later head and record an earlier one.
+
+    `accept()` already re-observed the ref; bootstrap did not. It matters more
+    here than anywhere else: the first anchor is what every later acceptance
+    is measured against, so a bootstrap that forgets history it had already
+    seen leaves a divergent descendant of the *recorded* tip acceptable later.
+    """
+    room.post(thread_id="t1", type="observation", body={"text": "first"})
+    head_a = store.current_tip()
+    state = tmp_path / "raced.json"
+
+    real_verify = store.verify_store
+    moved = {}
+
+    def verify_then_move():
+        result = real_verify()
+        if not moved:
+            moved["yes"] = True
+            AgentRoom(store, "claude-code",
+                      ParticipantCursor(tmp_path / "racer", "claude-code"),
+                      signer=signers["claude-code"]).post(
+                thread_id="t1", type="observation",
+                body={"text": "advanced during bootstrap"})
+        return result
+
+    monkeypatch.setattr(store, "verify_store", verify_then_move)
+    with pytest.raises(CheckpointError, match="moved from"):
+        TrustCheckpoint.bootstrap(
+            store, expected_genesis=store.room_id(),
+            expected_trust_policy_sha256=policy_digest(store.trust),
+            path=state)
+
+    assert not state.exists(), "a refused bootstrap writes no anchor at all"
+    assert store.current_tip() != head_a, "the room really did move"
+
+
+def test_a_stable_bootstrap_still_succeeds(store, room, tmp_path):
+    room.post(thread_id="t1", type="observation", body={"text": "settled"})
+    head = store.current_tip()
+    checkpoint = TrustCheckpoint.bootstrap(
+        store, expected_genesis=store.room_id(),
+        expected_trust_policy_sha256=policy_digest(store.trust),
+        expected_tip=head, path=tmp_path / "stable.json")
+    assert checkpoint.document["last_accepted_tip"] == head
+    assert (tmp_path / "stable.json").exists()
+
+
+def test_an_expected_tip_must_survive_verification(store, room, signers,
+                                                   monkeypatch, tmp_path):
+    room.post(thread_id="t1", type="observation", body={"text": "first"})
+    head_a = store.current_tip()
+    state = tmp_path / "expected.json"
+
+    real_verify = store.verify_store
+    moved = {}
+
+    def verify_then_move():
+        result = real_verify()
+        if not moved:
+            moved["yes"] = True
+            AgentRoom(store, "claude-code",
+                      ParticipantCursor(tmp_path / "racer2", "claude-code"),
+                      signer=signers["claude-code"]).post(
+                thread_id="t1", type="observation", body={"text": "moved"})
+        return result
+
+    monkeypatch.setattr(store, "verify_store", verify_then_move)
+    with pytest.raises(CheckpointError):
+        TrustCheckpoint.bootstrap(
+            store, expected_genesis=store.room_id(),
+            expected_trust_policy_sha256=policy_digest(store.trust),
+            expected_tip=head_a, path=state)
+    assert not state.exists()
+
+
+# ----- S2-F2: no host-signed human decision from the production CLI -------
+
+def test_the_authenticated_cli_refuses_a_host_signed_human_decision(
+        store, room, target, consequential, signers, tmp_path, capsys):
+    """The one operational contradiction S2 had left.
+
+    `human-decide --signing-key` would have signed a human decision with a key
+    on this host, while the whole design says the human credential is never
+    here — which is an invitation to put a real one here.
+    """
+    from agent_room.cli import main
+
+    policy_path = tmp_path / "trust.json"
+    store.trust.save(policy_path)
+    code = main([
+        "--repo", str(store.workdir), "--participant", "human",
+        "--trust-policy", str(policy_path),
+        "--signing-key", str(signers["human"].key_path),
+        "--key-id", "human-1", "--signer-name", "human",
+        "human-decide", "--request-id", consequential["request_id"],
+        "--decision", "approve", "--confirm-human",
+    ])
+    assert code == 2
+    stderr = capsys.readouterr().err
+    assert "Refusing to record a human decision from this host" in stderr
+    assert "human-prepare" in stderr and "human-submit" in stderr
+
+    # Nothing was written: no decision exists, and the gate is unmoved.
+    assert not [m for m in store.thread_messages("t1")
+                if m["type"] in ("approval", "rejection")]
+    with pytest.raises(ReleaseBlocked) as caught:
+        authorise(store, consequential["request_id"], workdir=target["path"])
+    assert caught.value.report["state"] == "blocked_no_decision"
+
+
+def test_human_decide_show_stays_read_only(store, room, target, consequential,
+                                           tmp_path, capsys):
+    from agent_room.cli import main
+
+    policy_path = tmp_path / "trust.json"
+    store.trust.save(policy_path)
+    code = main([
+        "--repo", str(store.workdir), "--participant", "human",
+        "--trust-policy", str(policy_path),
+        "human-decide", "--request-id", consequential["request_id"], "--show",
+    ])
+    assert code == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["action_id"] == "activate-agent-room-transport"
+    assert not [m for m in store.thread_messages("t1")
+                if m["type"] in ("approval", "rejection")]
+
+
+def test_the_device_ceremony_still_works_through_the_cli(
+        store, room, target, consequential, signers, tmp_path, capsys):
+    """prepare -> (device signs) -> submit, end to end through the CLI."""
+    from agent_room.cli import main
+
+    policy_path = tmp_path / "trust.json"
+    store.trust.save(policy_path)
+    prepared_path = tmp_path / "prepared.json"
+    base = ["--repo", str(store.workdir), "--participant", "human",
+            "--trust-policy", str(policy_path)]
+
+    assert main([*base, "human-prepare", "--request-id",
+                 consequential["request_id"], "--decision", "approve",
+                 "--out", str(prepared_path)]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["summary"]["action_id"] == "activate-agent-room-transport"
+
+    prepared = json.loads(prepared_path.read_text())
+    # The device half. Here a disposable key stands in for the phone.
+    signature = signers["human"].sign(base64.b64decode(prepared["payload_b64"]))
+
+    assert main([*base, "human-submit", "--prepared", str(prepared_path),
+                 "--signature", signature]) == 0
+    capsys.readouterr()
+
+    result = authorise(store, consequential["request_id"],
+                       workdir=target["path"])
+    assert result["authorised"] is True
+    assert result["human_provenance"]["role"] == HUMAN_ROLE

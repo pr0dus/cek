@@ -205,13 +205,24 @@ agent-room --repo <room> --participant coordinator snapshot \
 agent-room --repo <room> --participant coordinator gate-status \
     --request-id <id> --snapshot-sha256 <…> --context-sha256 <…>
 
-agent-room --repo <room> --participant human human-decide \
-    --request-id <id> --show            # read what would be decided
+agent-room --repo <room> --participant human --trust-policy <policy> \
+    human-decide --request-id <id> --show      # read what would be decided
 
-agent-room --repo <room> --participant human human-decide \
-    --request-id <id> --decision approve --confirm-human
+# Recording one is the device ceremony (S2). There is no host-signed route.
+agent-room --repo <room> --participant human --trust-policy <policy> \
+    human-prepare --request-id <id> --decision approve --out <file>
+#   … the trusted device shows the summary, takes the fingerprint, and signs
+#     payload_b64 …
+agent-room --repo <room> --participant human --trust-policy <policy> \
+    human-submit --prepared <file> --signature <base64>
 ```
 
-`--confirm-human` is required, and `human-decide` is never invoked by participant or
-orchestrator code. That is the point at which the machine stops and waits for a person —
-enforced by capability separation, and by the operating rule in §1, not by authentication.
+`human-decide --show` is read-only. In an authenticated room `human-decide` will **not**
+record a decision, even with `--confirm-human` and a `--signing-key`: signing a human
+decision with a key on this host would contradict the model that put the credential on a
+separate device, and leaving the route available is an invitation to put a real
+credential here. It refuses and points at `human-prepare` / `human-submit`.
+
+The gate is still never invoked by participant or orchestrator code. Since S2 that
+capability separation has a signature behind it: `--confirm-human` gates the surface so
+nothing is recorded by accident, and the device's assertion is what carries authority.
