@@ -25,7 +25,17 @@ from agent_room import AgentRoom, GitMessageStore, ParticipantCursor, canonical
 from agent_room.checkpoint import TrustCheckpoint, policy_digest
 from agent_room.control_store import ControlStore
 from agent_room.ids import uuid7
-from agent_room.remote_sync import Anchor, RemoteRefMoved, RoomRemote, run_git
+from agent_room import remote_sync
+from agent_room.errors import AgentRoomError
+from agent_room.remote_sync import (
+    AmbiguousDelivery,
+    Anchor,
+    ControlRemote,
+    RemoteRefMoved,
+    RoomRemote,
+    SyncError,
+    run_git,
+)
 from agent_room.supervisor import PARTICIPANT as SUPERVISOR
 from agent_room.supervisor import SupervisorBoundary
 from agent_room.transport import (
@@ -86,6 +96,9 @@ def net(tmp_path):
     room_dir = clone(origin_room, tmp_path / "worker-room", "agent-room")
     control_dir = clone(origin_control, tmp_path / "worker-control",
                         "agent-room-control")
+    # Pinned out of band, exactly as production must: the first remote history
+    # a fresh service sees does not get to choose its own replay anchor.
+    control_genesis = ControlStore(control_dir, "agent-room-control").genesis()
     worker_store = GitMessageStore(room_dir, branch="agent-room", trust=policy)
     checkpoint = TrustCheckpoint.bootstrap(
         worker_store, expected_genesis=worker_store.room_id(),
@@ -100,6 +113,7 @@ def net(tmp_path):
         signing_key_path=str(signers[SUPERVISOR].key_path),
         signing_key_id=signers[SUPERVISOR].key_id,
         room_remote="origin", control_remote="origin",
+        control_genesis=control_genesis,
     )
 
     # Two independent writers against the same remotes.
@@ -457,24 +471,331 @@ def test_a_forged_result_does_not_suppress_processing(net):
     assert any(d["status"] == "conflict" for d in delivered)
 
 
-def test_a_concurrent_remote_request_and_a_local_result_both_survive(net):
+def test_CONTROL_RESULT_REMOTE_MOVES_AFTER_LOCAL_COMMIT(net, monkeypatch):
+    """The remote gains a request between our local result commit and its push.
+
+    Measured against the previous freeze: the result was cleared from the
+    ledger when it was committed *locally*, the push was then refused as a
+    non-fast-forward, and `sync_control` could not install the diverged
+    candidate with `--ff-only` at all. The result existed nowhere on the
+    remote and nothing remembered that it was owed.
+    """
     first = submit_remote(net, request_document("status"))
 
-    # The worker produces a result while a second request is pushed remotely.
-    worker = TransportWorker(net["config"])
-    worker.recover_room()
-    worker.sync_room()
-    worker.sync_control()
-    second = submit_remote(net, request_document("status"))
+    real = ControlRemote.push
+    fired = {}
 
+    def inject_then_push(self):
+        if not fired:
+            fired["yes"] = True
+            # A second writer appends a request while our result sits
+            # committed locally and unpushed.
+            fired["second"] = submit_remote(net, request_document("status"))
+        return real(self)
+
+    monkeypatch.setattr(ControlRemote, "push", inject_then_push)
     summary = run(net)
+    assert fired, "the race must actually have been run"
+
     probe = net["tmp"] / "both"
     clone(net["origin_control"], probe, "agent-room-control")
     remote_control = ControlStore(probe, "agent-room-control")
-    assert remote_control.has_result(first)
     history = remote_control._history()
-    assert f".agent-room-control/requests/{second}.json" in history
+
+    assert remote_control.has_result(first), "the service result reached the remote"
+    assert f".agent-room-control/requests/{fired['second']}.json" in history, \
+        "the other writer's request survived"
+    ledger = Anchor(Path(net["config"].state_dir) / "processed.json",
+                    "processed-ledger")
+    assert first not in (ledger.get("pending_results") or {}), \
+        "cleared only because delivery was proven"
     assert summary["lifecycle"]["status"] == "ok"
+
+
+def test_a_pending_result_is_kept_until_delivery_is_proven(net, monkeypatch):
+    """The invariant, asserted at the moment it used to be violated."""
+    request_id = submit_remote(net, request_document("status"))
+    ledger_path = Path(net["config"].state_dir) / "processed.json"
+
+    def refuse(self):
+        raise RemoteRefMoved("the remote moved")
+
+    monkeypatch.setattr(ControlRemote, "push", refuse)
+    run(net)
+
+    ledger = Anchor(ledger_path, "processed-ledger")
+    pending = ledger.get("pending_results") or {}
+    assert request_id in pending, "still owed: it never reached the remote"
+    assert pending[request_id]["state"] in ("materialised", "pending")
+
+    probe = net["tmp"] / "not-there"
+    clone(net["origin_control"], probe, "agent-room-control")
+    assert not ControlStore(probe, "agent-room-control").has_result(request_id)
+
+    # A later run with a working remote delivers it.
+    monkeypatch.undo()
+    run(net)
+    probe2 = net["tmp"] / "there-now"
+    clone(net["origin_control"], probe2, "agent-room-control")
+    assert ControlStore(probe2, "agent-room-control").has_result(request_id)
+    assert request_id not in (Anchor(ledger_path, "processed-ledger")
+                              .get("pending_results") or {})
+
+
+def test_the_local_control_checkout_is_reconstructible_from_the_ledger(net,
+                                                                       monkeypatch):
+    """Its Git history is working state; the ledger is the authority."""
+    request_id = submit_remote(net, request_document("status"))
+
+    def refuse(self):
+        raise RemoteRefMoved("the remote moved")
+
+    monkeypatch.setattr(ControlRemote, "push", refuse)
+    run(net)
+    monkeypatch.undo()
+
+    # Throw the local control history away entirely.
+    control_dir = Path(net["config"].control_workdir)
+    shutil.rmtree(control_dir)
+    clone(net["origin_control"], control_dir, "agent-room-control")
+
+    run(net)
+    probe = net["tmp"] / "rebuilt"
+    clone(net["origin_control"], probe, "agent-room-control")
+    assert ControlStore(probe, "agent-room-control").has_result(request_id)
+
+
+def test_the_control_anchor_never_advances_to_a_local_only_commit(net,
+                                                                  monkeypatch):
+    submit_remote(net, request_document("status"))
+
+    def refuse(self):
+        raise RemoteRefMoved("the remote moved")
+
+    monkeypatch.setattr(ControlRemote, "push", refuse)
+    run(net)
+
+    anchor = Anchor(Path(net["config"].state_dir) / "control-anchor.json",
+                    "control-anchor")
+    remote_control_tip = git(net["origin_control"],
+                             "rev-parse", "refs/heads/agent-room-control").strip()
+    assert anchor.get("last_accepted_tip") == remote_control_tip
+    local_tip = ControlStore(net["config"].control_workdir,
+                             "agent-room-control").current_tip()
+    assert local_tip != remote_control_tip, "local carries the unpushed result"
+
+
+# ===== ambiguous pushes ====================================================
+
+def test_CONTROL_PUSH_ACCEPTED_ACK_LOST(net, monkeypatch):
+    """The remote took it; the client saw an error. Delivered is delivered."""
+    request_id = submit_remote(net, request_document("status"))
+    # The real shape: git pushes successfully, then the client's view of the
+    # result is lost. Patching the runner rather than `push` keeps the
+    # primitive's own reconciliation in the picture.
+    real_run_git = remote_sync.run_git
+
+    def push_then_lose_ack(workdir, *args, **kwargs):
+        result = real_run_git(workdir, *args, **kwargs)
+        if args and args[0] == "push":
+            raise SyncError("connection reset after the remote accepted")
+        return result
+
+    monkeypatch.setattr(remote_sync, "run_git", push_then_lose_ack)
+    run(net)
+
+    probe = net["tmp"] / "ack-lost"
+    clone(net["origin_control"], probe, "agent-room-control")
+    remote_control = ControlStore(probe, "agent-room-control")
+    assert remote_control.has_result(request_id), "it did land"
+    ledger = Anchor(Path(net["config"].state_dir) / "processed.json",
+                    "processed-ledger")
+    assert request_id not in (ledger.get("pending_results") or {}), \
+        "cleared by confirmation against the remote's content, not by exit code"
+
+
+def test_CONTROL_PUSH_UNKNOWN_leaves_the_result_pending(net, monkeypatch):
+    request_id = submit_remote(net, request_document("status"))
+
+    def unknown(self):
+        raise AmbiguousDelivery("the delivery state is unknown")
+
+    monkeypatch.setattr(ControlRemote, "push", unknown)
+    run(net)
+
+    ledger = Anchor(Path(net["config"].state_dir) / "processed.json",
+                    "processed-ledger")
+    assert request_id in (ledger.get("pending_results") or {}), \
+        "an unknown is never cleared"
+
+
+def test_ROOM_PUSH_ACCEPTED_ACK_LOST(net, monkeypatch):
+    """One supervisor response, and the checkpoint still advances."""
+    submit_remote(net, request_document(
+        "supervisor_import", {"response": bound_response(net)}))
+    real = RoomRemote.push_with_lease
+
+    def push_then_lie(self, expected):
+        real(self, expected)
+        # The push landed; the acknowledgement did not arrive. The primitive
+        # must reconcile against the ref rather than believe the exit code.
+        return self._classify_failed_push(
+            self.local_tip(), expected, "connection reset")
+
+    monkeypatch.setattr(RoomRemote, "push_with_lease", push_then_lie)
+    summary = run(net)
+
+    assert summary["results"][0]["status"] == "ok"
+    assert len(remote_supervisor_messages(net)) == 1, "exactly one"
+    delivery = summary["results"][0]
+    checkpoint = TrustCheckpoint.load(net["config"].checkpoint_path)
+    assert checkpoint.document["last_accepted_tip"] == remote_tip(net)
+
+
+def test_ROOM_PUSH_UNKNOWN_does_not_produce_a_second_response(net, monkeypatch):
+    submit_remote(net, request_document(
+        "supervisor_import", {"response": bound_response(net)}))
+
+    def unknown(self, expected):
+        raise AmbiguousDelivery("the delivery state is unknown")
+
+    monkeypatch.setattr(RoomRemote, "push_with_lease", unknown)
+    summary = run(net)
+    assert summary["results"][0]["status"] == "ok"
+    assert summary["processed"] == 1
+
+    monkeypatch.undo()
+    # A restart reconciles rather than signing again.
+    run(net)
+    assert len(remote_supervisor_messages(net)) <= 1, "never two responses"
+
+
+# ===== the ledger fails closed =============================================
+
+def test_an_unreadable_ledger_stops_the_worker(net):
+    """Fail-open here would let every processed request run again."""
+    submit_remote(net, request_document("status"))
+    run(net)
+    ledger_path = Path(net["config"].state_dir) / "processed.json"
+    assert ledger_path.exists()
+
+    os.chmod(ledger_path, 0o000)
+    try:
+        summary = run(net)
+        assert summary["lifecycle"]["status"] == "failed"
+        assert summary["lifecycle"]["error_type"] == "SyncError"
+        assert "not treated as" in summary["lifecycle"]["error"]
+        assert summary["processed"] == 0, "it stops before processing"
+    finally:
+        os.chmod(ledger_path, 0o600)
+
+
+def test_a_missing_ledger_is_an_ordinary_first_run(net, tmp_path):
+    ledger_path = Path(net["config"].state_dir) / "processed.json"
+    assert not ledger_path.exists()
+    submit_remote(net, request_document("status"))
+    assert run(net)["processed"] == 1
+
+
+@pytest.mark.parametrize("content", [
+    '{"kind": "something-else"}',
+    '{"not": "an anchor"}',
+    'not json at all',
+    '{"kind": "processed-ledger", "requests": {}, "requests": {}}',
+])
+def test_a_malformed_ledger_stops_the_worker(net, content):
+    state = Path(net["config"].state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "processed.json").write_text(content, encoding="utf-8")
+    submit_remote(net, request_document("status"))
+    summary = run(net)
+    assert summary["lifecycle"]["status"] == "failed"
+    assert summary["processed"] == 0
+
+
+def test_an_unreadable_control_anchor_stops_the_worker(net):
+    submit_remote(net, request_document("status"))
+    run(net)
+    anchor_path = Path(net["config"].state_dir) / "control-anchor.json"
+    os.chmod(anchor_path, 0o000)
+    try:
+        summary = run(net)
+        assert summary["lifecycle"]["status"] == "failed"
+        assert "not treated as" in summary["lifecycle"]["error"]
+        assert summary["processed"] == 0
+    finally:
+        os.chmod(anchor_path, 0o600)
+
+
+# ===== the control genesis is pinned, not learned ==========================
+
+def test_a_production_config_without_a_control_genesis_fails_closed(tmp_path):
+    path = tmp_path / "transport.json"
+    path.write_text(json.dumps({
+        "room_workdir": "/var/lib/agent-room/room",
+        "control_workdir": "/var/lib/agent-room/control",
+        "trust_policy_path": "/etc/agent-room/trust-policy.json",
+        "checkpoint_path": "/var/lib/agent-room/checkpoint.json",
+        "state_dir": "/var/lib/agent-room/state",
+        "signing_key_path": "/var/lib/agent-room/keys/k.pem",
+        "signing_key_id": "openai-research-1",
+        "room_remote": "origin", "control_remote": "origin",
+    }), encoding="utf-8")
+    with pytest.raises(TransportError, match="control_genesis"):
+        TransportConfig.load(path)
+
+
+def test_a_malformed_control_genesis_pin_fails_closed(tmp_path):
+    path = tmp_path / "transport.json"
+    path.write_text(json.dumps({
+        "room_workdir": "/x", "control_workdir": "/y",
+        "trust_policy_path": "/p", "checkpoint_path": "/c", "state_dir": "/s",
+        "signing_key_path": "/k", "signing_key_id": "openai-research-1",
+        "room_remote": "origin", "control_remote": "origin",
+        "control_genesis": "HEAD",
+    }), encoding="utf-8")
+    with pytest.raises(TransportError, match="full Git object id"):
+        TransportConfig.load(path)
+
+
+def test_a_wrong_pinned_control_genesis_refuses_the_first_sync(net):
+    from dataclasses import replace
+
+    submit_remote(net, request_document("status"))
+    config = replace(net["config"], control_genesis="0" * 39 + "1")
+    # Nothing has been recorded yet for this pin.
+    shutil.rmtree(Path(config.state_dir), ignore_errors=True)
+    summary = TransportWorker(config).run()
+    assert summary["lifecycle"]["status"] == "failed"
+    assert "genesis" in summary["lifecycle"]["error"]
+    assert summary["processed"] == 0
+
+
+def test_the_first_remote_history_cannot_choose_its_own_anchor(net):
+    from dataclasses import replace
+
+    submit_remote(net, request_document("status"))
+    config = replace(net["config"], control_genesis=None)
+    shutil.rmtree(Path(config.state_dir), ignore_errors=True)
+    summary = TransportWorker(config).run()
+    assert summary["lifecycle"]["status"] == "failed"
+    assert "out of band" in summary["lifecycle"]["error"]
+
+
+def test_the_correct_pin_bootstraps(net):
+    request_id = submit_remote(net, request_document("status"))
+    summary = run(net)
+    assert summary["lifecycle"]["status"] == "ok"
+    anchor = Anchor(Path(net["config"].state_dir) / "control-anchor.json",
+                    "control-anchor")
+    assert anchor.get("genesis") == net["config"].control_genesis
+
+
+def test_the_shipped_example_config_pins_the_control_genesis():
+    example = json.loads(
+        (Path(__file__).resolve().parents[1]
+         / "deploy" / "transport.json.example").read_text(encoding="utf-8"))
+    assert "control_genesis" in example
 
 
 def test_an_exact_duplicate_result_is_idempotent(net):
@@ -555,6 +876,7 @@ def test_the_worker_git_lifecycle_runs_under_the_hardened_restrictions(net,
         "signing_key_path": net["config"].signing_key_path,
         "signing_key_id": net["config"].signing_key_id,
         "room_remote": "origin", "control_remote": "origin",
+        "control_genesis": net["config"].control_genesis,
     }), encoding="utf-8")
 
     root = Path(__file__).resolve().parents[1]

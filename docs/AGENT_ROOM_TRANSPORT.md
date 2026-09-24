@@ -225,14 +225,62 @@ with **no remote** and delivery is done here instead:
 No request field supplies or overrides any ref, remote, repository, path,
 checkpoint or policy.
 
-### Control egress
+### Control sync and egress
 
-Push the exact ref; never forced. On a non-fast-forward, fetch and verify the
-remote candidate first, then re-apply the pending results on top — request and
-result paths are unique per id, so nothing of the other writer's is discarded
-and nothing of ours is overwritten. An identical result already present is
-idempotent; a *different* result at the same id is a conflict and fails
-closed. Bounded at 3 attempts.
+Three things are kept strictly apart, and conflating them was the last
+correctness defect:
+
+| | |
+|---|---|
+| **control anchor** | the last *remote* control tip the service accepted. It never advances to a local-only commit. |
+| **pending-results ledger** | service-produced results not yet proven remote. Owner-only, protected. |
+| **local control checkout** | disposable working state, reconstructible from the two above. |
+
+On sync: fetch, verify closed namespace and append-only history, require
+descent from the anchor, then install the verified candidate — with
+`reset --hard`, not `merge --ff-only`. Divergence is ordinary here: the remote
+gains a request while we hold a result, and `--ff-only` simply cannot install
+that. The local result commit is not a second authority; its document is in
+the ledger, so the remote candidate wins for Git history and the pending
+results are re-laid on top of it afterwards.
+
+A candidate that omits a result the service had already *confirmed* remote
+cannot descend from the anchor, so rollback is still refused.
+
+### A result is cleared only against evidence
+
+The states are explicit, because an earlier version cleared a result from the
+ledger when it was committed **locally** — so a remote that moved before the
+push lost it entirely, and the reconciliation that followed reported "nothing
+left to deliver":
+
+```
+produced → materialised → delivered        (cleared)
+                        ↘ conflict         (cleared, terminal DoS)
+                        ↘ pending/unknown  (kept, retried next run)
+```
+
+A result leaves the ledger for exactly two reasons: the remote demonstrably
+holds byte-identical canonical content at that immutable path, or a
+*different* immutable artifact sits there and it is permanently undeliverable.
+Committing it locally is not one of them.
+
+### Ambiguous pushes are reconciled, not believed
+
+A remote can accept an update and the acknowledgement can still be lost, so
+"the client saw an error" and "the remote did not take it" are different
+facts. Neither push infers delivery from an exit code.
+
+*Room CAS:* on any failure, inspect the ref — if the remote equals or descends
+from the exact local response tip, classify **delivered**; if it demonstrably
+moved without containing it, `RemoteRefMoved`; otherwise `AmbiguousDelivery`.
+An ambiguous room delivery never causes a second signed response: the local
+commit stays and the next run's recovery reconciles whether it landed.
+
+*Control results:* on any failure, fetch the remote and check each pending
+result path for byte-identical content — identical is delivered, absent stays
+pending, different is a terminal conflict, unreadable stays pending and says
+so.
 
 ## 5. Result authenticity: what a forged result can and cannot do
 
@@ -268,6 +316,10 @@ turn protocol.
 
 - Each immutable request id is processed at most once, decided by the
   service's ledger — not by the presence of a result in the untrusted queue.
+- The ledger fails closed. Only `FileNotFoundError` means "not initialised";
+  a permission or I/O error is refused, because a ledger that silently became
+  empty would let every processed request run again. Recovery is an explicit
+  human procedure, not a default.
 - A crash after the room mutation but before the result write reconciles on
   restart rather than importing twice: the participant turn protocol finds the
   durable response and returns `already_responded`. There is a regression for
@@ -436,8 +488,13 @@ service.
 4. Create the dedicated **private** repository (§7).
 5. Configure the repository-scoped deploy key and pinned `known_hosts`;
    `0600`, owned by `agentroom`.
-6. Create the room and control branches; record the room genesis and the trust
-   policy digest **out of band** for the checkpoint pins.
+6. Create the room and control branches. Record **out of band**: the room
+   genesis and the trust policy digest for the checkpoint pins, and the
+   control branch's root commit for `control_genesis` in the root-owned
+   config. The control genesis is not optional and is never learned from the
+   branch: the queue's content is untrusted either way, but its history
+   identity is what stops an erased result causing a replay, and a fresh
+   service must not let the first remote history it sees choose that anchor.
 7. Generate production participant/service keys at the human-gated step, on the
    host, owner-only.
 8. Enroll the real human device credential through the reviewed device flow

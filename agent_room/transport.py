@@ -43,6 +43,7 @@ from .checkpoint import TrustCheckpoint
 from .control_store import (
     CONTROL_SCHEMA_VERSION,
     MAX_PENDING_REQUESTS,
+    RESULTS_DIR,
     ControlConflict,
     ControlError,
     ControlStore,
@@ -55,10 +56,12 @@ from .room import AgentRoom
 from .remote_sync import (
     CANDIDATE_SUFFIX,
     MAX_DELIVERY_ATTEMPTS,
+    AmbiguousDelivery,
     Anchor,
     ControlRemote,
     RemoteRefMoved,
     RoomRemote,
+    SyncError,
     run_git,
 )
 from .supervisor import PARTICIPANT as SUPERVISOR
@@ -183,14 +186,22 @@ class TransportConfig:
         # with no remotes is a worker something else has to synchronise, which
         # is the gap this corrective pass closed; tests may construct the
         # dataclass directly for local-only mode.
-        missing = [name for name in ("room_remote", "control_remote")
+        missing = [name for name in ("room_remote", "control_remote",
+                                     "control_genesis")
                    if not getattr(config, name)]
         if missing:
             raise TransportError(
                 f"{path} is missing {missing}. An unattended transport "
-                "synchronises its own fixed remotes; without them something "
-                "outside this worker would have to run Git, which is the "
-                "broad path S3 exists to remove.")
+                "synchronises its own fixed remotes, and it pins the control "
+                "history's root out of band: without the pin the first remote "
+                "history a fresh service sees would choose its own replay "
+                "anchor, which is trust on first use for the thing that stops "
+                "erased results causing replay.")
+        if not re.match(r"\A[0-9a-f]{40}(?:[0-9a-f]{24})?\Z",
+                        config.control_genesis):
+            raise TransportError(
+                f"{path} control_genesis {config.control_genesis!r} must be a "
+                "full Git object id obtained out of band")
         return config
 
 
@@ -504,82 +515,174 @@ class TransportWorker:
                 "back queue would erase results this service already produced "
                 "and invite it to repeat the work.")
         if candidate != control.current_tip():
-            run_git(self.config.control_workdir, "merge", "--ff-only",
-                    "--quiet", candidate)
+            # `--ff-only` cannot install this when the local branch carries a
+            # service result the remote has not seen, and that divergence is
+            # ordinary under concurrent use. The local control checkout is
+            # disposable working state: the authority for our own undelivered
+            # results is the owner-only ledger, so the verified remote
+            # candidate wins for Git history and the results are re-laid on
+            # top of it afterwards.
+            run_git(self.config.control_workdir, "reset", "--hard", "--quiet",
+                    candidate)
         control.verify_history()
-        self._anchor_control(anchor, control)
-        return {"mode": "remote", "tip": control.current_tip()}
+        # The anchor advances only to a tip actually observed on the remote —
+        # never to a local-only result commit, which nobody else has seen.
+        anchor.set(genesis=probe.genesis(), last_accepted_tip=candidate)
+        return {"mode": "remote", "tip": control.current_tip(),
+                "anchor": candidate}
 
     def _expected_control_genesis(self, anchor: Anchor, probe) -> str:
+        """The pin, never the fetched branch's own answer.
+
+        Falling back to what the remote says would let the first history a
+        fresh service sees choose its own replay anchor — trust on first use
+        for exactly the thing that stops erased results causing replay.
+        """
         configured = self.config.control_genesis
         if configured:
             return configured
         recorded = anchor.get("genesis")
-        return recorded if recorded else probe.genesis()
+        if recorded:
+            return recorded
+        raise TransportRefused(
+            "no control genesis is pinned and none has been recorded: the "
+            "control history's root must be supplied out of band before a "
+            "remote queue can be accepted as this service's replay anchor")
 
     def _anchor_control(self, anchor: Anchor, control: ControlStore) -> None:
         anchor.set(genesis=control.genesis(),
                    last_accepted_tip=control.current_tip())
 
     # -- 4. delivery of results this service produced ----------------------
-    def deliver_results(self) -> list:
-        """Get durable local results onto the remote before taking new work."""
+    def materialise_pending(self, control: ControlStore) -> dict:
+        """Write every still-pending result into the local control branch.
+
+        Idempotent and repeatable. The local control checkout is disposable
+        working state that can be reconstructed from the protected ledger, so
+        this runs again after any sync that reset it.
+        """
         ledger = self._ledger()
         pending = dict(ledger.get("pending_results") or {})
-        if not pending:
+        for request_id, entry in pending.items():
+            self._check_clock("materialising a result")
+            try:
+                control.write_result(request_id, entry["document"])
+                entry["state"] = "materialised"
+            except ControlConflict:
+                # An immutable artifact already sits at this path with
+                # different content. The service cannot deliver its own
+                # result, and says so rather than overwriting.
+                entry["state"] = "conflict"
+            except ControlError as exc:
+                entry["state"] = "deferred"
+                entry["detail"] = _bounded(exc)
+        ledger.set(pending_results=pending)
+        return pending
+
+    def deliver_results(self) -> list:
+        """Deliver produced results, and clear them only once that is proven.
+
+        A result leaves the protected ledger for exactly two reasons: the
+        remote demonstrably holds byte-identical content, or an immutable
+        conflicting artifact makes it permanently undeliverable. Committing it
+        locally is not one of them — the earlier version cleared it there, so
+        a remote that moved before the push lost the result entirely.
+        """
+        ledger = self._ledger()
+        if not (ledger.get("pending_results") or {}):
             return []
         control = ControlStore(self.config.control_workdir,
                                self.config.control_branch)
         remote = self._control_remote()
-        delivered = []
-        for request_id, document in list(pending.items()):
-            self._check_clock("delivering a result")
-            try:
-                control.write_result(request_id, document)
-                outcome = "written"
-            except ControlConflict:
-                # Somebody else already wrote a different result at this id.
-                # Immutable means immutable: this fails closed rather than
-                # overwriting, and the request is not retried.
-                outcome = "conflict"
-            except ControlError as exc:
-                delivered.append({"request_id": request_id,
-                                  "status": "deferred",
-                                  "detail": _bounded(exc)})
-                continue
-            pending.pop(request_id)
-            delivered.append({"request_id": request_id, "status": outcome})
-        ledger.set(pending_results=pending)
+        self.materialise_pending(control)
 
-        if remote is not None and delivered:
-            self._push_control(control, remote)
-        return delivered
+        push_state = "local"
+        if remote is not None:
+            push_state = self._push_control(control, remote)
+        return self._confirm_results(control, remote, push_state)
 
-    def _push_control(self, control: ControlStore, remote: ControlRemote) -> dict:
-        """Bounded push. On a moved remote, verify it first and reconstruct."""
-        for attempt in range(MAX_DELIVERY_ATTEMPTS):
+    def _push_control(self, control: ControlStore, remote: ControlRemote) -> str:
+        """Bounded push. A moved remote is verified and reconstructed on."""
+        for _attempt in range(MAX_DELIVERY_ATTEMPTS):
+            self._check_clock("pushing control results")
             try:
-                return remote.push()
+                remote.push()
+                return "pushed"
             except RemoteRefMoved:
-                self._check_clock("retrying the control push")
+                # Divergence is ordinary under concurrent use: the remote
+                # gained a request while we held a result. The verified remote
+                # candidate wins for Git history, and our results are re-laid
+                # on top from the ledger.
                 self.sync_control()
-                ledger = self._ledger()
-                pending = dict(ledger.get("pending_results") or {})
-                if not pending:
-                    return {"pushed": False, "reason": "nothing left to deliver"}
-                # Re-apply on top of the verified remote history. The paths are
-                # unique per request, so nothing is overwritten and nothing of
-                # the other writer's is discarded.
-                for request_id, document in list(pending.items()):
-                    try:
-                        control.write_result(request_id, document)
-                        pending.pop(request_id)
-                    except ControlConflict:
-                        pending.pop(request_id)
-                ledger.set(pending_results=pending)
-        raise TransportError(
-            f"the control remote moved {MAX_DELIVERY_ATTEMPTS} times while "
-            "delivering results; stopping rather than looping")
+                self.materialise_pending(control)
+            except (AmbiguousDelivery, SyncError):
+                # Cannot tell, or the push failed for a reason that says
+                # nothing about acceptance. Delivery is never inferred from an
+                # exit code: confirmation against the remote's own content
+                # decides, and nothing is cleared on a guess.
+                return "ambiguous"
+        return "exhausted"
+
+    def _confirm_results(self, control: ControlStore,
+                         remote: ControlRemote | None,
+                         push_state: str) -> list:
+        """Clear a result only against evidence, never against an exit code."""
+        ledger = self._ledger()
+        pending = dict(ledger.get("pending_results") or {})
+        outcomes = []
+        observed = None
+        if remote is not None:
+            observed = self._remote_control_results(remote)
+
+        for request_id, entry in list(pending.items()):
+            document = entry["document"]
+            if remote is None:
+                # Local-only mode: the local branch is the only place a result
+                # can be, so materialised is delivered.
+                state = ("delivered" if entry.get("state") == "materialised"
+                         else entry.get("state", "pending"))
+            elif observed is None:
+                state = "unknown"
+            else:
+                state = self._classify_remote(observed, request_id, document,
+                                              entry)
+            outcomes.append({"request_id": request_id, "status": state,
+                             "push": push_state})
+            if state in ("delivered", "conflict"):
+                pending.pop(request_id)
+            else:
+                entry["state"] = state
+        ledger.set(pending_results=pending)
+        return outcomes
+
+    def _remote_control_results(self, remote: ControlRemote):
+        """The remote's own result artifacts, or None if it cannot be read."""
+        probe_branch = f"{self.config.control_branch}{CANDIDATE_SUFFIX}-confirm"
+        try:
+            if remote.fetch_candidate(probe_branch) is None:
+                return {}
+            probe = ControlStore(self.config.control_workdir, probe_branch)
+            history = probe._history()
+            return {
+                path.rsplit("/", 1)[-1][: -len(".json")]:
+                    probe._blob(path, commit)
+                for path, commit in history.items()
+                if path.startswith(f"{RESULTS_DIR}/")
+            }
+        except AgentRoomError:
+            # Unreadable is not absent. Nothing is cleared on an unknown.
+            return None
+
+    @staticmethod
+    def _classify_remote(observed: dict, request_id: str, document: dict,
+                         entry: dict) -> str:
+        expected = canonical.canonical_text(document).encode("utf-8")
+        actual = observed.get(request_id)
+        if actual is None:
+            return "conflict" if entry.get("state") == "conflict" else "pending"
+        if actual == expected:
+            return "delivered"
+        return "conflict"
 
     # -- operations --------------------------------------------------------
     def _op_status(self, store: GitMessageStore, _params: dict) -> dict:
@@ -623,6 +726,15 @@ class TransportWorker:
                 return {"import": result, "delivery": {"mode": "local"}}
             try:
                 pushed = remote.push_with_lease(expected)
+            except AmbiguousDelivery as exc:
+                # Neither delivered nor demonstrably refused. Do not sign a
+                # second response: the local commit stays, and the next run's
+                # recovery reconciles whether it landed.
+                return {"import": result,
+                        "delivery": {"mode": "remote", "status": "ambiguous",
+                                     "tip": store.current_tip(),
+                                     "lease": expected,
+                                     "detail": _bounded(exc)}}
             except RemoteRefMoved:
                 # The ref moved. Recompute the reviewed context against what
                 # is there now; a changed context is stale, full stop.
@@ -794,7 +906,11 @@ class TransportWorker:
                                 "at": result["completed_at"],
                                 "room_tip": store_tip}
         pending = dict(ledger.get("pending_results") or {})
-        pending[request_id] = result
+        # `produced`: this service made it and has not proven it reached the
+        # remote. It stays here through `materialised`, and leaves only on
+        # `delivered` or a terminal `conflict`.
+        pending[request_id] = {"document": result, "state": "produced",
+                               "at": result["completed_at"]}
         ledger.set(requests=requests, pending_results=pending)
         return {"request_id": request_id, "operation": operation,
                 "status": status}

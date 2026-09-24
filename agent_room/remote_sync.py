@@ -69,7 +69,8 @@ STATE_DIR_MODE = 0o700
 
 __all__ = [
     "GIT_TIMEOUT_SECONDS", "MAX_DELIVERY_ATTEMPTS", "CANDIDATE_SUFFIX",
-    "SyncError", "RemoteRefMoved", "CandidateRejected", "run_git",
+    "SyncError", "RemoteRefMoved", "CandidateRejected", "AmbiguousDelivery",
+    "run_git",
     "Anchor", "RoomRemote", "ControlRemote",
 ]
 
@@ -84,6 +85,17 @@ class RemoteRefMoved(SyncError):
 
 class CandidateRejected(SyncError):
     """A fetched candidate did not verify, so it was not installed."""
+
+
+class AmbiguousDelivery(SyncError):
+    """The push failed, and whether the remote accepted it is unknown.
+
+    A distinct state on purpose. "The client saw an error" and "the remote did
+    not take it" are different facts, and a network failure after acceptance
+    makes them come apart. Inferring delivery from an exit code would mean
+    either losing a delivered result or producing a second one; this says so
+    instead, and the caller reconciles against the remote rather than guessing.
+    """
 
 
 def _now_iso() -> str:
@@ -141,8 +153,19 @@ class Anchor:
     def _load(self) -> dict:
         try:
             raw = self.path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
+            # The only "not initialised yet" there is.
             return {"kind": self.kind, "created_at": _now_iso()}
+        except OSError as exc:
+            # Permission denied, an I/O error or a bad path are *not* an empty
+            # ledger. Treating them as one is fail-open: a processed-request
+            # ledger that silently became empty would let every request run
+            # again. Recovery is an explicit human procedure, not a default.
+            raise SyncError(
+                f"cannot read the {self.kind} at {self.path}: {exc}. This is "
+                "not treated as 'not initialised': an unreadable ledger that "
+                "became empty would let processed requests run a second time."
+            ) from exc
         document = canonical.strict_loads(raw)
         if not isinstance(document, dict) or document.get("kind") != self.kind:
             raise SyncError(f"{self.path} is not a {self.kind} anchor")
@@ -251,8 +274,12 @@ class RoomRemote(_Remote):
 
         The lease is the atomic comparison, not a licence to rewrite: our
         commit is a fast-forward from the expected head, so nothing valid is
-        ever discarded. If the ref moved, this reports it and the caller
-        decides — recompute the context and fail stale, or reconstruct.
+        ever discarded.
+
+        A non-zero exit is *not* taken as "the remote did not accept it". The
+        remote can accept an update and the acknowledgement can still be lost,
+        so any failure is reconciled against the ref itself before it is
+        classified — delivered, moved, or honestly unknown.
         """
         local = self.local_tip()
         if local is None:
@@ -267,14 +294,36 @@ class RoomRemote(_Remote):
             self.remote, f"{self.ref}:{self.ref}", check=False)
         if result.returncode == 0:
             return {"pushed": True, "tip": local}
+
         stderr = result.stderr.decode("utf-8", "replace").strip()
-        if "stale info" in stderr or "non-fast-forward" in stderr or \
-                "rejected" in stderr:
+        return self._classify_failed_push(local, expected_remote_oid, stderr)
+
+    def _classify_failed_push(self, local: str, expected: str | None,
+                              stderr: str) -> dict:
+        """Ask the remote what happened, rather than reading the exit code."""
+        try:
+            landed = self.contains_remotely(local)
+        except SyncError as exc:
+            raise AmbiguousDelivery(
+                f"the push of {self.ref} failed ({stderr[:120]}) and the "
+                f"remote could not be inspected ({exc}); whether the response "
+                "was delivered is unknown, and it will be reconciled rather "
+                "than sent again"
+            ) from exc
+        if landed:
+            # Accepted, acknowledgement lost. Delivered is delivered.
+            return {"pushed": True, "tip": local, "ack": "recovered"}
+
+        observed = self.remote_tip()
+        if observed is not None and observed != expected:
             raise RemoteRefMoved(
                 f"the remote {self.ref} is no longer "
-                f"{str(expected_remote_oid)[:12]}; the lease refused the push "
-                "rather than delivering a review of a head that has moved")
-        raise SyncError(f"push of {self.ref} failed: {stderr[:300]}")
+                f"{str(expected)[:12]}; the lease refused the push rather "
+                "than delivering a review of a head that has moved")
+        raise AmbiguousDelivery(
+            f"the push of {self.ref} failed ({stderr[:200]}) and the remote "
+            f"neither contains {local[:12]} nor demonstrably moved; the "
+            "delivery state is unknown")
 
     def contains_remotely(self, oid: str) -> bool:
         """Is this commit already on the remote ref? Reconciliation, not hope."""
@@ -291,7 +340,13 @@ class ControlRemote(_Remote):
     """The untrusted control branch: bounded fetch in, bounded push out."""
 
     def push(self) -> dict:
-        """Ordinary fast-forward push. Never forced, never discarding."""
+        """Ordinary fast-forward push. Never forced, never discarding.
+
+        Like the room push, a failure is reconciled rather than believed: the
+        caller confirms each pending result against the remote's own content,
+        so a lost acknowledgement does not lose a result and does not produce
+        a second one.
+        """
         local = self.local_tip()
         result = run_git(self.workdir, "push", self.remote,
                          f"{self.ref}:{self.ref}", check=False)
@@ -304,4 +359,9 @@ class ControlRemote(_Remote):
                 f"the control remote moved; {self.ref} was not pushed. The "
                 "remote candidate must be fetched and verified before "
                 "retrying, and history is never discarded to make room.")
-        raise SyncError(f"push of {self.ref} failed: {stderr[:300]}")
+        if local is not None and self.remote_tip() == local:
+            return {"pushed": True, "tip": local, "ack": "recovered"}
+        raise AmbiguousDelivery(
+            f"the control push failed ({stderr[:200]}) and the remote tip is "
+            "not the local one; each pending result is confirmed against the "
+            "remote's content before anything is cleared")
