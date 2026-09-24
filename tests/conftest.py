@@ -14,7 +14,9 @@ if str(ROOT) not in sys.path:
 from tests.conftest_agent_room import (  # noqa: E402,F401
     CONTEXT_SHA,
     SNAPSHOT_SHA,
+    SIGNED_ROLES,
     bare_remote,
+    build_trust,
     ACTION_SAMPLES,
     BASE_COMMIT,
     PROJECT,
@@ -24,5 +26,8 @@ from tests.conftest_agent_room import (  # noqa: E402,F401
     git,
     post_decision_request,
     room,
+    signed_room,
+    signed_store,
     store,
+    trust_material,
 )

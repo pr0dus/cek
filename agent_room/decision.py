@@ -2,6 +2,18 @@
 
 Two things live here, and keeping them apart is the point.
 
+**Since S2, authority is cryptographic.** A decision record carries authority
+only when it is signed by the credential pinned for `human` in the trust
+policy — and that credential never exists on this host. The ceremony is split
+for exactly that reason: `prepare()` builds the unsigned decision and hands
+back the bytes to sign, a trusted personal device shows the action summary and
+signs after a biometric unlock, and `submit()` attaches the assertion. Nothing
+here can produce a human signature, which is the point.
+
+Capability separation below remains, and still matters: it is what stops an
+agent *surface* from reaching the write path at all, one layer before the
+signature would have refused it.
+
 **The authority surface.** `HumanDecisionAuthority` is the only caller of
 `GitMessageStore.append_decision`, which is the only path in the package that
 validates `agent_facing=False` and can therefore write an `approval` or a
@@ -28,10 +40,11 @@ There is no timeout and no auto-approval. A pending decision blocks for as
 long as it stays pending.
 """
 
+import base64
 import datetime as dt
 import hashlib
 
-from . import canonical
+from . import auth, canonical
 from .errors import AgentRoomError, ForbiddenOperation, UnresolvedReference
 from .ids import uuid7
 from .schema import (
@@ -475,7 +488,7 @@ class HumanDecisionAuthority:
             "body": request.get("body") or {},
         }
 
-    def record(
+    def prepare(
         self,
         request_message_id: str,
         verdict: str,
@@ -487,7 +500,124 @@ class HumanDecisionAuthority:
         expect_action_id: str | None = None,
         timestamp: str | None = None,
     ) -> dict:
-        """Record one human approval or rejection, bound to the request."""
+        """Build the unsigned decision and the exact bytes a device must sign.
+
+        Half of the ceremony. The other half happens on a personal device this
+        host cannot reach into: it shows the summary below, unlocks the
+        credential with a biometric gesture, signs `payload` and returns only a
+        signature. The biometric never leaves the device and never touches
+        Agent Room.
+
+        The signed bytes are the whole decision, so a signature cannot be moved
+        to another message, another action or another verdict — each of those
+        changes the payload.
+        """
+        envelope = self._build(
+            request_message_id, verdict, decision_id=decision_id, note=note,
+            expect_snapshot_sha256=expect_snapshot_sha256,
+            expect_supervisor_context_sha256=expect_supervisor_context_sha256,
+            expect_action_id=expect_action_id, timestamp=timestamp,
+        )
+        record = envelope["decision"]
+        header, payload = None, b""
+        if self.store.trust is not None:
+            human = self.store.trust.current_human_key()
+            header = auth.auth_header(signer=self.participant,
+                                      key_id=human["key_id"],
+                                      method=human["method"])
+            payload = auth.signed_payload(envelope, header)
+        return {
+            "envelope": envelope,
+            "auth_header": header,
+            "payload_b64": base64.b64encode(payload).decode("ascii"),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            # What a person is shown before their fingerprint unlocks
+            # anything. Prose is for them; the digest is what is signed.
+            "summary": {
+                "decision": verdict,
+                "action_id": record["action_id"],
+                "action_scope": record["action_scope"],
+                "parameters": record.get("parameters"),
+                "project": record["binding"].get("project"),
+                "snapshot_sha256": record["binding"]["snapshot_sha256"],
+                "supervisor_context_sha256":
+                    record["binding"]["supervisor_context_sha256"],
+                "request_message_id": record["request_message_id"],
+                "decision_id": record["decision_id"],
+            },
+        }
+
+    def submit(self, prepared: dict, signature: str) -> dict:
+        """Attach a device assertion to a prepared decision and append it."""
+        envelope, header = prepared["envelope"], prepared["auth_header"]
+        if header is None:
+            raise DecisionError(
+                "this store pins no trust policy, so there is no human "
+                "credential to assert with"
+            )
+        if not isinstance(signature, str) or not signature.strip():
+            raise DecisionError("a device assertion is required")
+        sealed = canonical.seal({**envelope,
+                                 auth.AUTH_FIELD: {**header,
+                                                   "signature": signature}})
+        return self._append(sealed, envelope["decision"])
+
+    def _append(self, sealed: dict, record: dict) -> dict:
+        result = self.store.append_decision(sealed)
+        result["decision_id"] = record["decision_id"]
+        result["decision"] = record["decision"]
+        result["decision_binding_sha256"] = record["decision_binding_sha256"]
+        return result
+
+    def record(
+        self,
+        request_message_id: str,
+        verdict: str,
+        *,
+        signer=None,
+        decision_id: str | None = None,
+        note: str | None = None,
+        expect_snapshot_sha256: str | None = None,
+        expect_supervisor_context_sha256: str | None = None,
+        expect_action_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict:
+        """Record one human approval or rejection, bound to the request.
+
+        `signer` is for a **disposable or test** credential held on this host.
+        A real human credential is never here, so the real ceremony is
+        `prepare()` on this host and `submit()` with what the device returns.
+        """
+        envelope = self._build(
+            request_message_id, verdict, decision_id=decision_id, note=note,
+            expect_snapshot_sha256=expect_snapshot_sha256,
+            expect_supervisor_context_sha256=expect_supervisor_context_sha256,
+            expect_action_id=expect_action_id, timestamp=timestamp,
+        )
+        if self.store.trust is not None:
+            if signer is None:
+                raise DecisionError(
+                    "this store is authenticated: a decision needs a signature "
+                    "from the pinned human credential. Use prepare()/submit() "
+                    "with the trusted device, or pass a disposable signer in a "
+                    "test."
+                )
+            envelope = auth.sign_envelope(envelope, signer)
+        return self._append(canonical.seal(envelope), envelope["decision"])
+
+    def _build(
+        self,
+        request_message_id: str,
+        verdict: str,
+        *,
+        decision_id: str | None = None,
+        note: str | None = None,
+        expect_snapshot_sha256: str | None = None,
+        expect_supervisor_context_sha256: str | None = None,
+        expect_action_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict:
+        """The unsigned decision envelope. Shared by every entry point."""
         if verdict not in DECISION_VERDICTS:
             raise DecisionError(
                 f"decision must be one of {sorted(DECISION_VERDICTS)}, got "
@@ -556,8 +686,4 @@ class HumanDecisionAuthority:
             "human_approval_required": False,
             "decision": record,
         }
-        result = self.store.append_decision(canonical.seal(envelope))
-        result["decision_id"] = record["decision_id"]
-        result["decision"] = verdict
-        result["decision_binding_sha256"] = record["decision_binding_sha256"]
-        return result
+        return envelope

@@ -22,6 +22,7 @@ import time
 import pytest
 
 from agent_room import AgentRoom, GitMessageStore, ParticipantCursor, canonical
+from agent_room.auth import sign_envelope
 from agent_room.claude_participant import ClaudeAdapterError, ClaudeInvoker
 from agent_room.codex_participant import CodexAdapterError, CodexInvoker
 from agent_room.decision import HumanDecisionAuthority, evaluate_gate
@@ -51,16 +52,76 @@ from agent_room.release import (
     canonical_repo_identity,
     identity_matches,
     receipt_state,
-    reconcile,
-    reserve,
 )
+from agent_room.release import reconcile as _reconcile
+from agent_room.release import reserve as _reserve
 from agent_room.snapshot import SnapshotError, snapshot_manifest
 from agent_room.supervisor import context_digest
 from agent_room.tool_profiles import QUALIFIED_PROFILES, ToolProfileUnavailable, resolve
-from tests.conftest_agent_room import ACTION_SAMPLES, configure_identity, git
+from tests.conftest_agent_room import (
+    ACTION_SAMPLES,
+    build_trust,
+    configure_identity,
+    git,
+)
 
 
 # ===== fixtures ============================================================
+#
+# This whole module now runs **authenticated**. S2 makes a pinned trust policy
+# mandatory on every release-capable path, so verifying S1's properties in the
+# unauthenticated configuration would be verifying a configuration that is no
+# longer reachable. The disposable keys below stand in for credentials that in
+# production live on a phone (the human) or in owner-only files (participants).
+
+
+@pytest.fixture
+def store(tmp_path):
+    room_store = GitMessageStore.initialise(tmp_path / "room",
+                                            branch="agent-room")
+    configure_identity(room_store.workdir)
+    policy, signers = build_trust(tmp_path / "keys", room_store)
+    room_store.trust = policy
+    # Test-only scaffolding: private keys never live on a store in production,
+    # and nothing in `agent_room` reads this attribute.
+    room_store._test_signers = signers
+    return room_store
+
+
+@pytest.fixture
+def signers(store):
+    return store._test_signers
+
+
+@pytest.fixture
+def room(store, signers, tmp_path):
+    return AgentRoom(store, "claude-code",
+                     ParticipantCursor(tmp_path / "state", "claude-code"),
+                     signer=signers["claude-code"])
+
+
+#: Populated per test by the autouse fixture below, so the S1 assertions keep
+#: reading as assertions about S1 rather than about signing.
+_SIGNERS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _wire_signers(request):
+    _SIGNERS.clear()
+    if "store" in request.fixturenames:
+        _SIGNERS.update(request.getfixturevalue("signers"))
+    yield
+    _SIGNERS.clear()
+
+
+def reserve(store, *args, **kwargs):
+    kwargs.setdefault("signer", _SIGNERS.get("release-recorder"))
+    return _reserve(store, *args, **kwargs)
+
+
+def reconcile(store, *args, **kwargs):
+    kwargs.setdefault("signer", _SIGNERS.get("release-recorder"))
+    return _reconcile(store, *args, **kwargs)
 
 @pytest.fixture
 def target(tmp_path):
@@ -136,8 +197,14 @@ def consequential(store, room, target):
 
 
 def approve(store, consequential):
+    """A human approval signed by the disposable human credential.
+
+    In production this is `prepare()` here and `submit()` with what a phone
+    returns; the signature is the same shape either way.
+    """
     return HumanDecisionAuthority(store).record(
-        consequential["request_id"], "approve", decision_id="hd-s1")
+        consequential["request_id"], "approve", decision_id="hd-s1",
+        signer=_SIGNERS.get("human"))
 
 
 def raw_commit(repo, rel, text, message):
@@ -737,21 +804,20 @@ def test_a_thread_is_bounded_before_a_model_is_invoked(store, room, monkeypatch)
 
 # ===== S2 boundary, stated rather than implied =============================
 
-def test_KNOWN_S2_GAP_raw_git_can_still_forge_human_authority(store, room,
-                                                             target,
-                                                             consequential):
+def test_RAW_GIT_HUMAN_FORGERY(store, room, target, consequential):
     """RAW_GIT_HUMAN_FORGERY: `{"releasable": true, "state": "released"}`.
 
-    **This test asserts that the attack still works.** Authenticating identity
-    is Stage S2, and S1's contract is explicit that it must not pretend
-    otherwise. Capability separation stops an agent *surface* from authoring a
-    decision; it says nothing about someone who can write to the Git remote,
-    because `sender.agent` is a string in a file.
+    **This test used to assert that the attack worked.** It was the named S2
+    blocker: capability separation stopped an agent *surface* from authoring a
+    decision, but said nothing about someone who could write to the Git
+    remote, because `sender.agent` was a string in a file.
 
-    S2 must invert this test: with the human key pinned, a decision record not
-    signed by it carries no authority, and `verify_store` fails closed on one
-    that claims to be human without the signature.
+    S2 inverted it. The forged approval is still perfectly well-formed and
+    still correctly hashed; it simply carries no signature by the pinned human
+    credential, so the read path refuses it and the whole store fails closed
+    rather than releasing on it.
     """
+    from agent_room.auth import UnauthenticatedMessage
     from agent_room.decision import binding_digest
 
     described = HumanDecisionAuthority(store).describe(consequential["request_id"])
@@ -782,12 +848,10 @@ def test_KNOWN_S2_GAP_raw_git_can_still_forge_human_authority(store, room,
     rel = store.message_path("t1", envelope["message_id"])
     raw_commit(store.workdir, rel, canonical.canonical_text(envelope), "forged")
 
-    result = authorise(store, consequential["request_id"],
-                       workdir=target["path"])
-    assert result["authorised"] is True, (
-        "S1 does not authenticate identity; this is the S2 blocker"
-    )
-    assert result["decision_id"] == "forged-by-raw-git"
+    with pytest.raises(UnauthenticatedMessage, match="a name is a claim"):
+        authorise(store, consequential["request_id"], workdir=target["path"])
+    with pytest.raises(UnauthenticatedMessage):
+        store.verify_store()
 
 
 # ===== tooling stays closed ================================================
@@ -925,7 +989,8 @@ def test_CONCURRENT_RESERVE(store, room, target, consequential):
     approve(store, consequential)
 
     def attempt(_index):
-        own = GitMessageStore(store.workdir, branch=store.branch)
+        own = GitMessageStore(store.workdir, branch=store.branch,
+                              trust=store.trust)
         return reserve(own, consequential["request_id"],
                        workdir=target["path"])
 
@@ -982,7 +1047,8 @@ def test_CONCURRENT_RECONCILE(store, room, target, consequential):
     reserve(store, consequential["request_id"], workdir=target["path"])
 
     def attempt(index):
-        own = GitMessageStore(store.workdir, branch=store.branch)
+        own = GitMessageStore(store.workdir, branch=store.branch,
+                              trust=store.trust)
         return reconcile(own, consequential["request_id"], status="executed",
                          result={"worker": index})
 
@@ -1005,7 +1071,8 @@ def test_reconcile_without_a_reservation_is_refused(store, room, target,
 
 
 def test_an_impossible_receipt_history_fails_verification(store, room, target,
-                                                          consequential):
+                                                          consequential,
+                                                          signers):
     """Two reservations for one nonce are not a history to read past.
 
     The write path cannot produce this; a Git writer can. Verification refuses
@@ -1017,10 +1084,14 @@ def test_an_impossible_receipt_history_fails_verification(store, room, target,
     duplicate = [m for m in store.thread_messages("t1")
                  if m["type"] == "execution_receipt"][0]
     forged = {k: v for k, v in duplicate.items()
-              if k != canonical.DIGEST_FIELD}
+              if k not in (canonical.DIGEST_FIELD, "auth")}
     forged["message_id"] = uuid7()
     forged["receipt"] = dict(forged["receipt"], receipt_id="rx-forged")
-    sealed = canonical.seal(forged)
+    # Signed with the real release-recorder key: the lifecycle invariant has
+    # to hold even against a correctly authenticated impossible history, which
+    # is what a compromised host key would produce.
+    sealed = canonical.seal(
+        sign_envelope(forged, signers["release-recorder"]))
     raw_commit(store.workdir, store.message_path("t1", sealed["message_id"]),
                canonical.canonical_text(sealed), "second reservation")
 
@@ -1029,7 +1100,7 @@ def test_an_impossible_receipt_history_fails_verification(store, room, target,
 
 
 def test_a_terminal_receipt_without_a_reservation_fails_verification(
-        store, room, target, consequential):
+        store, room, target, consequential, signers):
     approve(store, consequential)
     request = store.resolve_message(consequential["request_id"])
     receipt = {
@@ -1040,7 +1111,7 @@ def test_a_terminal_receipt_without_a_reservation_fails_verification(
         "decision_id": "hd-s1", "status": "executed",
         "recorded_at": "2026-09-24T09:00:00Z", "result": {},
     }
-    sealed = canonical.seal({
+    sealed = canonical.seal(sign_envelope({
         "schema_version": 1, "message_id": uuid7(),
         "timestamp": "2026-09-24T09:00:00Z",
         "sender": {"agent": "release-recorder"}, "recipient": {"broadcast": True},
@@ -1048,7 +1119,7 @@ def test_a_terminal_receipt_without_a_reservation_fails_verification(
         "parent_id": request["message_id"], "body": {"text": "orphan"},
         "evidence": [], "status": "open", "reply_requested": False,
         "human_approval_required": False, "receipt": receipt,
-    })
+    }, signers["release-recorder"]))
     raw_commit(store.workdir, store.message_path("t1", sealed["message_id"]),
                canonical.canonical_text(sealed), "orphan terminal receipt")
 
@@ -1097,11 +1168,14 @@ def test_reserve_is_what_grants_the_manual_step(store, room, target,
 
 def test_the_cli_authorise_output_says_it_is_not_permission(store, room, target,
                                                             consequential,
-                                                            capsys):
+                                                            capsys, tmp_path):
     from agent_room.cli import build_parser, main
 
     approve(store, consequential)
+    policy_path = tmp_path / "trust.json"
+    store.trust.save(policy_path)
     code = main(["--repo", str(store.workdir), "--participant", "coordinator",
+                 "--trust-policy", str(policy_path),
                  "release-authorise", "--request-id",
                  consequential["request_id"], "--target", str(target["path"])])
     assert code == 0

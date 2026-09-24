@@ -20,10 +20,40 @@ from .room import AgentRoom
 EXIT_PARTIAL_DELIVERY = 3
 
 
+def _trust(args):
+    """Load the pinned trust policy, or None in the legacy unauthenticated mode.
+
+    There is deliberately no `--trust-any`: a release-capable command with no
+    policy fails closed rather than offering a flag that turns the whole S2
+    boundary off.
+    """
+    if not getattr(args, "trust_policy", None):
+        return None
+    from .trust import TrustPolicy
+
+    return TrustPolicy.load(args.trust_policy)
+
+
+def _store(args) -> GitMessageStore:
+    return GitMessageStore(args.repo, branch=args.branch, remote=args.remote,
+                           trust=_trust(args))
+
+
+def _signer(args):
+    """An Ed25519 signer from an owner-only key file, when one was given."""
+    if not getattr(args, "signing_key", None):
+        return None
+    from .auth import Ed25519Signer
+
+    return Ed25519Signer(args.signing_key,
+                         signer=args.signer_name or args.participant,
+                         key_id=args.key_id)
+
+
 def _room(args) -> AgentRoom:
-    store = GitMessageStore(args.repo, branch=args.branch, remote=args.remote)
+    store = _store(args)
     cursor = ParticipantCursor(args.state_dir, args.participant) if args.state_dir else None
-    return AgentRoom(store, args.participant, cursor)
+    return AgentRoom(store, args.participant, cursor, signer=_signer(args))
 
 
 def _emit(obj) -> None:
@@ -51,6 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote", default=None, help="optional push remote")
     p.add_argument("--participant", required=True, help="this participant's agent name")
     p.add_argument("--state-dir", default=None, help="participant-local cursor directory")
+    p.add_argument("--trust-policy", default=None,
+                   help="pinned public verification identities. Required by "
+                        "every release-capable command; without one nothing "
+                        "is authenticated and any Git writer can claim any "
+                        "identity.")
+    p.add_argument("--signing-key", default=None,
+                   help="owner-only Ed25519 private key file used to sign "
+                        "outbound messages")
+    p.add_argument("--key-id", default=None, help="key id for --signing-key")
+    p.add_argument("--signer-name", default=None,
+                   help="identity --signing-key signs as (defaults to "
+                        "--participant)")
     sub = p.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create the orphan room branch in --repo")
@@ -254,6 +296,55 @@ def build_parser() -> argparse.ArgumentParser:
     recon.add_argument("--status", required=True, choices=["executed", "failed"])
     recon.add_argument("--result", default=None, help="JSON object")
 
+    trust_show = sub.add_parser(
+        "trust-show",
+        help="print the pinned trust policy: public material only",
+    )
+
+    cp_boot = sub.add_parser(
+        "checkpoint-bootstrap",
+        help="anchor this room for the first time against a genesis identity "
+             "obtained OUT OF BAND. There is no trust on first use.",
+    )
+    cp_boot.add_argument("--state", required=True, help="checkpoint file path")
+    cp_boot.add_argument("--expected-genesis", required=True,
+                         help="the room's root commit, from a source that is "
+                              "not the remote being anchored")
+    cp_boot.add_argument("--expected-tip", default=None)
+
+    cp_accept = sub.add_parser(
+        "checkpoint-accept",
+        help="verify a candidate head and, only if everything passes, advance "
+             "the monotonic trust anchor",
+    )
+    cp_accept.add_argument("--state", required=True)
+    cp_accept.add_argument("--tip", default=None,
+                           help="candidate head (default: the current tip)")
+
+    cp_status = sub.add_parser("checkpoint-status", help="show the trust anchor")
+    cp_status.add_argument("--state", required=True)
+
+    prepare = sub.add_parser(
+        "human-prepare",
+        help="build an unsigned human decision and print the exact bytes a "
+             "trusted device must sign. Writes nothing.",
+    )
+    prepare.add_argument("--request-id", required=True)
+    prepare.add_argument("--decision", required=True,
+                         choices=["approve", "reject"])
+    prepare.add_argument("--decision-id", default=None)
+    prepare.add_argument("--note", default=None)
+    prepare.add_argument("--out", required=True,
+                         help="file to write the prepared decision to")
+
+    submit = sub.add_parser(
+        "human-submit",
+        help="attach a device assertion to a prepared decision and record it",
+    )
+    submit.add_argument("--prepared", required=True)
+    submit.add_argument("--signature", required=True,
+                        help="base64 assertion returned by the trusted device")
+
     verify_art = sub.add_parser(
         "verify-artifact",
         help="rehash a stored proof artifact and check it against the digest "
@@ -321,11 +412,50 @@ def main(argv=None) -> int:
                    "proof_sha256": checked["proof_sha256"],
                    "verified": True})
             return 0
+        if args.command in ("trust-show", "checkpoint-bootstrap",
+                            "checkpoint-accept", "checkpoint-status"):
+            from .checkpoint import TrustCheckpoint
+            if args.command == "checkpoint-status":
+                _emit(TrustCheckpoint.load(args.state).status())
+                return 0
+            store = _store(args)
+            if args.command == "trust-show":
+                store.assert_authenticated("trust-show")
+                _emit(store.trust.document)
+                return 0
+            if args.command == "checkpoint-bootstrap":
+                _emit(TrustCheckpoint.bootstrap(
+                    store, expected_genesis=args.expected_genesis,
+                    expected_tip=args.expected_tip, path=args.state).status())
+                return 0
+            _emit(TrustCheckpoint.load(args.state).accept(store, args.tip))
+            return 0
+        if args.command in ("human-prepare", "human-submit"):
+            from . import decision as decision_mod
+            store = _store(args)
+            store.assert_authenticated("recording a human decision")
+            authority = decision_mod.HumanDecisionAuthority(store)
+            if args.command == "human-prepare":
+                prepared = authority.prepare(
+                    args.request_id, args.decision,
+                    decision_id=args.decision_id, note=args.note)
+                Path(args.out).write_text(
+                    canonical.canonical_text(prepared), encoding="utf-8")
+                _emit({"written": args.out,
+                       "payload_sha256": prepared["payload_sha256"],
+                       "summary": prepared["summary"],
+                       "next_step": "sign payload_b64 on the trusted device, "
+                                    "then agent-room human-submit"})
+                return 0
+            prepared = canonical.strict_loads(
+                Path(args.prepared).read_text(encoding="utf-8"))
+            _emit(authority.submit(prepared, args.signature))
+            return 0
         if args.command in ("release-authorise", "release-reserve",
                             "release-reconcile"):
             from . import release as release_mod
-            store = GitMessageStore(args.repo, branch=args.branch,
-                                    remote=args.remote)
+            store = _store(args)
+            store.assert_authenticated(f"{args.command}")
             if args.command == "release-authorise":
                 _emit(release_mod.authorise(store, args.request_id,
                                             workdir=args.target))
@@ -341,11 +471,12 @@ def main(argv=None) -> int:
                     )
                     return 2
                 _emit(release_mod.reserve(store, args.request_id,
-                                          workdir=args.target))
+                                          workdir=args.target,
+                                          signer=_signer(args)))
                 return 0
             _emit(release_mod.reconcile(
                 store, args.request_id, status=args.status,
-                result=_json_arg(args.result, {})))
+                result=_json_arg(args.result, {}), signer=_signer(args)))
             return 0
         if args.command == "proof":
             from .proof import run_proof
@@ -359,8 +490,7 @@ def main(argv=None) -> int:
             return 0
         if args.command in ("gate-status", "pending-decisions", "human-decide"):
             from . import decision as decision_mod
-            store = GitMessageStore(args.repo, branch=args.branch,
-                                    remote=args.remote)
+            store = _store(args)
             if args.command == "gate-status":
                 _emit(decision_mod.evaluate_gate(
                     store, args.request_id,
@@ -388,8 +518,12 @@ def main(argv=None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+            # Checked after the flags, because none of these paths writes
+            # anything and a useful message about a missing flag is worth more
+            # than strict ordering between two refusals.
+            store.assert_authenticated("recording a human decision")
             _emit(authority.record(
-                args.request_id, args.decision,
+                args.request_id, args.decision, signer=_signer(args),
                 decision_id=args.decision_id, note=args.note,
                 expect_action_id=args.expect_action_id,
                 expect_snapshot_sha256=args.expect_snapshot_sha256,

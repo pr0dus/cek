@@ -215,9 +215,13 @@ def test_the_authority_surface_derives_bindings_from_the_stored_request(
     supplied = set(signature.parameters) - {"self", "request_message_id",
                                             "verdict"}
     assert supplied == {
-        "decision_id", "note", "expect_snapshot_sha256",
+        "signer", "decision_id", "note", "expect_snapshot_sha256",
         "expect_supervisor_context_sha256", "expect_action_id", "timestamp",
     }, "record() must take no binding value it would trust over the request"
+    # `expect_*` are assertions to be refused on mismatch, never values to
+    # adopt; nothing here supplies a binding the request does not already hold.
+    assert not [name for name in supplied
+                if name.endswith("_sha256") and not name.startswith("expect_")]
 
 
 def test_an_unbound_decision_request_can_never_release_anything(store, room):

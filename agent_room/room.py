@@ -10,7 +10,7 @@ Nothing here executes anything. Posting a message is the whole capability.
 import datetime as dt
 from typing import Any, Iterable
 
-from . import canonical
+from . import auth, canonical
 from .cursor import ParticipantCursor
 from .errors import (
     AgentRoomError,
@@ -35,15 +35,25 @@ class AgentRoom:
         store: GitMessageStore,
         participant: str,
         cursor: ParticipantCursor | None = None,
+        signer=None,
     ) -> None:
         if participant in RESERVED_PARTICIPANTS:
             raise ForbiddenOperation(
                 f"{participant!r} is reserved for the human decision surface; "
                 "an agent room cannot post under it"
             )
+        if signer is not None and signer.signer != participant:
+            raise ForbiddenOperation(
+                f"this room posts as {participant!r} but was given a signer "
+                f"for {signer.signer!r}; a participant signs as itself or not "
+                "at all"
+            )
         self.store = store
         self.participant = participant
         self.cursor = cursor
+        #: Signs outbound messages. Required when the store pins a trust
+        #: policy, because an authenticated room accepts nothing unsigned.
+        self.signer = signer
 
     # -- write -------------------------------------------------------------
     def build_envelope(
@@ -129,6 +139,17 @@ class AgentRoom:
         # The store is its own authority for references; nothing the caller
         # supplies can assert that a parent or evidence message exists.
         validate_envelope(envelope, agent_facing=True, resolver=self.store)
+        # Sign, then seal: the envelope digest covers the signature, and the
+        # signature covers everything the digest does not. Doing it the other
+        # way round would make the two circular.
+        if self.store.trust is not None:
+            if self.signer is None:
+                raise ForbiddenOperation(
+                    f"this room posts into an authenticated store but "
+                    f"{self.participant!r} has no signing key; an unsigned "
+                    "message would be indistinguishable from a forged one"
+                )
+            envelope = auth.sign_envelope(envelope, self.signer)
         return self.store.append(canonical.seal(envelope))
 
     def reply(self, parent_id: str, **kwargs) -> dict:

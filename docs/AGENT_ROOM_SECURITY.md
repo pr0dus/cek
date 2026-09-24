@@ -1,15 +1,20 @@
 # Agent Room — security model
 
-Issue #13. Written against `426089ce…` and covering **Stage S1 only**: local
-fail-closed hardening. Identity authentication (S2) and the narrow transport
-service (S3) are not implemented, and this document says so everywhere it
-matters rather than in a footnote.
+Issue #13, through **Stage S2**. S1 was local fail-closed hardening; S2 made
+cryptographic provenance the authority boundary and added a monotonic trust
+anchor for the transport. The narrow transport service (S3) is not
+implemented, and this document says so everywhere it matters rather than in a
+footnote.
 
-The honest summary: S1 closes every local integrity, filesystem and release
-defect the red team reproduced. It does **not** make identity authentic. A
-writer to the Git remote can still forge a human approval, and that is the
-expected S2 blocker — there is a test asserting the attack still works, so the
-gap cannot quietly disappear from view.
+The honest summary: S1 closed every local integrity, filesystem and release
+defect the red team reproduced. S2 closed identity — a writer to the Git remote
+can no longer forge a human approval, a participant message or an execution
+receipt, and the test that used to assert the forgery worked now asserts it
+fails. What remains open is the host itself: participant keys live here, so an
+attacker who holds those files can sign as those participants. The human
+credential deliberately does not live here.
+
+The identity design in full: `docs/AGENT_ROOM_AUTH.md`.
 
 ---
 
@@ -28,12 +33,12 @@ Not protected against by S1:
 
 | # | Adversary | Stage |
 |---|---|---|
-| 1 | write access to the Agent Room Git remote | **S2** — participant and human signatures |
+| 1 | write access to the Agent Room Git remote | closed — every trusted artifact is signed by a pinned key |
+| 9 | remote branch rollback or force replacement | closed — monotonic checkpoint, descendant-only |
 | 2 | injected requests on the existing bridge control branch | **S3** — narrow transport |
 | — | a descendant that detaches from the process group | **S3** — cgroup/PID namespace |
-| 3 | a compromised Claude or Codex process | **S2** (partially; capability limits already apply) |
-| 4 | a compromised ChatGPT/GitHub connector credential | **S2 + S3** |
-| 9 | remote branch rollback or force replacement | **S2** — trust anchor and last-seen checkpoint |
+| 3 | a compromised Claude or Codex process | partly — capability limits apply; a stolen host key still signs |
+| 4 | a compromised ChatGPT/GitHub connector credential | impersonation closed; **S3** for the shell it still grants |
 
 **Explicit non-goal.** Nothing here survives an attacker with arbitrary root or
 kernel control on this host. Every guarantee below is stated for an
@@ -42,6 +47,35 @@ unprivileged attacker, and none of them is a claim about a rooted machine.
 ---
 
 ## 2. What S1 guarantees
+
+### Identity is cryptographic
+
+`sender.agent` is a claim; a signature over the whole envelope is what
+corroborates it. Every trusted artifact carries a versioned auth record, and
+`verify_store()` fails closed on one that is missing, malformed, signed by an
+unpinned key, signed by a key pinned for a different role, or signed over
+different bytes. The trust policy holds public material only and does not live
+on the room branch, so the branch cannot rewrite its own trust roots.
+
+The human credential lives in a personal device's keystore and is unlocked per
+approval by a fingerprint. Nothing on this host can produce a human signature —
+the ceremony is `human-prepare` here, biometric confirmation there,
+`human-submit` here. `release.authorise` independently re-checks that the
+effective decision is signed by the key pinned for the *human role*, rather
+than assuming the read path did it.
+
+Rotation and revocation are human-signed updates with monotonic generations,
+and key validity is decided by Git ancestry rather than by a clock, so history
+signed by a since-rotated key stays verifiable while the revoked key signs
+nothing new.
+
+### The transport has a monotonic anchor
+
+A local checkpoint records the anchored genesis and the last tip that passed
+full verification. A candidate head is accepted only if it descends from that
+tip, and only after everything else verifies; a failure leaves the anchor
+exactly where it was. Bootstrapping requires a genesis identity obtained out of
+band — there is no trust on first use.
 
 ### The branch namespace is closed
 
@@ -240,29 +274,30 @@ umask is `0002` and would otherwise leave them group-writable.
 
 ## 3. What S1 does not guarantee
 
-**Identity is not authenticated.** `sender.agent` is a string in a file. A
-writer to the Git remote can commit a structurally valid `approval` with
-`sender.agent: "human"`, and `release.authorise` will accept it. This is
-CRITICAL A, it remains open, and
-`test_KNOWN_S2_GAP_raw_git_can_still_forge_human_authority` asserts that it
-still works so the gap stays visible. S2 must invert that test.
+**Host compromise is not addressed.** Participant keys — Claude, Codex, the
+supervisor boundary, the release recorder, the coordinator — are owner-only
+files on this machine. Anyone who can read them can sign as those participants.
+Read the guarantee as "a repository writer cannot impersonate a participant",
+never as "a host attacker cannot". The human credential is the exception: it is
+not here at all.
 
-The same applies to `claude-code`, `codex` and `openai-research`: capability
-separation stops an agent *surface* from authoring a decision or a receipt; it
-says nothing about a raw Git writer.
+**The human credential's hardware backing is not attested.** Whether an Android
+Keystore key lands in a TEE or StrongBox depends on the handset, and nothing
+verifies it. Treat it as software held on a separate device.
+
+**Local policy and checkpoint files are not tamper-proof.** Both belong to the
+service user. Someone who already controls that user's state can edit the pins
+or rewind the anchor. S3.
 
 **The existing bridge is still a broad remote shell.** `run_command` accepts
 arbitrary argv, the service is unsandboxed, and a repository-write credential
 on the control branch is shell-as-`pr0`. S1 changed nothing about it, by
 instruction. The human CLI surface is reachable from it.
 
-**`--confirm-human` is an operator assertion, not authentication.** Unchanged
-from Issue #5 and repeated here: no signature, no token, no check of who is at
-the keyboard. The isolation is within Agent Room, not on this host.
-
-**Rollback is not detected.** Local checks authenticate the object graph they
-can see. A structurally valid history substituted before a fresh clone would
-pass. The monotonic trust anchor is S2.
+**`--confirm-human` is an operator assertion, not authentication** — and since
+S2 it is no longer what carries authority. The flag still gates the CLI surface
+so a decision is never recorded by accident; the signature is what makes it
+count, and `--confirm-human` with no valid human assertion records nothing.
 
 **The transport repository is still public.** `pr0dus/cek` is public; the
 production room must live in a dedicated private repository. Not created, not
@@ -287,15 +322,21 @@ someone who already controls that checkout's config.
 
 ## 4. Keys and trust anchors
 
-None exist yet. S1 introduces no key material, generates nothing, and stores no
-secret. The pinned human verification identity, participant verification
-identities, key rotation policy and the transport genesis checkpoint are all
-S2.
+Ed25519 throughout, via the installed `openssl`. Full detail in
+`docs/AGENT_ROOM_AUTH.md`; the custody summary:
 
-Recorded here so S2 inherits the decision: the human private credential must
-never be generated, copied or imported on this host, in the repository, in
-bridge state, in Claude/Codex config, or in the ChatGPT connector. The host
-stores only public verification material.
+| Identity | Where the private key lives | Custody recorded as |
+|---|---|---|
+| `human` | a personal device's keystore, unlocked per approval by a fingerprint | `android-keystore-device-bound` |
+| `claude-code`, `codex`, `openai-research`, `release-recorder`, `coordinator` | owner-only file on this host | `host-file` |
+
+**No human private credential exists on this host**, in the repository, in
+bridge state, in Claude/Codex config, or in the ChatGPT connector — and none
+was created by this stage. The trust policy stores public keys only, and
+refuses to hold anything containing `PRIVATE KEY`.
+
+The transport anchor is the room branch's root commit, confirmed out of band at
+bootstrap.
 
 ---
 

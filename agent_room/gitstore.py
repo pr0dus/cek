@@ -59,6 +59,8 @@ from .errors import (
 from . import namespace
 from .ids import is_uuid7
 from .namespace import NamespaceViolation
+from . import trust as trust_module
+from .trust import NoTrustPolicy
 from .process import sanitised_env
 from .schema import DECISION_TYPES, THREAD_ID_RE, validate_envelope
 
@@ -103,8 +105,15 @@ class GitMessageStore:
         push_retries: int = DEFAULT_PUSH_RETRIES,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
         author: tuple[str, str] = ("agent-room", "agent-room@localhost"),
+        trust=None,
     ) -> None:
         self.workdir = Path(workdir)
+        #: Pinned public verification identities, or None for the legacy
+        #: unauthenticated mode. When set, every artifact read out of history
+        #: must carry a signature by a key this policy pins, and every artifact
+        #: written must too. When unset nothing is authenticated - which is why
+        #: every release-capable path refuses a store without one.
+        self.trust = trust
         #: Validated once, before any ref is built from it.
         self.branch = self._validate_branch_name(branch)
         #: The only revision authority. A short name can be shadowed by a tag
@@ -1063,6 +1072,70 @@ class GitMessageStore:
             return "unknown"
         return "absent" if self._batch_check(f"{sha}:{path}") is None else "present"
 
+    def current_tip(self) -> str:
+        """The branch tip, resolved through the ref rather than a short name."""
+        proc = self._git("rev-parse", "--verify", self.ref, check=False)
+        if proc.returncode != 0:
+            raise HistoryUnavailable(
+                f"cannot resolve {self.ref} in {self.workdir}: "
+                f"{proc.stderr.strip()}"
+            )
+        return proc.stdout.strip()
+
+    def room_id(self) -> str:
+        """The branch's root commit: a deterministic identity for this room.
+
+        Used as the trust policy's subject and as the checkpoint genesis. A
+        root commit cannot be changed without rewriting the entire history,
+        which is exactly the property an out-of-band anchor needs.
+        """
+        proc = self._git("rev-list", "--max-parents=0", self.ref, check=False)
+        roots = [line for line in proc.stdout.split() if line]
+        if proc.returncode != 0 or not roots:
+            raise HistoryUnavailable(
+                f"cannot determine the root commit of {self.ref} in "
+                f"{self.workdir}: {proc.stderr.strip()}"
+            )
+        if len(roots) > 1:
+            raise HistoryUnavailable(
+                f"{self.ref} has {len(roots)} root commits ({roots[:3]}); a "
+                "room has one origin, and several means grafted history"
+            )
+        return roots[0]
+
+    @property
+    def authenticated(self) -> bool:
+        return self.trust is not None
+
+    def assert_authenticated(self, what: str = "this operation") -> None:
+        """Refuse a release-capable operation on an unauthenticated store."""
+        if self.trust is None:
+            raise NoTrustPolicy(
+                f"{what} needs a pinned trust policy: without one, "
+                "`sender.agent` is just a string and any Git writer can claim "
+                "any identity. There is deliberately no option to proceed "
+                "without authentication."
+            )
+
+    def authenticate(self, envelope: dict, commit: str | None) -> dict | None:
+        """Verify provenance of one artifact as it was committed.
+
+        Called from the read path, so what is authenticated is the stored
+        bytes: the envelope here was parsed out of the blob at its own add
+        commit and its digest already checked, not handed in by a caller.
+
+        `commit` places the message in history, which is what lets a key that
+        has since been rotated still verify the messages it signed while it was
+        valid — and stops a revoked key authenticating anything after its
+        revocation point.
+        """
+        if self.trust is None:
+            return None
+        return trust_module.verify_envelope(
+            envelope, self.trust, at_commit=commit,
+            ancestry=self.is_strict_ancestor,
+        )
+
     def _load(self, path: str, commit: str) -> dict:
         """Read one message as committed, with references resolved.
 
@@ -1078,6 +1151,13 @@ class GitMessageStore:
             resolver=self._resolver_as_of(commit),
             check_references=True,
         )
+        # Provenance last in the order, first in authority: nothing above this
+        # line has established *who* wrote it, only that the artifact is
+        # well-formed and internally consistent. An unsigned or wrongly signed
+        # message raises here, so it never reaches an inbox, a claim, a gate or
+        # an audit path - it fails the whole read rather than being returned
+        # with a warning nobody checks.
+        self.authenticate(envelope, commit)
         return envelope
 
     def local_persistence_state(self, path: str) -> tuple:
@@ -1343,6 +1423,12 @@ class GitMessageStore:
         limits.assert_within(
             len(canonical.canonical_bytes(envelope)),
             limits.MAX_ENVELOPE_BYTES, "canonical envelope")
+        # An authenticated room accepts nothing unsigned, including from its
+        # own library callers. `at_commit=None` asks the policy about *current*
+        # validity, which is the right question for a message being written
+        # now: a revoked key signs nothing further.
+        if self.trust is not None:
+            self.authenticate(envelope, None)
         thread_id = envelope["thread_id"]
         message_id = envelope["message_id"]
         rel = self.message_path(thread_id, message_id)

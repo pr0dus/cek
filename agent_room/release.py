@@ -33,7 +33,7 @@ from pathlib import Path
 
 import re
 
-from . import canonical, supervisor
+from . import auth, canonical, supervisor
 from .decision import _decisions_for, _load_request, evaluate_gate
 from .errors import AgentRoomError
 from .ids import uuid7
@@ -43,6 +43,7 @@ from .schema import (
     RECEIPT_UNRESOLVED,
     validate_action,
 )
+from . import trust
 from .snapshot import _git as _snapshot_git, snapshot_manifest
 
 #: Message types that may legitimately follow the review cutoff without making
@@ -361,7 +362,8 @@ def assert_transition(state: dict, status: str) -> None:
 
 
 def _write_receipt(store, request: dict, *, status: str, result: dict,
-                   decision_id: str, receipt_id: str | None = None) -> dict:
+                   decision_id: str, receipt_id: str | None = None,
+                   signer=None) -> dict:
     """Append one receipt. The caller must already hold the writer lock."""
     if status not in RECEIPT_STATUS:
         raise ReleaseError(
@@ -403,6 +405,15 @@ def _write_receipt(store, request: dict, *, status: str, result: dict,
         "human_approval_required": False,
         "receipt": receipt,
     }
+    if store.trust is not None:
+        if signer is None:
+            raise ReleaseError(
+                "this store is authenticated: an execution receipt must be "
+                "signed by the pinned release-recorder credential. A receipt "
+                "consumes a human approval, so an unsigned one would let any "
+                "writer spend somebody else's decision."
+            )
+        envelope = auth.sign_envelope(envelope, signer)
     written = store.append_receipt(canonical.seal(envelope))
     written["receipt_id"] = receipt["receipt_id"]
     written["receipt_status"] = status
@@ -411,6 +422,37 @@ def _write_receipt(store, request: dict, *, status: str, result: dict,
 
 # -- the release path -------------------------------------------------------
 
+def assert_human_authenticated(store, decision_message_id: str) -> dict:
+    """Independently re-authenticate the decision that is about to release.
+
+    The read path already refuses an unsigned or wrongly signed artifact, so
+    reaching here means it verified once. This asks again, on the release
+    path, and asks a question the read path does not: is this signature by the
+    key pinned for the **human role**? A perfectly valid `claude-code`
+    signature is a perfectly valid signature and carries no human authority.
+
+    Deliberately not "upstream must have checked": the whole point of a
+    release gate is that it establishes its own preconditions.
+    """
+    store.assert_authenticated("releasing a consequential action")
+    history = store._history()
+    path = store._id_index().get(decision_message_id)
+    if path is None:
+        raise ReleaseError(
+            f"decision {decision_message_id} is not in the room")
+    envelope = store._load(path, history[path])
+    provenance = store.authenticate(envelope, history[path])
+    if provenance is None or provenance["role"] != trust.HUMAN_ROLE:
+        raise ReleaseBlocked(
+            f"decision {decision_message_id} is signed by "
+            f"{(provenance or {}).get('signer')!r}, which is not the pinned "
+            "human credential; only the human releases a consequential action",
+            report={"state": "blocked_unauthenticated", "releasable": False,
+                    "reasons": ["the decision is not signed by the human"]},
+        )
+    return provenance
+
+
 def authorise(store, request_message_id: str, *, workdir) -> dict:
     """The exact final recheck. Derives everything; performs nothing.
 
@@ -418,6 +460,7 @@ def authorise(store, request_message_id: str, *, workdir) -> dict:
     state still matches what they approved, nothing unreviewed has been
     appended since the review cutoff, and the one-shot nonce is unconsumed.
     """
+    store.assert_authenticated("releasing a consequential action")
     request = _load_request(store, request_message_id)
     action = _consequential_action(request)
     binding = action["binding"]
@@ -477,8 +520,10 @@ def authorise(store, request_message_id: str, *, workdir) -> dict:
         )
 
     decision = report["effective_decision"]
+    provenance = assert_human_authenticated(store, decision["message_id"])
     return {
         "authorised": True,
+        "human_provenance": provenance,
         "authorised_at": _now_iso(),
         "request_message_id": request["message_id"],
         "action_id": action["action_id"],
@@ -508,7 +553,7 @@ def authorise(store, request_message_id: str, *, workdir) -> dict:
     }
 
 
-def reserve(store, request_message_id: str, *, workdir,
+def reserve(store, request_message_id: str, *, workdir, signer=None,
             result: dict | None = None) -> dict:
     """The operator-facing command: recheck and consume the nonce, atomically.
 
@@ -528,7 +573,7 @@ def reserve(store, request_message_id: str, *, workdir,
         request = _load_request(store, request_message_id)
         assert_transition(receipt_state(store, request), "uncertain")
         written = _write_receipt(
-            store, request, status="uncertain",
+            store, request, status="uncertain", signer=signer,
             decision_id=authorisation["decision_id"],
             result=result or {"stage": "reserved",
                               "note": "no side effect has been attempted yet"},
@@ -545,7 +590,7 @@ def reserve(store, request_message_id: str, *, workdir,
 
 
 def reconcile(store, request_message_id: str, *, status: str, result: dict,
-              receipt_id: str | None = None) -> dict:
+              receipt_id: str | None = None, signer=None) -> dict:
     """Record what actually happened. Resolves a reserved action.
 
     Deliberately does not re-derive current state: by the time this is called
@@ -569,4 +614,5 @@ def reconcile(store, request_message_id: str, *, status: str, result: dict,
         decision_id = (decisions[-1]["decision"]["decision_id"] if decisions
                        else receipts["latest"]["decision_id"])
         return _write_receipt(store, request, status=status, result=result,
-                              decision_id=decision_id, receipt_id=receipt_id)
+                              decision_id=decision_id, receipt_id=receipt_id,
+                              signer=signer)

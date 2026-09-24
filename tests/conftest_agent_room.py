@@ -137,3 +137,67 @@ def post_decision_request(room, thread_id: str = "t1", **kwargs) -> dict:
         thread_id=thread_id, type="decision_request", body={"text": text},
         human_approval_required=True, action=bound_action(**kwargs),
     )
+
+
+# -- Issue #13 S2 helpers ---------------------------------------------------
+
+#: Every identity the authenticated fixtures pin a disposable key for. The
+#: human key here stands in for a credential that in production lives in a
+#: phone's keystore and never exists on this host.
+SIGNED_ROLES = ("claude-code", "codex", "openai-research", "release-recorder",
+                "coordinator")
+
+
+def build_trust(keydir, store, roles=SIGNED_ROLES):
+    """A disposable trust policy plus signers for every pinned identity.
+
+    The participants are added through real human-signed updates rather than
+    written into the bootstrap document, so the fixtures exercise the same
+    rotation path production would.
+    """
+    from agent_room import auth, trust as trust_module
+
+    human = auth.generate_ed25519_keypair(keydir, "human-1")
+    human_signer = auth.Ed25519Signer(human["private_key_path"],
+                                      signer="human", key_id="human-1")
+    policy = trust_module.TrustPolicy.bootstrap(
+        room_id=store.room_id(), human_key_id="human-1",
+        human_public_key=human["public_key"],
+        human_custody=trust_module.CUSTODY_DEVICE,
+    )
+    signers = {"human": human_signer}
+    for role in roles:
+        key_id = f"{role}-1"
+        pair = auth.generate_ed25519_keypair(keydir, key_id)
+        policy.apply_update(trust_module.build_update(
+            policy, human_signer, action="add", participant=role,
+            new_key_id=key_id, public_key=pair["public_key"],
+        ))
+        signers[role] = auth.Ed25519Signer(pair["private_key_path"],
+                                           signer=role, key_id=key_id)
+    return policy, signers
+
+
+@pytest.fixture
+def trust_material(tmp_path, store):
+    """Disposable keys and a pinned policy for the throwaway room."""
+    policy, signers = build_trust(tmp_path / "keys", store)
+    return {"policy": policy, "signers": signers,
+            "keydir": tmp_path / "keys",
+            "policy_path": tmp_path / "trust.json"}
+
+
+@pytest.fixture
+def signed_store(store, trust_material):
+    """The same throwaway store, with authentication turned on."""
+    store.trust = trust_material["policy"]
+    return store
+
+
+@pytest.fixture
+def signed_room(signed_store, trust_material, tmp_path):
+    from agent_room import AgentRoom
+
+    return AgentRoom(signed_store, "claude-code",
+                     ParticipantCursor(tmp_path / "state", "claude-code"),
+                     signer=trust_material["signers"]["claude-code"])

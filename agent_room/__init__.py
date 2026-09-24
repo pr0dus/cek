@@ -52,6 +52,28 @@ from .orchestrator import (
     RoundBounds,
 )
 from .namespace import NamespaceViolation
+from .auth import (
+    AuthError,
+    Ed25519Signer,
+    InvalidSignature,
+    UnauthenticatedMessage,
+    generate_ed25519_keypair,
+    sign_envelope,
+    signed_payload,
+)
+from .trust import (
+    NoTrustPolicy,
+    TrustError,
+    TrustPolicy,
+    build_update,
+    verify_envelope,
+)
+from .checkpoint import (
+    AnchorMismatch,
+    NoTrustAnchor,
+    RollbackRejected,
+    TrustCheckpoint,
+)
 from .limits import LimitExceeded
 from .process import BoundedResult, ProcessError, isolated_env, run_bounded, sanitised_env
 from .proof import (
@@ -113,6 +135,22 @@ __all__ = [
     "verify_artifact",
     "ProofArtifactConflict",
     "NamespaceViolation",
+    "AuthError",
+    "UnauthenticatedMessage",
+    "InvalidSignature",
+    "Ed25519Signer",
+    "sign_envelope",
+    "signed_payload",
+    "generate_ed25519_keypair",
+    "TrustPolicy",
+    "TrustError",
+    "NoTrustPolicy",
+    "build_update",
+    "verify_envelope",
+    "TrustCheckpoint",
+    "NoTrustAnchor",
+    "AnchorMismatch",
+    "RollbackRejected",
     "LimitExceeded",
     "ProcessError",
     "BoundedResult",
