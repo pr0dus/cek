@@ -22,11 +22,11 @@ the supervisor import boundary, and `append` itself — refuses those two types
 outright. No participant or orchestrator module imports this class, and a test
 asserts that.
 
-That is capability separation, not cryptography. The design deferred signed
-commits deliberately (§6), so this code never claims to *prove* a human acted.
-What it guarantees is narrower and checkable: an agent cannot reach the write
-path at all, well-formed or otherwise, and the operation is never invoked
-automatically — the qualification stops and waits for a person.
+This capability separation complements S2's cryptographic device-signed human
+decision. The human private key stays off-host. A signature authenticates the
+pinned device credential; it does not by itself attest a person's intent or
+make that device immune to compromise. Nothing here signs for the human or
+automatically performs the approved action.
 
 **The gate.** `evaluate_gate` decides whether a consequential action is
 releasable *now*. It is fail-closed in every direction: no decision blocks, a

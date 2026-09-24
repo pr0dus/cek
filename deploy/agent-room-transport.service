@@ -72,6 +72,10 @@ StateDirectory=agent-room
 StateDirectoryMode=0700
 ReadOnlyPaths=/opt/agent-room /etc/agent-room
 InaccessiblePaths=/home/pr0
+InaccessiblePaths=/var/lib/agent-room-claude /var/lib/agent-room-codex /var/lib/agent-room-coordinator /var/lib/agent-room-release
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+Environment=HOME=/var/lib/agent-room/home
+UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS SSH_ASKPASS
 
 # Kernel and host
 ProtectKernelTunables=yes

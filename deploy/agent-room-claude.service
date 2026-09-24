@@ -1,0 +1,55 @@
+# S4-C1 SYSTEM one-shot template. NOT INSTALLED OR ACTIVATED.
+# No timer/Install target: explicit operator start after qualification.
+[Unit]
+Description=Agent Room claude-code isolated one-shot
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=agentroom-claude
+Group=agentroom-claude
+UMask=0077
+WorkingDirectory=/opt/agent-room/current
+ExecStart=/usr/bin/python3 -s -m agent_room.role_worker claude-code
+Environment=PYTHONPATH=/opt/agent-room/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+Environment=HOME=/var/lib/agent-room-claude/home
+UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS SSH_ASKPASS
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+LockPersonality=yes
+Delegate=no
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStartSec=1200
+TimeoutStopSec=30
+StateDirectory=agent-room-claude
+StateDirectoryMode=0700
+ReadOnlyPaths=/opt/agent-room /etc/agent-room
+InaccessiblePaths=/home/pr0 /var/lib/agent-room-codex /var/lib/agent-room /var/lib/agent-room-coordinator /var/lib/agent-room-release
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RemoveIPC=yes
+KeyringMode=private
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=256
+MemoryMax=2G
+LimitNOFILE=2048

@@ -1,0 +1,5 @@
+{
+  "key_id": "claude-code-1",
+  "room_branch": "agent-room",
+  "room_remote": "origin"
+}

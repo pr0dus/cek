@@ -1,7 +1,10 @@
 """Small CLI over the library. No daemon, no poller, no scheduling.
 
 Every command is one shot: it runs, prints JSON, and exits. Anything that
-would keep running belongs to Issues #3/#4, not here.
+would keep running belongs to Issues #3/#4, not here. Direct CLI/library
+signer construction is development/manual tooling, not production custody.
+Production participants use the dedicated guarded role_worker system units;
+production release uses release_worker. Shared-UID keys are not isolated.
 """
 
 import argparse

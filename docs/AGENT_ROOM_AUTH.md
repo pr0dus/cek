@@ -86,7 +86,7 @@ caller who wants it trusted.
 Ed25519 through the installed `openssl` (3.0.13 here). No custom signature
 construction, no new Python dependency, no shell: fixed executable, internally
 constructed argv, sanitised environment, bounded time and output. Private keys
-reach `openssl` as `-inkey <path>` to an owner-only file — never as an
+reach `openssl` as `-inkey <path>` to a role-owner-only file — never as an
 argument, never through the environment.
 
 Signatures are base64, bounded at 512 characters; an Ed25519 signature is 88.
@@ -185,8 +185,11 @@ it.
 ## 4. Participant signatures
 
 Claude, Codex, the supervisor boundary, the release recorder and the
-coordinator each have a pinned key id and an Ed25519 key held in an owner-only
-file on this host. Outbound messages are signed before append; inbound messages
+coordinator each have a pinned key id and an Ed25519 key held in a
+**role-owner-only** file: one dedicated Unix identity per key-bearing host
+role in the qualified production layout. See `AGENT_ROOM_CUSTODY.md` and the
+root-installed `deploy/custody/roles.json`. Mode 0600 under a shared UID is
+**not** participant isolation. Outbound messages are signed before append; inbound messages
 are verified before they can reach an inbox, a claim, a gate or an audit path.
 
 **The guarantee is bounded, and the boundary is the interesting part.** These
@@ -195,6 +198,15 @@ that participant, and nothing here changes that. What this closes is
 impersonation by a *repository writer* — someone with push access, a
 compromised connector credential, or write access to the branch — who holds no
 key. That was the demonstrated attack, and it is now refused.
+
+S4-C1 adds guarded production entrypoints and per-UID deployment templates;
+it does not claim deployment has happened or S4 has passed. A compromised
+client may steal/use its **own** role identity. Under the intended dedicated-UID
+deployment it must not access another role's key/state. Root/kernel compromise
+and `pr0`'s still-unresolved passwordless root defeat that boundary. The human
+private key remains off-host. Disposable same-user library/CLI tests do not
+qualify production custody; the mandatory cross-UID canary remains a deployment
+and subsequent independent S4 prerequisite.
 
 A key pinned for one participant cannot authenticate another: the role is in
 the policy, the signer is in the signed payload, and `sender.agent` has to

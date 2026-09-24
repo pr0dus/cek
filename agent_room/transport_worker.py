@@ -14,19 +14,24 @@ import json
 import sys
 
 from .transport import TransportConfig, TransportWorker
+from . import custody
 
 DEFAULT_CONFIG = "/etc/agent-room/transport.json"
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if len(argv) > 1:
+    if argv and argv != [DEFAULT_CONFIG]:
         print("usage: python3 -m agent_room.transport_worker [config.json]",
               file=sys.stderr)
         return 2
     config_path = argv[0] if argv else DEFAULT_CONFIG
     try:
+        item = custody.guard('openai-research')
+        custody.root_file(config_path)
         config = TransportConfig.load(config_path)
+        custody.check_transport(config, item)
+        custody.install_environment('openai-research', item)
         summary = TransportWorker(config).run()
     except Exception as exc:                          # noqa: BLE001
         # One line, no traceback, no paths beyond the config: the journal of

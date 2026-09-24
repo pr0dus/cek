@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "roles": {
+    "claude-code": {
+      "user": "agentroom-claude",
+      "group": "agentroom-claude",
+      "state_root": "/var/lib/agent-room-claude",
+      "signing_key": "/var/lib/agent-room-claude/keys/claude-code.ed25519.pem",
+      "repository_key": "/var/lib/agent-room-claude/keys/repository.ed25519",
+      "canary": "/var/lib/agent-room-claude/custody.canary",
+      "home": "/var/lib/agent-room-claude/home",
+      "workspace": "/var/lib/agent-room-claude/workspace",
+      "room": "/var/lib/agent-room-claude/room",
+      "state": "/var/lib/agent-room-claude/state",
+      "checkpoint": "/var/lib/agent-room-claude/checkpoint.json",
+      "client": "/opt/agent-room/clients/bin/claude"
+    },
+    "codex": {
+      "user": "agentroom-codex",
+      "group": "agentroom-codex",
+      "state_root": "/var/lib/agent-room-codex",
+      "signing_key": "/var/lib/agent-room-codex/keys/codex.ed25519.pem",
+      "repository_key": "/var/lib/agent-room-codex/keys/repository.ed25519",
+      "canary": "/var/lib/agent-room-codex/custody.canary",
+      "home": "/var/lib/agent-room-codex/home",
+      "workspace": "/var/lib/agent-room-codex/workspace",
+      "room": "/var/lib/agent-room-codex/room",
+      "state": "/var/lib/agent-room-codex/state",
+      "checkpoint": "/var/lib/agent-room-codex/checkpoint.json",
+      "client": "/opt/agent-room/clients/bin/codex"
+    },
+    "openai-research": {
+      "user": "agentroom",
+      "group": "agentroom",
+      "state_root": "/var/lib/agent-room",
+      "signing_key": "/var/lib/agent-room/keys/openai-research.ed25519.pem",
+      "repository_key": "/var/lib/agent-room/keys/repository.ed25519",
+      "canary": "/var/lib/agent-room/custody.canary",
+      "home": "/var/lib/agent-room/home",
+      "workspace": "/var/lib/agent-room/workspace",
+      "room": "/var/lib/agent-room/room",
+      "state": "/var/lib/agent-room/state",
+      "checkpoint": "/var/lib/agent-room/checkpoint.json",
+      "client": null
+    },
+    "coordinator": {
+      "user": "agentroom-coordinator",
+      "group": "agentroom-coordinator",
+      "state_root": "/var/lib/agent-room-coordinator",
+      "signing_key": "/var/lib/agent-room-coordinator/keys/coordinator.ed25519.pem",
+      "repository_key": "/var/lib/agent-room-coordinator/keys/repository.ed25519",
+      "canary": "/var/lib/agent-room-coordinator/custody.canary",
+      "home": "/var/lib/agent-room-coordinator/home",
+      "workspace": "/var/lib/agent-room-coordinator/workspace",
+      "room": "/var/lib/agent-room-coordinator/room",
+      "state": "/var/lib/agent-room-coordinator/state",
+      "checkpoint": "/var/lib/agent-room-coordinator/checkpoint.json",
+      "client": null
+    },
+    "release-recorder": {
+      "user": "agentroom-release",
+      "group": "agentroom-release",
+      "state_root": "/var/lib/agent-room-release",
+      "signing_key": "/var/lib/agent-room-release/keys/release-recorder.ed25519.pem",
+      "repository_key": "/var/lib/agent-room-release/keys/repository.ed25519",
+      "canary": "/var/lib/agent-room-release/custody.canary",
+      "home": "/var/lib/agent-room-release/home",
+      "workspace": "/var/lib/agent-room-release/workspace",
+      "room": "/var/lib/agent-room-release/room",
+      "state": "/var/lib/agent-room-release/state",
+      "checkpoint": "/var/lib/agent-room-release/checkpoint.json",
+      "client": null
+    }
+  },
+  "human": {
+    "location": "off-host",
+    "private_key": null
+  },
+  "trust_policy": "/etc/agent-room/trust-policy.json"
+}

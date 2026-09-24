@@ -1,0 +1,17 @@
+{
+  "key_id": "coordinator-1",
+  "room_branch": "agent-room",
+  "room_remote": "origin",
+  "message": {
+    "message_id": "REPLACE-WITH-ONE-FIXED-UUID7",
+    "thread_id": "REPLACE-WITH-TASK-THREAD",
+    "type": "handoff",
+    "recipient": {
+      "agent": "claude-code"
+    },
+    "project": null,
+    "body": {
+      "text": "REPLACE-WITH-OPERATOR-AUTHORED-TASK"
+    }
+  }
+}

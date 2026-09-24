@@ -898,7 +898,9 @@ def test_the_worker_git_lifecycle_runs_under_the_hardened_restrictions(net,
         "--property=Environment=PYTHONDONTWRITEBYTECODE=1",
         f"--property=StandardOutput=file:{out}",
         f"--property=StandardError=append:{out}",
-        "/usr/bin/python3", "-m", "agent_room.transport_worker",
+        # Explicit disposable library harness, not the production entrypoint:
+        # production now requires real root config + dedicated UID custody.
+        "/usr/bin/python3", "-m", "tests.transport_library_fixture",
         str(config_path)], capture_output=True, text=True, timeout=300)
     subprocess.run(["systemctl", "--user", "reset-failed", f"{unit}.service"],
                    capture_output=True)

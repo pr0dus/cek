@@ -1,0 +1,4 @@
+[credential]
+	helper =
+[core]
+	sshCommand = /usr/bin/ssh -F /etc/agent-room/ssh/release-recorder.conf

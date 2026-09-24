@@ -1,0 +1,10 @@
+// Versioned only. Install by an authorized operator after independent review.
+// Deny role accounts system-service management even if another rule grants it.
+polkit.addRule(function(action, subject) {
+    var roles = ["agentroom-claude", "agentroom-codex", "agentroom",
+                 "agentroom-coordinator", "agentroom-release"];
+    if (roles.indexOf(subject.user) >= 0 &&
+        action.id.indexOf("org.freedesktop.systemd1.") === 0) {
+        return polkit.Result.NO;
+    }
+});
