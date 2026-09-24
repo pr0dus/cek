@@ -310,6 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
     cp_boot.add_argument("--expected-genesis", required=True,
                          help="the room's root commit, from a source that is "
                               "not the remote being anchored")
+    cp_boot.add_argument("--expected-trust-policy-sha256", required=True,
+                         help="out-of-band digest of the trust policy root. A "
+                              "genesis alone does not say which human key may "
+                              "authenticate the history descending from it.")
     cp_boot.add_argument("--expected-tip", default=None)
 
     cp_accept = sub.add_parser(
@@ -426,6 +430,8 @@ def main(argv=None) -> int:
             if args.command == "checkpoint-bootstrap":
                 _emit(TrustCheckpoint.bootstrap(
                     store, expected_genesis=args.expected_genesis,
+                    expected_trust_policy_sha256=(
+                        args.expected_trust_policy_sha256),
                     expected_tip=args.expected_tip, path=args.state).status())
                 return 0
             _emit(TrustCheckpoint.load(args.state).accept(store, args.tip))

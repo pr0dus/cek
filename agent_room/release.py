@@ -413,7 +413,8 @@ def _write_receipt(store, request: dict, *, status: str, result: dict,
                 "consumes a human approval, so an unsigned one would let any "
                 "writer spend somebody else's decision."
             )
-        envelope = auth.sign_envelope(envelope, signer)
+        envelope = auth.sign_envelope(envelope, signer,
+                                      room_id=store.room_id())
     written = store.append_receipt(canonical.seal(envelope))
     written["receipt_id"] = receipt["receipt_id"]
     written["receipt_status"] = status

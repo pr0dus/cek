@@ -524,6 +524,7 @@ class HumanDecisionAuthority:
             human = self.store.trust.current_human_key()
             header = auth.auth_header(signer=self.participant,
                                       key_id=human["key_id"],
+                                      room_id=self.store.room_id(),
                                       method=human["method"])
             payload = auth.signed_payload(envelope, header)
         return {
@@ -602,7 +603,8 @@ class HumanDecisionAuthority:
                     "with the trusted device, or pass a disposable signer in a "
                     "test."
                 )
-            envelope = auth.sign_envelope(envelope, signer)
+            envelope = auth.sign_envelope(envelope, signer,
+                                          room_id=self.store.room_id())
         return self._append(canonical.seal(envelope), envelope["decision"])
 
     def _build(

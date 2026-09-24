@@ -169,10 +169,13 @@ def build_trust(keydir, store, roles=SIGNED_ROLES):
     for role in roles:
         key_id = f"{role}-1"
         pair = auth.generate_ed25519_keypair(keydir, key_id)
+        # Every boundary is mandatory and must be a commit in this room's
+        # history; at bootstrap the only one is the genesis.
         policy.apply_update(trust_module.build_update(
             policy, human_signer, action="add", participant=role,
             new_key_id=key_id, public_key=pair["public_key"],
-        ))
+            effective_commit=store.current_tip(),
+        ), store=store)
         signers[role] = auth.Ed25519Signer(pair["private_key_path"],
                                            signer=role, key_id=key_id)
     return policy, signers

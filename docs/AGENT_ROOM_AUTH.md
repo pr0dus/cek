@@ -13,9 +13,30 @@ signing and verification call it. It is canonical JSON over:
 
 ```
 { "domain": "agent-room.v1.envelope",
-  "auth":   { auth_schema_version, domain, method, signer, key_id },
+  "auth":   { auth_schema_version: 2, domain, room_id, method, signer, key_id },
   "envelope": <the whole envelope, minus envelope_sha256 and auth.signature> }
 ```
+
+**`room_id` is the branch's root commit**, and it is in the signed bytes.
+Schema 1 bound the protocol but not the instance: a domain of
+"agent-room.v1" says what kind of thing was signed, not which room, and
+participant keys are expected to be reused across rooms and projects. A
+byte-identical envelope signed in room A therefore verified perfectly when
+copied into room B. Verification now requires
+
+```
+signed room_id == trust_policy.room_id == store.room_id()
+```
+
+and the first of those three is inside the signature, so the check cannot be
+removed by editing an unsigned field. Trust-policy updates carry the room id
+in both the signed body and the signed auth header.
+
+The genesis commit contains a random nonce for this reason. Two rooms created
+in the same second from the same template otherwise produce byte-identical
+root commits — same tree, same author, same message, same timestamp — and
+therefore the same identity, which would make the room binding bind nothing.
+The nonce is committed and not secret; its only job is to be different.
 
 So the signature covers `message_id`, `thread_id`, `type`, `sender`,
 `recipient`, `project`, `parent_id`, `body`, `evidence`, `status`,
@@ -107,6 +128,14 @@ inaccurate, and the policy would have to say "unknown".
   `setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)` — authentication
   per operation, not a time window. Non-exportable where the platform supports
   it.
+- **Availability must be probed, not assumed.** Android exposes Curve25519 in
+  the hardware keystore as a *feature level capability*, not a guarantee on
+  every handset, and the same is true of strong-biometric-per-operation. Before
+  any real enrollment the client must query the device's actual support for the
+  chosen algorithm **and** the per-operation authentication policy, and either
+  fail closed or fall back to an explicitly reviewed alternative — not silently
+  to a weaker one. Nothing in this document should be read as a claim that
+  Ed25519 in the Android Keystore is universally available.
 - **Exact bytes signed:** the output of `auth.signed_payload()` for the
   decision envelope, raw, with no further hashing or wrapping. `human-prepare`
   prints them as `payload_b64` together with `payload_sha256`; the device signs
@@ -225,12 +254,27 @@ Every change is a signed update in its own domain:
   nothing.
 - **Generations are monotonic and exact** (`current + 1`), so an old update
   cannot be replayed.
-- **Validity is history, not wall clock.** A key is valid from
-  `effective_commit` and invalid from `revoked_effective_commit`, both decided
-  by Git ancestry against the commit the message was added in. Messages signed
-  before a rotation stay verifiable; the revoked key signs nothing after it.
-  The boundary is inclusive in the fail-closed direction: a key revoked
-  effective at commit *C* does not authenticate *C* either.
+- **Validity is history, not wall clock, and the boundaries are mandatory.**
+  Every key has an `effective_commit`; every revocation has a
+  `revoked_effective_commit`. Both are full object ids, both must name a commit
+  that exists in this room's history at the time of the update, and neither may
+  be null or a revision expression. A null lower bound used to mean "valid for
+  all of history", including commits that predate the key — which is precisely
+  how a newly installed key could authenticate a forged artifact from before it
+  existed. A null revocation bound only blocked the write path, leaving raw-Git
+  artifacts at any commit verifiable.
+- **The interval is inclusive at both ends.** A key is valid *at* its effective
+  commit and every descendant; a revoked key is invalid *at* its revocation
+  commit and every descendant. A rotation whose boundary is the current tip
+  therefore does not retroactively invalidate the outgoing key's earlier
+  messages — but it does invalidate anything it signed *in* that boundary
+  commit. An operator rotating a key that signed the tip should first land a
+  neutral marker commit from another valid identity and use that as the
+  boundary.
+- **The write path uses the same interval.** A message being written is checked
+  against the tip it will descend from. There is no boundary-free mode: a key
+  that is not yet effective cannot sign early, and a revoked one cannot sign
+  late.
 - **Key ids are never reused.** A reused id makes history ambiguous.
 - **Human rotation needs proof of possession**: the incoming credential
   counter-signs the same payload, so a credential nobody holds cannot be
@@ -242,14 +286,18 @@ If the human credential is lost or compromised there is deliberately **no**
 in-band command to replace it — an unsigned recovery path is just the forgery
 this stage closed, wearing a helpful name.
 
-Recovery is an out-of-band trust-anchor replacement:
+Recovery is an out-of-band trust-anchor replacement, and it re-anchors **both**
+roots:
 
 1. enroll a new credential on a trusted device; export only its public key;
 2. construct a fresh trust policy file out of band, pinning the new human
-   credential and re-pinning the participant keys that are still trusted;
-3. re-anchor the checkpoint against the room's genesis, confirmed from a source
-   that is not the remote;
-4. review the interval since the compromise: every decision signed by the old
+   credential and re-pinning the participant keys that are still trusted, each
+   with an explicit effective commit in the room's history;
+3. compute the new policy digest and confirm it through a channel that is not
+   the compromised one;
+4. re-anchor the checkpoint against **both** the room's genesis and that policy
+   digest, each confirmed from a source that is not the remote;
+5. review the interval since the compromise: every decision signed by the old
    credential after that point is suspect and must be re-taken.
 
 Step 4 is the part that is work rather than typing, and it is why losing the
@@ -260,32 +308,54 @@ credential is a real incident rather than a reset.
 ## 7. Transport trust anchor
 
 `checkpoint.py`. A local durable record of the genesis this room was anchored
-to and the last remote tip that passed full verification. A new tip is accepted
-only if it **descends** from the last accepted one; rollback to an ancestor,
-replacement by an unrelated history and rewritten history are all "not a
-descendant", and all refused. A trust-policy generation that went backwards is
-refused too, since an older policy may pin keys that have since been revoked.
+to, the trust-policy root it was anchored under, and the last remote tip that
+passed full verification. A new tip is accepted only if it **descends** from
+the last accepted one; rollback to an ancestor, replacement by an unrelated
+history and rewritten history are all "not a descendant", and all refused. A
+trust-policy generation that went backwards is refused too, since an older
+policy may pin keys that have since been revoked.
+
+**The candidate is observed, never supplied.** The checkpoint must name exactly
+the history that passed verification. An earlier version checked a
+caller-supplied candidate for descent, verified the *branch*, and then recorded
+the *candidate* — so any reachable descendant object could become the accepted
+anchor while a different history was the one actually checked. The candidate is
+now read from the configured ref; a supplied one is an assertion that must
+equal it, and the tip is re-read after verification so a branch that moved
+underneath fails rather than advancing.
 
 Everything else verifies first — namespace, append-only history, digests,
 references, receipt lifecycle, signatures — and only then does the checkpoint
 advance. A failed verification leaves the anchor exactly where it was, so a bad
 fetch can never become the new baseline.
 
-### Bootstrap: no trust on first use
+### Bootstrap: no trust on first use, and there are two roots
 
 A fresh device with no checkpoint does not believe whatever tip the remote
-offers. `checkpoint-bootstrap` requires `--expected-genesis`, the room's root
-commit, obtained from somewhere that is not the remote being anchored — another
-device, a note, the person who created the room — and the observed root must
-match it. `--expected-tip` may be supplied for a stronger anchor.
+offers — and a genesis commit alone is not enough. Because the trust policy
+deliberately does not live on the room branch, it is a **second root**: an
+attacker who supplies both a plausible history and a policy pinning their own
+human key produces a branch that verifies perfectly under it. A genesis pin
+says which history; it does not say which keys may authenticate the history
+descending from it.
+
+So bootstrapping requires both, out of band, and neither may be defaulted from
+the artefact being checked:
 
 ```
 agent-room --repo <room> --participant coordinator --trust-policy <policy> \
-    checkpoint-bootstrap --state <checkpoint> --expected-genesis <root oid>
+    checkpoint-bootstrap --state <checkpoint> \
+        --expected-genesis <root oid> \
+        --expected-trust-policy-sha256 <policy digest>
 
 agent-room --repo <room> --participant coordinator --trust-policy <policy> \
     checkpoint-accept --state <checkpoint>
 ```
+
+The accepted policy digest is recorded in the checkpoint. On a later
+acceptance, a changed digest at an **unchanged generation** fails closed: the
+only legitimate way for the pins to move is a signed update, and a signed
+update advances the generation.
 
 Local checkpoint tampering by an attacker who already controls the service
 user's state is **not** solved here. S3.

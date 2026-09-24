@@ -21,6 +21,15 @@ be replayed as a signature in some other protocol, and the auth header is
 inside it too, so an artifact cannot claim a weaker method than the one that
 was actually signed.
 
+**The room identity is in there as well** (schema 2). A domain of
+"agent-room.v1" says *what kind of thing* was signed, not *which room*; since
+participant keys are expected to be reused across rooms and projects, an
+identical envelope signed in room A would otherwise verify perfectly when
+copied into room B. The signed `room_id` is the branch's root commit, and
+verification requires it to equal both the trust policy's room and the store's
+own — so a cross-room transplant fails on the signature, not on a field
+somebody remembered to compare.
+
 **Order of operations**, which is also the order of trust:
 
 1. build the unsigned immutable envelope;
@@ -53,7 +62,7 @@ from . import canonical
 from .errors import AgentRoomError
 from .process import run_bounded, sanitised_env
 
-AUTH_SCHEMA_VERSION = 1
+AUTH_SCHEMA_VERSION = 2
 
 #: Where the auth record lives on an envelope.
 AUTH_FIELD = "auth"
@@ -73,6 +82,9 @@ UNSIGNED_FIELDS = (canonical.DIGEST_FIELD, AUTH_FIELD)
 #: gets the same narrow grammar as every other identifier here.
 KEY_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9._-]{0,63}\Z")
 
+#: The room identity is a Git root commit, so it is a full object id.
+ROOM_ID_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
 #: An Ed25519 signature is 64 bytes, 88 base64 characters. The bound is
 #: generous and finite: an auth record is not a place to put a payload.
 MAX_SIGNATURE_CHARS = 512
@@ -89,7 +101,7 @@ __all__ = [
     "KNOWN_METHODS", "UNSIGNED_FIELDS", "KEY_ID_RE",
     "AuthError", "UnauthenticatedMessage", "MalformedAuthRecord",
     "UnknownAuthVersion", "UnknownMethod", "InvalidSignature", "SigningError",
-    "signed_payload", "validate_auth_record", "auth_header",
+    "ROOM_ID_RE", "signed_payload", "validate_auth_record", "auth_header",
     "sign_envelope", "verify_signature", "Ed25519Signer",
     "generate_ed25519_keypair", "public_key_fingerprint",
 ]
@@ -125,12 +137,20 @@ class SigningError(AuthError):
 
 # -- the signed object ------------------------------------------------------
 
-def auth_header(*, signer: str, key_id: str, method: str = METHOD_ED25519,
+def auth_header(*, signer: str, key_id: str, room_id: str,
+                method: str = METHOD_ED25519,
                 version: int = AUTH_SCHEMA_VERSION) -> dict:
     """The part of the auth record that is itself signed."""
+    if not isinstance(room_id, str) or not ROOM_ID_RE.match(room_id):
+        raise SigningError(
+            f"room_id {room_id!r} must be the room branch's root commit as a "
+            "full Git object id; a signature that does not name its room is "
+            "transplantable into another one"
+        )
     return {
         "auth_schema_version": version,
         "domain": DOMAIN,
+        "room_id": room_id,
         "method": method,
         "signer": signer,
         "key_id": key_id,
@@ -176,6 +196,12 @@ def validate_auth_record(auth) -> dict:
             f"auth.method {method!r} is not implemented; known: "
             f"{sorted(KNOWN_METHODS)}"
         )
+    room_id = auth.get("room_id")
+    if not isinstance(room_id, str) or not ROOM_ID_RE.match(room_id):
+        raise MalformedAuthRecord(
+            f"auth.room_id {room_id!r} must be a full Git object id; without a "
+            "signed room identity a signature is transplantable between rooms"
+        )
     signer = auth.get("signer")
     if not isinstance(signer, str) or not signer.strip():
         raise MalformedAuthRecord(
@@ -193,8 +219,8 @@ def validate_auth_record(auth) -> dict:
             f"auth.signature is {len(signature)} characters, over the "
             f"{MAX_SIGNATURE_CHARS} limit"
         )
-    unknown = set(auth) - {"auth_schema_version", "domain", "method", "signer",
-                           "key_id", "signature"}
+    unknown = set(auth) - {"auth_schema_version", "domain", "room_id",
+                           "method", "signer", "key_id", "signature"}
     if unknown:
         raise MalformedAuthRecord(
             f"auth record has unknown fields {sorted(unknown)}; an unsigned "
@@ -344,14 +370,18 @@ class Ed25519Signer:
         return base64.b64encode(raw).decode("ascii")
 
 
-def sign_envelope(envelope: dict, signer) -> dict:
-    """Attach an auth record. The caller seals afterwards, never before."""
+def sign_envelope(envelope: dict, signer, *, room_id: str) -> dict:
+    """Attach an auth record. The caller seals afterwards, never before.
+
+    `room_id` is required rather than defaulted: a signature that does not say
+    which room it was made for is one that can be moved to another.
+    """
     if canonical.DIGEST_FIELD in envelope:
         raise SigningError(
             "sign before sealing: the envelope digest must cover the signature, "
             "not the other way round"
         )
     header = auth_header(signer=signer.signer, key_id=signer.key_id,
-                         method=signer.method)
+                         room_id=room_id, method=signer.method)
     signature = signer.sign(signed_payload(envelope, header))
     return {**envelope, AUTH_FIELD: {**header, "signature": signature}}

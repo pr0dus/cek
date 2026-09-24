@@ -12,11 +12,26 @@ trust roots: if the keys that authenticate the branch's messages lived on the
 branch, anyone who could write the branch could install their own. The policy
 is local state, and changes to it require the human credential.
 
-**Validity is a function of history, not of the clock.** A key is valid from an
-effective commit and invalid from a revocation commit, both checked by Git
-ancestry against the commit a message was added in. So a message signed before
-a rotation stays verifiable afterwards, and a revoked key stops authenticating
-new messages, without anyone having to trust a timestamp.
+**Validity is a function of history, not of the clock.** Every key has a
+mandatory effective commit and, once revoked, a mandatory revocation commit,
+both checked by Git ancestry against the commit a message was added in. So a
+message signed before a rotation stays verifiable afterwards, and a revoked key
+stops authenticating anything from its boundary on, without anyone having to
+trust a timestamp.
+
+The boundaries are not optional, and that was a real defect: a key with a null
+effective commit was valid for *all of history*, including commits that predate
+it, and a revocation with a null boundary only blocked the write path while
+leaving raw-Git artifacts at any commit verifiable. Both are now required to be
+full object ids that exist in this room's history.
+
+**The rule is inclusive at both ends.** A key is valid *at* its effective
+commit and every descendant; a revoked key is invalid *at* its revocation
+commit and every descendant. So a rotation whose boundary is the current tip
+does not retroactively invalidate the outgoing key's earlier messages, but it
+does invalidate anything it signed in that boundary commit — which is why an
+operator rotating a key that signed the tip should first land a neutral marker
+commit from another valid identity and use that as the boundary.
 
 The honest limit: this is a local file owned by the service user. Someone who
 already controls that user's local state can edit it. S3's isolation is what
@@ -26,6 +41,7 @@ would change that; until then, do not read this as tamper-proof.
 import datetime as dt
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -56,6 +72,10 @@ CUSTODY_DEVICE = "android-keystore-device-bound"
 
 POLICY_FILE_MODE = 0o600
 POLICY_DIR_MODE = 0o700
+
+#: A history boundary is a commit, named by a full object id. Revision syntax
+#: is not an identity and cannot bind a validity interval.
+OID_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 __all__ = [
     "TRUST_SCHEMA_VERSION", "TRUST_UPDATE_DOMAIN", "TRUSTED_ROLES",
@@ -129,6 +149,10 @@ class TrustPolicy:
         Everything after this is a signed update, so the human credential is
         the root of the policy as well as the authority over consequential
         actions. Its public half is all that is stored.
+
+        The bootstrap key is effective at the room's genesis — the root commit
+        — which is the only boundary that can be correct for a key that has to
+        authenticate the room from its first message.
         """
         document = {
             "trust_schema_version": TRUST_SCHEMA_VERSION,
@@ -143,7 +167,10 @@ class TrustPolicy:
                     "public_key": human_public_key,
                     "custody": human_custody,
                     "added_generation": 1,
-                    "effective_commit": None,
+                    # Genesis: the room identity *is* the root commit, so this
+                    # key is valid from the first commit onwards and never
+                    # from "everywhere", which is what null used to mean.
+                    "effective_commit": room_id,
                     "revoked_generation": None,
                     "revoked_effective_commit": None,
                     "replaces": None,
@@ -223,6 +250,25 @@ class TrustPolicy:
             if entry.get("method") not in auth.KNOWN_METHODS:
                 raise TrustError(
                     f"key {key_id!r} names method {entry.get('method')!r}")
+            effective = entry.get("effective_commit")
+            if not isinstance(effective, str) or not OID_RE.match(effective):
+                raise TrustError(
+                    f"key {key_id!r} has effective_commit {effective!r}; every "
+                    "key needs a full-object-id history boundary, because a "
+                    "key with no lower bound is valid for all of history"
+                )
+            revoked = entry.get("revoked_effective_commit")
+            if entry.get("revoked_generation") is not None:
+                if not isinstance(revoked, str) or not OID_RE.match(revoked):
+                    raise TrustError(
+                        f"key {key_id!r} is revoked but names revocation "
+                        f"boundary {revoked!r}; a revocation with no boundary "
+                        "still authenticates historical commits"
+                    )
+            elif revoked is not None:
+                raise TrustError(
+                    f"key {key_id!r} names a revocation boundary but no "
+                    "revocation generation")
             public_key = entry.get("public_key")
             if not isinstance(public_key, str) or \
                     "PRIVATE KEY" in public_key.upper():
@@ -287,24 +333,22 @@ class TrustPolicy:
                 "choose the algorithm"
             )
 
-        effective = entry.get("effective_commit")
+        effective = entry["effective_commit"]
         revoked = entry.get("revoked_effective_commit")
         if at_commit is None:
-            # A message being written now. Current validity is the question.
-            if entry.get("revoked_generation") is not None:
-                raise KeyNotValidHere(
-                    f"key {key_id!r} was revoked at generation "
-                    f"{entry['revoked_generation']}; it cannot sign new messages"
-                )
-            return entry
+            raise KeyNotValidHere(
+                f"key {key_id!r} cannot be checked without a history point. "
+                "There is no boundary-free validity check: a message being "
+                "written is validated against the tip it will descend from, "
+                "and a stored one against its own add commit."
+            )
 
         if ancestry is None:
             raise KeyNotValidHere(
                 "key validity is decided by Git ancestry, and no ancestry "
                 "oracle was supplied; refusing to guess"
             )
-        if effective is not None and not (
-                at_commit == effective or ancestry(effective, at_commit)):
+        if not (at_commit == effective or ancestry(effective, at_commit)):
             raise KeyNotValidHere(
                 f"key {key_id!r} becomes effective at {effective[:12]}, which "
                 f"is not an ancestor of {at_commit[:12]}; it had no authority "
@@ -322,13 +366,38 @@ class TrustPolicy:
         return entry
 
     # -- updates -----------------------------------------------------------
-    def apply_update(self, update: dict, *, ancestry=None) -> dict:
+    def assert_boundary_in_history(self, boundary, store, label: str) -> str:
+        """The boundary commit must be a real commit in *this* room's history.
+
+        A validity interval that names a commit nobody has, or a commit from
+        an unrelated history, is not an interval — it is a hole with an object
+        id in it.
+        """
+        if not isinstance(boundary, str) or not OID_RE.match(boundary):
+            raise TrustUpdateError(
+                f"{label} {boundary!r} must be a full Git object id; revision "
+                "syntax cannot bind a validity interval, and a null boundary "
+                "would make the key valid for all of history"
+            )
+        if store.commit_object_state(boundary) != "commit":
+            raise TrustUpdateError(
+                f"{label} {boundary[:12]} is not a commit in this room")
+        tip = store.current_tip()
+        if not (boundary == tip or store.is_strict_ancestor(boundary, tip)):
+            raise TrustUpdateError(
+                f"{label} {boundary[:12]} is not in the room's history at "
+                f"{tip[:12]}; a boundary outside the room bounds nothing"
+            )
+        return boundary
+
+    def apply_update(self, update: dict, *, store) -> dict:
         """Apply one human-signed rotation, revocation or addition.
 
         Refused unless the update is signed by the *current* human credential,
-        carries exactly the next generation, and — when it replaces the human
-        credential itself — is counter-signed by the incoming key, so nobody
-        can pin a credential nobody holds.
+        carries exactly the next generation, names a history boundary that
+        really exists in this room, and — when it replaces the human credential
+        itself — is counter-signed by the incoming key, so nobody can pin a
+        credential nobody holds.
         """
         if not isinstance(update, dict):
             raise TrustUpdateError("a trust update must be an object")
@@ -358,6 +427,11 @@ class TrustPolicy:
             )
 
         # Authority: the current human credential, and nothing else.
+        if record["room_id"] != self.room_id:
+            raise TrustUpdateError(
+                f"the update's signature names room {record['room_id'][:12]}, "
+                f"but this policy is for {self.room_id[:12]}"
+            )
         if record["signer"] != HUMAN_ROLE:
             raise TrustUpdateError(
                 f"a trust update must be signed by {HUMAN_ROLE!r}, not "
@@ -369,7 +443,9 @@ class TrustPolicy:
                 f"update is signed by key {record['key_id']!r}, but the current "
                 f"human credential is {human['key_id']!r}"
             )
-        self.assert_valid_for(human, role=HUMAN_ROLE, method=record["method"])
+        self.assert_valid_for(human, role=HUMAN_ROLE, method=record["method"],
+                              at_commit=store.current_tip(),
+                              ancestry=store.is_strict_ancestor)
         payload = update_payload(update, record)
         if not auth.verify_signature(human["public_key"], payload,
                                      record["signature"],
@@ -386,9 +462,10 @@ class TrustPolicy:
                 f"update names participant {participant!r}, which is not a "
                 f"trusted role: {list(TRUSTED_ROLES)}"
             )
-        effective = update.get("effective_commit")
-        if effective is not None and not isinstance(effective, str):
-            raise TrustUpdateError("effective_commit must be a commit id or null")
+        # Mandatory, and proven to be in this room. Every action moves a
+        # validity boundary, so every action has to name where.
+        effective = self.assert_boundary_in_history(
+            update.get("effective_commit"), store, "effective_commit")
 
         keys = dict(self.document["keys"])
         if action in ("add", "rotate"):
@@ -483,13 +560,17 @@ class TrustPolicy:
 
 
 def build_update(policy: TrustPolicy, signer, *, action: str,
-                 participant: str, new_key_id: str | None = None,
+                 participant: str, effective_commit: str,
+                 new_key_id: str | None = None,
                  public_key: str | None = None, old_key_id: str | None = None,
                  method: str = auth.METHOD_ED25519,
                  custody: str = CUSTODY_HOST_FILE,
-                 effective_commit: str | None = None,
                  new_key_signer=None) -> dict:
     """Assemble and sign one trust-policy update.
+
+    `effective_commit` has no default. A boundary that a caller can forget is
+    a boundary that ends up null, and a null boundary means "valid for all of
+    history" — which is what this stage had to fix.
 
     The signer must be the current human credential; `apply_update` checks
     that independently, so this is a convenience for building the record, not
@@ -510,8 +591,11 @@ def build_update(policy: TrustPolicy, signer, *, action: str,
         "effective_commit": effective_commit,
         "created_at": _now_iso(),
     }
+    # The update is room-bound twice over: `room_id` is in the signed body and
+    # in the signed auth header, and `apply_update` checks both against the
+    # policy it is being applied to.
     header = auth.auth_header(signer=signer.signer, key_id=signer.key_id,
-                              method=signer.method)
+                              room_id=policy.room_id, method=signer.method)
     if participant == HUMAN_ROLE and action in ("add", "rotate"):
         # Proof of possession has to cover the same bytes as the authority
         # signature, so it is produced against the payload built without it.
@@ -527,7 +611,7 @@ def build_update(policy: TrustPolicy, signer, *, action: str,
 
 
 def verify_envelope(envelope, policy: TrustPolicy, *, at_commit=None,
-                    ancestry=None) -> dict:
+                    ancestry=None, room_id: str | None = None) -> dict:
     """Authenticate one stored envelope. Fails closed at every step.
 
     The order is the order of trust: structure, then policy, then
@@ -554,6 +638,22 @@ def verify_envelope(envelope, policy: TrustPolicy, *, at_commit=None,
             f"is from {claimed!r}; the two must be the same identity"
         )
 
+    # Room binding, checked on the *signed* value. The room id is inside the
+    # payload, so a message signed for another room fails here, and would fail
+    # the signature check even if this comparison were removed.
+    if record["room_id"] != policy.room_id:
+        raise KeyNotValidHere(
+            f"the signature names room {record['room_id'][:12]}, but this "
+            f"trust policy is for {policy.room_id[:12]}; participant keys are "
+            "reused across rooms, so a signature has to say which one it was "
+            "made in"
+        )
+    if room_id is not None and record["room_id"] != room_id:
+        raise KeyNotValidHere(
+            f"the signature names room {record['room_id'][:12]}, but this "
+            f"store is room {room_id[:12]}"
+        )
+
     entry = policy.key(record["key_id"])
     policy.assert_valid_for(entry, role=record["signer"],
                             method=record["method"], at_commit=at_commit,
@@ -569,4 +669,4 @@ def verify_envelope(envelope, policy: TrustPolicy, *, at_commit=None,
         )
     return {"signer": record["signer"], "key_id": record["key_id"],
             "method": record["method"], "role": entry["role"],
-            "custody": entry.get("custody")}
+            "room_id": record["room_id"], "custody": entry.get("custody")}

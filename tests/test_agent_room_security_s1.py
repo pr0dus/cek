@@ -1090,8 +1090,8 @@ def test_an_impossible_receipt_history_fails_verification(store, room, target,
     # Signed with the real release-recorder key: the lifecycle invariant has
     # to hold even against a correctly authenticated impossible history, which
     # is what a compromised host key would produce.
-    sealed = canonical.seal(
-        sign_envelope(forged, signers["release-recorder"]))
+    sealed = canonical.seal(sign_envelope(
+        forged, signers["release-recorder"], room_id=store.room_id()))
     raw_commit(store.workdir, store.message_path("t1", sealed["message_id"]),
                canonical.canonical_text(sealed), "second reservation")
 
@@ -1119,7 +1119,7 @@ def test_a_terminal_receipt_without_a_reservation_fails_verification(
         "parent_id": request["message_id"], "body": {"text": "orphan"},
         "evidence": [], "status": "open", "reply_requested": False,
         "human_approval_required": False, "receipt": receipt,
-    }, signers["release-recorder"]))
+    }, signers["release-recorder"], room_id=store.room_id()))
     raw_commit(store.workdir, store.message_path("t1", sealed["message_id"]),
                canonical.canonical_text(sealed), "orphan terminal receipt")
 

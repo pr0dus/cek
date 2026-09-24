@@ -30,6 +30,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import subprocess
 import threading
 import time
@@ -272,11 +273,19 @@ class GitMessageStore:
         store._git("checkout", "-q", "--orphan", branch)
         store._git("rm", "-rq", "--cached", ".", check=False)
         readme = path / "README.agent-room.md"
+        # A random nonce in the genesis, because the room identity *is* the
+        # root commit and signatures are bound to it. Without this, two rooms
+        # created in the same second from the same template produce byte
+        # identical genesis commits - same tree, same author, same message,
+        # same timestamp - and therefore the same identity, which would make
+        # the room binding bind nothing. Not a secret: it is committed, and
+        # its only job is to be different.
         readme.write_text(
             "# agent-room\n\n"
             "Dedicated append-only branch for Agent Room message traffic.\n"
             "This branch is separate from main and must never be merged into it.\n\n"
-            f"Paths:\n- {MESSAGES_DIR}/<thread_id>/<message_id>.json\n",
+            f"Paths:\n- {MESSAGES_DIR}/<thread_id>/<message_id>.json\n\n"
+            f"Room nonce: {secrets.token_hex(16)}\n",
             encoding="utf-8",
         )
         store._git("add", "README.agent-room.md")
@@ -962,7 +971,17 @@ class GitMessageStore:
         class _Resolver:
             @staticmethod
             def resolve_message(message_id: str):
-                return store._resolve_raw(message_id)
+                # Same rule as the read path: a new message may not be
+                # validated against an unauthenticated parent or piece of
+                # evidence. Bounded - the reference is authenticated, never
+                # recursively resolved.
+                path = store._id_index().get(message_id)
+                if path is None:
+                    return None
+                add_commit = store._history()[path]
+                referenced = store._load_raw(path, add_commit)
+                store.authenticate(referenced, add_commit)
+                return referenced
 
             @staticmethod
             def commit_object_state(sha: str) -> str:
@@ -998,7 +1017,16 @@ class GitMessageStore:
                         "message may only rely on state that existed when it "
                         "was committed"
                     )
-                return store._load_raw(path, other)
+                referenced = store._load_raw(path, other)
+                # Authenticate the reference before its content validates
+                # anything. Otherwise a signed claim could be validated against
+                # an unsigned parent or forged evidence, and a targeted read
+                # would hand it back as trusted even though `verify_store()`
+                # would later fail on the forgery. No recursion into *its*
+                # references: the top-level read owns the recursive semantics,
+                # and this stays bounded.
+                store.authenticate(referenced, other)
+                return referenced
 
             @staticmethod
             def commit_object_state(sha: str) -> str:
@@ -1128,12 +1156,18 @@ class GitMessageStore:
         has since been rotated still verify the messages it signed while it was
         valid — and stops a revoked key authenticating anything after its
         revocation point.
+
+        `commit=None` means "a message being written now". It does **not** mean
+        "skip the history boundary": the message will descend from the current
+        tip, so that is the point it is validated at. A key that is not yet
+        effective cannot sign early, and a revoked one cannot sign late.
         """
         if self.trust is None:
             return None
+        at_commit = commit if commit is not None else self.current_tip()
         return trust_module.verify_envelope(
-            envelope, self.trust, at_commit=commit,
-            ancestry=self.is_strict_ancestor,
+            envelope, self.trust, at_commit=at_commit,
+            ancestry=self.is_strict_ancestor, room_id=self.room_id(),
         )
 
     def _load(self, path: str, commit: str) -> dict:

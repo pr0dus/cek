@@ -12,11 +12,25 @@ and a new tip is accepted only when it **descends** from that one. Rollback to
 an ancestor, replacement by an unrelated history and rewritten history are all
 the same answer: not a descendant, refused.
 
-**No trust on first use.** A fresh device with no checkpoint does not simply
-believe whatever tip the remote offers. Bootstrapping requires a genesis
-identity supplied out of band — read from somewhere that is not the remote
-being bootstrapped against — and the remote's actual root commit has to match
-it.
+**No trust on first use, and there are two roots.** A fresh device with no
+checkpoint does not simply believe whatever tip the remote offers. Bootstrapping
+requires a genesis identity supplied out of band — read from somewhere that is
+not the remote being bootstrapped against — and the remote's actual root commit
+has to match it.
+
+A genesis alone is not enough, which was a real gap. The trust policy is
+deliberately not on the room branch, so it is a *second* root: an attacker who
+supplies both a plausible history and a policy pinning their own human key can
+produce a branch that verifies perfectly under it. So bootstrapping also
+requires the policy's digest out of band, and a later acceptance refuses a
+changed policy digest at an unchanged generation — the only legitimate way for
+that digest to move is a signed update, which advances the generation.
+
+**The candidate is observed, never supplied.** The checkpoint records exactly
+the history that passed verification. Accepting a caller's candidate while
+verifying the branch head would let an arbitrary reachable object become the
+new anchor, so the candidate is read from the configured ref, verified, and
+re-read afterwards to catch a branch that moved underneath.
 
 **The checkpoint only advances after everything else passes.** Namespace,
 append-only history, digests, references, receipt lifecycle and signatures all
@@ -49,7 +63,7 @@ OID_LENGTHS = (40, 64)
 
 __all__ = [
     "CHECKPOINT_SCHEMA_VERSION", "CheckpointError", "NoTrustAnchor",
-    "AnchorMismatch", "RollbackRejected", "TrustCheckpoint",
+    "AnchorMismatch", "RollbackRejected", "TrustCheckpoint", "policy_digest",
 ]
 
 
@@ -82,11 +96,20 @@ def _is_oid(value) -> bool:
             and all(c in "0123456789abcdef" for c in value))
 
 
-def _policy_digest(policy) -> str | None:
+def policy_digest(policy) -> str | None:
+    """The out-of-band pin for a trust policy: SHA-256 over its canonical form.
+
+    Public because an operator has to read it off one device and type it into
+    another; there is nothing secret in a policy.
+    """
     if policy is None:
         return None
     return hashlib.sha256(
         canonical.canonical_bytes(policy.document)).hexdigest()
+
+
+#: Kept as the internal spelling used through this module.
+_policy_digest = policy_digest
 
 
 class TrustCheckpoint:
@@ -158,19 +181,41 @@ class TrustCheckpoint:
     # -- bootstrap ---------------------------------------------------------
     @classmethod
     def bootstrap(cls, store, *, expected_genesis: str,
+                  expected_trust_policy_sha256: str,
                   expected_tip: str | None = None, path=None) -> "TrustCheckpoint":
-        """Anchor this room for the first time against an out-of-band identity.
+        """Anchor this room for the first time against two out-of-band roots.
 
-        `expected_genesis` must come from somewhere other than the remote being
-        anchored — a note, another device, the person who created the room.
-        Supplying the remote's own answer back to it would be trust on first
-        use with extra steps.
+        Both must come from somewhere other than the remote being anchored — a
+        note, another device, the person who created the room. Supplying the
+        remote's own answer back to it, or defaulting the policy pin from the
+        policy file being checked, would be trust on first use with extra
+        steps.
         """
         if not _is_oid(expected_genesis):
             raise NoTrustAnchor(
                 f"expected_genesis {expected_genesis!r} must be a full Git "
                 "object id obtained out of band; bootstrapping without one is "
                 "refused rather than defaulted"
+            )
+        if not isinstance(expected_trust_policy_sha256, str) or \
+                len(expected_trust_policy_sha256) != 64 or \
+                not all(c in "0123456789abcdef"
+                        for c in expected_trust_policy_sha256):
+            raise NoTrustAnchor(
+                "expected_trust_policy_sha256 must be the out-of-band digest "
+                "of the trust policy root. A genesis commit alone does not "
+                "say which human key is allowed to authenticate the history "
+                "descending from it, so a policy with a different human root "
+                "would verify an alternative history just as happily."
+            )
+        store.assert_authenticated("bootstrapping a trust anchor")
+        observed_policy = _policy_digest(store.trust)
+        if observed_policy != expected_trust_policy_sha256:
+            raise AnchorMismatch(
+                f"the supplied trust policy digests to {observed_policy[:12]}, "
+                f"but this room was anchored to "
+                f"{expected_trust_policy_sha256[:12]}. This is a different set "
+                "of trust roots."
             )
         observed = store.room_id()
         if observed != expected_genesis:
@@ -179,6 +224,8 @@ class TrustCheckpoint:
                 f"was anchored to {expected_genesis[:12]}. This is a different "
                 "history wearing the same branch name."
             )
+        # Observed, not supplied: the checkpoint has to name the history that
+        # was actually verified.
         tip = store.current_tip()
         if expected_tip is not None:
             if not _is_oid(expected_tip):
@@ -208,8 +255,23 @@ class TrustCheckpoint:
 
     # -- advance -----------------------------------------------------------
     def accept(self, store, candidate_tip: str | None = None) -> dict:
-        """Verify a candidate head and, only then, advance the anchor."""
-        candidate = candidate_tip or store.current_tip()
+        """Verify the room's head and, only then, advance the anchor.
+
+        `candidate_tip` is an assertion about what the caller believes the head
+        is, not a choice of what to anchor. It must equal the observed ref tip;
+        anything else is refused rather than verified-here-recorded-there.
+        """
+        observed = store.current_tip()
+        if candidate_tip is not None and candidate_tip != observed:
+            raise CheckpointError(
+                f"candidate tip {str(candidate_tip)[:12]} is not the room's "
+                f"head {observed[:12]}. The checkpoint records the history "
+                "that was verified, so the candidate is read from the ref and "
+                "never taken from the caller - otherwise any reachable object "
+                "could become the accepted anchor while a different one was "
+                "checked."
+            )
+        candidate = observed
         if not _is_oid(candidate):
             raise CheckpointError(
                 f"candidate tip {candidate!r} must be a full Git object id")
@@ -241,16 +303,34 @@ class TrustCheckpoint:
                 f"({previous} -> {generation}); an older policy may pin keys "
                 "that have since been revoked"
             )
+        policy_digest = _policy_digest(store.trust)
+        if generation == previous and \
+                policy_digest != self.document.get("trust_policy_sha256"):
+            raise RollbackRejected(
+                "the trust policy changed without advancing its generation. "
+                "The only legitimate way for the pinned keys to move is a "
+                "signed update, and a signed update increments the generation."
+            )
 
         # Everything else first. If any of this raises, the checkpoint below
         # is never reached and the anchor stays exactly where it was.
         verified = store.verify_store()
 
+        # Re-observe: if the branch moved while we were verifying it, what we
+        # checked is not what we would be recording.
+        settled = store.current_tip()
+        if settled != candidate:
+            raise CheckpointError(
+                f"the room head moved from {candidate[:12]} to "
+                f"{settled[:12]} during verification; the anchor is not "
+                "advanced to a history nobody checked"
+            )
+
         self.document = {
             **self.document,
             "last_accepted_tip": candidate,
             "trust_generation": generation,
-            "trust_policy_sha256": _policy_digest(store.trust),
+            "trust_policy_sha256": policy_digest,
             "accepted_at": _now_iso(),
         }
         self._validate()

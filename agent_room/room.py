@@ -149,7 +149,8 @@ class AgentRoom:
                     f"{self.participant!r} has no signing key; an unsigned "
                     "message would be indistinguishable from a forged one"
                 )
-            envelope = auth.sign_envelope(envelope, self.signer)
+            envelope = auth.sign_envelope(envelope, self.signer,
+                                          room_id=self.store.room_id())
         return self.store.append(canonical.seal(envelope))
 
     def reply(self, parent_id: str, **kwargs) -> dict:
