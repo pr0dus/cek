@@ -63,6 +63,7 @@ from .namespace import NamespaceViolation
 from . import trust as trust_module
 from .trust import NoTrustPolicy
 from .process import sanitised_env
+from .custody import network_git_binding
 from .schema import DECISION_TYPES, THREAD_ID_RE, validate_envelope
 
 MESSAGES_DIR = ".agent-room/messages"
@@ -144,11 +145,13 @@ class GitMessageStore:
         Hashing must see the object's real bytes; a text-mode round trip could
         normalise them and make a forged object hash correctly.
         """
-        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args]
+        network_options, network_env = network_git_binding(args)
+        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG,
+                   *network_options, *args]
         try:
             proc = subprocess.run(
                 command, cwd=self.workdir, capture_output=True,
-                timeout=GIT_TIMEOUT_SECONDS, env=self._clean_env(),
+                timeout=GIT_TIMEOUT_SECONDS, env={**self._clean_env(), **network_env},
             )
         except subprocess.TimeoutExpired as exc:
             raise GitTimeout(
@@ -195,7 +198,9 @@ class GitMessageStore:
              input: str | None = None) -> subprocess.CompletedProcess:
         # --no-replace-objects: a replace ref must never quietly rewrite what
         # verification sees. Their *presence* is rejected separately.
-        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args]
+        network_options, network_env = network_git_binding(args)
+        command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG,
+                   *network_options, *args]
         try:
             proc = subprocess.run(
                 command,
@@ -204,7 +209,7 @@ class GitMessageStore:
                 text=True,
                 timeout=GIT_TIMEOUT_SECONDS,
                 input=input,
-                env=self._clean_env(),
+                env={**self._clean_env(), **network_env},
             )
         except subprocess.TimeoutExpired as exc:
             raise GitTimeout(
@@ -1657,7 +1662,8 @@ class GitMessageStore:
     def _reconcile_push(self, tip: str) -> tuple:
         """Bounded check of whether the remote already has our tip.
 
-        One `ls-remote`, no fetch. Returns `(pushed, known, error)`. We can
+        Exact-ref observation, then bounded verified fetch when needed.
+        Returns `(pushed, known, error)`. We can
         prove delivery when the remote ref equals what we pushed, and prove
         non-delivery when the branch is absent entirely; anything else stays
         honestly unknown rather than being guessed either way.
@@ -1670,11 +1676,19 @@ class GitMessageStore:
             return None, False, AgentRoomError(
                 f"ls-remote {self.remote} failed: {proc.stderr.strip()}"
             )
-        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        lines = proc.stdout.splitlines()
         if not lines:
             # The exact branch ref is absent, so nothing we pushed landed.
             return False, True, None
-        remote_sha = lines[0].split()[0]
+        # ls-remote patterns match ref suffixes, not only complete refnames.
+        # Never let a tag/nested branch/extra advertisement prove delivery.
+        fields = lines[0].split('\t') if len(lines) == 1 else []
+        if (len(fields) != 2 or fields[1] != self.ref
+                or len(fields[0]) not in (40, 64)
+                or any(c not in '0123456789abcdef' for c in fields[0])):
+            return None, False, AgentRoomError(
+                f'ambiguous or invalid exact-ref advertisement for {self.ref}')
+        remote_sha = fields[0]
         if remote_sha == tip:
             return True, True, None
 

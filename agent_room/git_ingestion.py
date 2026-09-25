@@ -14,6 +14,7 @@ import stat
 from pathlib import Path
 
 from .errors import AgentRoomError
+from .custody import network_git_binding
 from .process import run_bounded, sanitised_env
 from .transport_state import private_directory, private_lock, STATE_LOCK
 
@@ -54,14 +55,15 @@ def verify_local_artifacts(original, candidate):
 
 
 def command(path, *args, input=None):
+    network_options, network_env = network_git_binding(args)
     result = run_bounded(
         ['/usr/bin/prlimit', f'--fsize={PACK_BYTES}:{PACK_BYTES}',
          f'--as={MEMORY_BYTES}:{MEMORY_BYTES}', '--core=0:0', '--',
-         'git', '--no-replace-objects', *CONFIG, *args],
+         'git', '--no-replace-objects', *CONFIG, *network_options, *args],
         cwd=path, input=input, timeout=TIMEOUT, max_output_bytes=PACK_BYTES,
         env=sanitised_env(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
                           GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1',
-                          GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/bin/false'))
+                          GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/bin/false', **network_env))
     if result.returncode != 0 or result.timed_out or result.output_limited:
         raise IngestionError(f'bounded Git ingestion {args[0]} refused: '
                              f'{result.stderr.decode("utf-8", "replace")[:250]}')

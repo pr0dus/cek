@@ -184,6 +184,45 @@ def git_config(role):
             f'\tsshCommand = /usr/bin/ssh -F /etc/agent-room/ssh/{role}.conf\n')
 
 
+def network_git_binding(args):
+    """Bind every actual Git network operation, including quarantine/recovery.
+
+    Never copy a command from HOME, repo config, a request or GIT_SSH*. The
+    kernel's current account selects the fixed role; the existing full guard
+    rechecks its custody before an explicit, highest-precedence Git option is
+    produced. Quarantine may keep global/system Git config disabled. Returned
+    environment entries must be applied AFTER sanitising inherited variables.
+
+    Unprovisioned development/library accounts may still use disposable local
+    remotes (and their existing non-SSH transports), but cannot fall back to
+    unchecked SSH. This is not a deployment or a cross-UID isolation proof.
+    """
+    if not args or args[0] not in ('fetch', 'push', 'ls-remote'):
+        return (), {}
+    try:
+        account = pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError) as exc:
+        raise CustodyError('cannot establish Git transport account') from exc
+    role = next((r for r, (name, _) in ACCOUNTS.items() if name == account), None)
+    if role is None:
+        return (('-c', 'protocol.ssh.allow=never', '-c', 'core.sshCommand=/bin/false'),
+                {'GIT_ALLOW_PROTOCOL': 'file:git:http:https'})
+    guard(role)
+    # No alternate production transport/helper or implicit SSH selection. All
+    # supported built-in non-SSH protocols are explicitly disabled as well as
+    # the default for unknown helpers. Environment overrides are stripped by
+    # each caller's existing sanitised_env boundary.
+    options = ('-c', 'core.sshCommand=/usr/bin/ssh -F /etc/agent-room/ssh/'+role+'.conf',
+            '-c', 'ssh.variant=ssh', '-c', 'credential.helper=',
+            '-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always',
+            '-c', 'protocol.file.allow=never', '-c', 'protocol.git.allow=never',
+            '-c', 'protocol.http.allow=never', '-c', 'protocol.https.allow=never',
+            '-c', 'protocol.ext.allow=never')
+    # Git's transport allowlist overrides even protocol.<arbitrary-helper>.allow
+    # in a repo config or a URL rewrite. protocol.allow=never alone does not.
+    return options, {'GIT_ALLOW_PROTOCOL': 'ssh'}
+
+
 def guard(role):
     """Production entrypoints call this before any signer, Git or client use."""
     document = load_manifest()

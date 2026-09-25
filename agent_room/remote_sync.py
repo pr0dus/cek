@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import canonical
 from .errors import AgentRoomError
+from .custody import network_git_binding
 from . import protected_state
 from .process import run_bounded, sanitised_env
 from .transport_state import private_directory, private_lock, check_file, STATE_LOCK, StateError
@@ -122,11 +123,13 @@ def run_git(workdir, *args: str, check: bool = True):
     request reaches it: callers pass constants, configured names this module
     has validated, and object ids it read from Git itself.
     """
+    network_options, network_env = network_git_binding(args)
     result = run_bounded(
-        ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG, *args],
+        ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG,
+         *network_options, *args],
         cwd=Path(workdir), timeout=GIT_TIMEOUT_SECONDS,
         env=sanitised_env(GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0",
-                          GIT_ASKPASS="/bin/false"),
+                          GIT_ASKPASS="/bin/false", **network_env),
         max_output_bytes=MAX_GIT_OUTPUT_BYTES,
     )
     if result.timed_out or result.output_limited:
