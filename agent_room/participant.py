@@ -39,6 +39,7 @@ from .errors import (
     SchemaError,
 )
 from .schema import AGENT_FORBIDDEN_TYPES, MESSAGE_TYPES
+from .doorbell_protocol import PREFIX as TERMINAL_PREFIX, KINDS as TERMINAL_KINDS, ROLES as CODING_ROLES, terminal_kind
 
 #: Types an agent participant may author (design §6; enforced again by the store).
 AGENT_MESSAGE_TYPES = tuple(sorted(MESSAGE_TYPES - AGENT_FORBIDDEN_TYPES))
@@ -252,6 +253,13 @@ class ParticipantAdapter:
     # -- prompt ------------------------------------------------------------
     def build_prompt(self, thread: list, target: dict) -> str:
         rendered = "\n".join(render_message(m) for m in thread)
+        terminal_rule = ''
+        if self.participant in CODING_ROLES:
+            terminal_rule = (f'For a meaningful terminal/end report ONLY, set body.format to '
+                             f'{TERMINAL_PREFIX}<kind>, with kind one of: '
+                             f'{", ".join(TERMINAL_KINDS)}. Keep the actual report in body.text. '
+                             'Routine intermediate messages must not use this marker. '
+                             'Terminal reports are routed to the supervisor, not human approval.\n')
         return f"""You are the participant `{self.participant}` in an Agent Room \
 research thread. You are {self.ROLE}.
 
@@ -262,6 +270,7 @@ Thread `{target['thread_id']}`, oldest first:
 Respond to message `{target['message_id']}`.
 
 Rules:
+{terminal_rule}\
 - Reply with a single JSON object matching the provided schema. No prose outside it.
 - `type` must be one of: {", ".join(AGENT_MESSAGE_TYPES)}.
 - You may NOT author `approval` or `rejection`; human authority is not yours to assert.
@@ -398,6 +407,7 @@ Rules:
 
         raw = self.invoke(prompt)
         response = self.parse_response(raw)   # raises before any mutation
+        terminal = self.participant in CODING_ROLES and terminal_kind(response) is not None
 
         delivery_error = None
         try:
@@ -409,8 +419,9 @@ Rules:
                 claim=response.get("claim"),
                 reply_requested=response.get("reply_requested", False),
                 human_approval_required=response.get("human_approval_required", False),
-                recipient={"agent": target["sender"].get("agent")}
-                if target["sender"].get("agent") else None,
+                recipient=({'agent': 'openai-research'} if terminal else
+                           {"agent": target["sender"].get("agent")}
+                           if target["sender"].get("agent") else None),
                 sender={"via": self.MARKER},
             )
         except (SchemaError, ForbiddenOperation) as exc:
