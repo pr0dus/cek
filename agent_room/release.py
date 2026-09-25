@@ -314,6 +314,7 @@ def receipt_state(store, request: dict) -> dict:
         "consumed": bool(receipts),
         "unresolved": bool(latest and latest["status"] in RECEIPT_UNRESOLVED),
         "latest": latest,
+        "reservation_decision_id": receipts[0]['decision_id'] if receipts else None,
     }
 
 
@@ -637,9 +638,7 @@ def _reconcile_local(store, request_message_id, *, status, result, receipt_id=No
         _consequential_action(request)
         receipts = receipt_state(store, request)
         assert_transition(receipts, status)
-        decisions, _foreign = _decisions_for(store, request)
-        decision_id = (decisions[-1]["decision"]["decision_id"] if decisions
-                       else receipts["latest"]["decision_id"])
+        decision_id = receipts['reservation_decision_id']
         return _write_receipt(store, request, status=status, result=result,
                               decision_id=decision_id, receipt_id=receipt_id,
                               signer=signer)

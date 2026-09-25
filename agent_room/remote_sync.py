@@ -31,12 +31,13 @@ import datetime as dt
 import json
 import os
 import re
-import tempfile
+import secrets
 from pathlib import Path
 
 from . import canonical
 from .errors import AgentRoomError
 from .process import run_bounded, sanitised_env
+from .transport_state import private_directory, private_lock, check_file, STATE_LOCK, StateError
 
 GIT_TIMEOUT_SECONDS = 120
 MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -152,15 +153,24 @@ class Anchor:
     def __init__(self, path, kind: str) -> None:
         self.path = Path(path)
         self.kind = kind
-        self.document = self._load()
+        self._base_raw = self._read()
+        self.document = self._decode(self._base_raw)
 
-    def _load(self) -> dict:
+    def _read(self):
         try:
-            raw = self.path.read_text(encoding="utf-8")
+            with private_directory(self.path.parent) as directory:
+                try:
+                    fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW |
+                                 os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+                except FileNotFoundError:
+                    return None
+                with os.fdopen(fd, 'rb') as handle:
+                    check_file(handle.fileno())
+                    return handle.read()
         except FileNotFoundError:
             # The only "not initialised yet" there is.
-            return {"kind": self.kind, "created_at": _now_iso()}
-        except OSError as exc:
+            return None
+        except (OSError, StateError) as exc:
             # Permission denied, an I/O error or a bad path are *not* an empty
             # ledger. Treating them as one is fail-open: a processed-request
             # ledger that silently became empty would let every request run
@@ -170,24 +180,85 @@ class Anchor:
                 "not treated as 'not initialised': an unreadable ledger that "
                 "became empty would let processed requests run a second time."
             ) from exc
+
+    def _decode(self, raw):
+        if raw is None:
+            return {"kind": self.kind, "created_at": _now_iso()}
         document = canonical.strict_loads(raw)
         if not isinstance(document, dict) or document.get("kind") != self.kind:
             raise SyncError(f"{self.path} is not a {self.kind} anchor")
+        if type(document.get('revision', 0)) is not int or document.get('revision', 0) < 0:
+            raise SyncError('invalid transport state revision')
         return document
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=STATE_DIR_MODE)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
-        try:
-            os.fchmod(fd, STATE_FILE_MODE)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(canonical.canonical_text(self.document))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        if self.kind == 'control-anchor':
+            raise SyncError('control anchor requires verified monotonic advance')
+        with private_lock(self.path.parent, STATE_LOCK):
+            raw = self._read()
+            if raw != self._base_raw:
+                raise SyncError('stale transport state object; reload before mutation')
+            previous = self._decode(raw)
+            if self.kind == 'processed-ledger':
+                completed = previous.get('requests') or {}
+                proposed = self.document.get('requests') or {}
+                if any(proposed.get(k) != v for k, v in completed.items()):
+                    raise SyncError('completed request records cannot be removed or changed')
+            self._write(previous)
+
+    def _write(self, previous):
+        """Caller owns STATE_LOCK and has rechecked current durable state."""
+        self.document['revision'] = previous.get('revision', 0) + 1
+        with private_directory(self.path.parent) as directory:
+            tmp = f'.state-{secrets.token_hex(16)}.tmp'
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+                         os.O_CLOEXEC | os.O_NOFOLLOW, STATE_FILE_MODE, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(canonical.canonical_text(self.document))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+                self._base_raw = canonical.canonical_text(self.document).encode('utf-8')
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                raise
+
+    def advance_control(self, control, remote, genesis):
+        """Re-read at commit time; only a verified observed control tip advances.
+
+        No generic set/save can write a control anchor. A fresh-state comparison
+        here also refuses a stale caller even if it bypasses the run mutex.
+        None is explicit local-test mode, never a missing configured remote.
+        """
+        if self.kind != 'control-anchor':
+            raise SyncError('not a control anchor')
+        with private_lock(self.path.parent, STATE_LOCK):
+            raw = self._read()
+            current = self._decode(raw)
+            control.verify_history()
+            tip = control.current_tip()
+            if not tip or control.genesis() != genesis:
+                raise SyncError('control genesis does not match the pinned root')
+            if current.get('genesis', genesis) != genesis:
+                raise SyncError('persisted control genesis changed')
+            if remote is not None and remote.required_remote_tip() != tip:
+                raise SyncError('control tip is not the observed authoritative remote head')
+            accepted = current.get('last_accepted_tip')
+            if accepted and accepted != tip:
+                result = control._git('merge-base', '--is-ancestor', accepted, tip, check=False)
+                if result.returncode != 0:
+                    raise SyncError('control anchor cannot regress or change ancestry')
+            self.document = current
+            self._base_raw = raw
+            if accepted == tip:
+                return
+            self.document.update(genesis=genesis, last_accepted_tip=tip, updated_at=_now_iso())
+            self._write(current.copy())
 
     def get(self, key, default=None):
         return self.document.get(key, default)

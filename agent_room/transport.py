@@ -34,6 +34,7 @@ import datetime as dt
 import json
 import re
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,7 @@ from .supervisor import PARTICIPANT as SUPERVISOR
 from .supervisor import SupervisorBoundary
 from .supervisor import context_digest
 from .trust import TrustPolicy
+from .transport_state import private_lock, WORKER_LOCK
 
 #: Every operation an untrusted writer may name. Adding to this list is a
 #: security decision, not a convenience one.
@@ -485,7 +487,8 @@ class TransportWorker:
         remote = self._control_remote()
         if remote is None:
             control.verify_history()
-            self._anchor_control(anchor, control)
+            anchor.advance_control(control, None,
+                                   self.config.control_genesis or control.genesis())
             return {"mode": "local", "tip": control.current_tip()}
 
         candidate_branch = f"{self.config.control_branch}{CANDIDATE_SUFFIX}"
@@ -505,6 +508,9 @@ class TransportWorker:
                 f"the last accepted {accepted[:12]}. A rewritten or rolled "
                 "back queue would erase results this service already produced "
                 "and invite it to repeat the work.")
+        # Commit against current disk state, before installation. A stale
+        # object cannot restore an older accepted tip even outside run().
+        anchor.advance_control(probe, remote, self._expected_control_genesis(anchor, probe))
         if candidate != control.current_tip():
             # `--ff-only` cannot install this when the local branch carries a
             # service result the remote has not seen, and that divergence is
@@ -518,7 +524,6 @@ class TransportWorker:
         control.verify_history()
         # The anchor advances only to a tip actually observed on the remote —
         # never to a local-only result commit, which nobody else has seen.
-        anchor.set(genesis=probe.genesis(), last_accepted_tip=candidate)
         return {"mode": "remote", "tip": control.current_tip(),
                 "anchor": candidate}
 
@@ -539,10 +544,6 @@ class TransportWorker:
             "no control genesis is pinned and none has been recorded: the "
             "control history's root must be supplied out of band before a "
             "remote queue can be accepted as this service's replay anchor")
-
-    def _anchor_control(self, anchor: Anchor, control: ControlStore) -> None:
-        anchor.set(genesis=control.genesis(),
-                   last_accepted_tip=control.current_tip())
 
     # -- 4. delivery of results this service produced ----------------------
     def materialise_pending(self, control: ControlStore) -> dict:
@@ -841,6 +842,20 @@ class TransportWorker:
 
     # -- 5. the run --------------------------------------------------------
     def run(self) -> dict:
+        # No state/Git/checkpoint read is allowed before this process owns the
+        # full lifecycle. Configuration is root-owned; no request chooses it.
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(private_lock(self.config.state_dir, WORKER_LOCK))
+            except AgentRoomError as exc:
+                return {"pending": None, "processed": 0, "remaining": None,
+                        "results": [], "lifecycle": {"status": "failed",
+                        "error": _bounded(exc), "error_type": type(exc).__name__}}
+            # Preserve existing error/delivery semantics once processing has
+            # begun; it would be false to report zero work on a later error.
+            return self._run_locked()
+
+    def _run_locked(self) -> dict:
         self._start_clock()
         try:
             # Read owner state and require both configured refs before any

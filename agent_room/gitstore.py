@@ -1281,6 +1281,9 @@ class GitMessageStore:
                 )
             terminal = None
             for envelope, receipt in entries[1:]:
+                if receipt['decision_id'] != first['decision_id']:
+                    raise ReceiptStateError(
+                        f'{where}: terminal receipt changes reservation decision provenance')
                 if receipt["status"] == "uncertain":
                     raise ReceiptStateError(
                         f"{envelope['message_id']} is a second reservation for "

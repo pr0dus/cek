@@ -191,6 +191,13 @@ class ControlStore:
 
     def _history(self) -> dict:
         """path -> add commit, refusing any later mutation of an artifact."""
+        # A log without merge diffs is only a sound mutation census for a
+        # linear graph. Reject topology, not just one observed merge diff.
+        proc = self._git('rev-list', '--parents', self.ref)
+        rows = [row.split() for row in proc.stdout.decode('ascii').splitlines()]
+        if (not rows or sum(len(row) == 1 for row in rows) != 1
+                or any(len(row) not in (1, 2) for row in rows)):
+            raise ControlAppendOnlyViolation('control history must be linear with exactly one root; merges refused')
         self.assert_namespace_closed()
         proc = self._git("log", self.ref, "--reverse", "--format=%H",
                          "--name-status", "-z", "--no-renames")
