@@ -99,6 +99,11 @@ host-side defence. Its installation/effect must be checked later; no rule or
 sudo policy is changed by this implementation. Do not authorize model roles to
 start the release unit. There is no signer daemon or unattended reserve API.
 
+For C2's remote-head authorization, reservation CAS and ambiguous-delivery
+recovery rules, see [AGENT_ROOM_RELEASE_C2.md](AGENT_ROOM_RELEASE_C2.md).
+Production release now requires its out-of-band checkpoint and fixed private
+recovery journal; the local-only development path is not production evidence.
+
 ## System templates and limits
 
 Four new system one-shot templates plus the updated supervisor template use

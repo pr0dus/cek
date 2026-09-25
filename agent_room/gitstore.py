@@ -1426,7 +1426,7 @@ class GitMessageStore:
         )
         return self._append_validated(envelope)
 
-    def append_receipt(self, envelope: dict) -> dict:
+    def append_receipt(self, envelope: dict, *, publish: bool = True) -> dict:
         """Append one `execution_receipt`. Deliberately NOT agent-facing.
 
         A receipt is what makes a consequential action one-shot. An agent that
@@ -1448,9 +1448,11 @@ class GitMessageStore:
             agent_facing=False,
             resolver=self._write_resolver,
         )
-        return self._append_validated(envelope)
+        if self.remote and publish and envelope["receipt"]["status"] == "uncertain":
+            raise ForbiddenOperation("remote reservations require release's exact-head CAS delivery")
+        return self._append_validated(envelope, publish=publish)
 
-    def _append_validated(self, envelope: dict) -> dict:
+    def _append_validated(self, envelope: dict, *, publish: bool = True) -> dict:
         """Shared commit path. Validation has already happened above."""
         # The last check before anything becomes permanent: an oversize
         # artifact must fail here rather than after it is in history.
@@ -1575,7 +1577,7 @@ class GitMessageStore:
                 "commit_known": commit_known,
                 "path": rel,
             }
-            if self.remote:
+            if self.remote and publish:
                 # The message is already durable locally. If delivery fails the
                 # caller must learn *what was written*, or a naive retry of
                 # post() would mint a second UUID for the same logical message
@@ -1734,6 +1736,17 @@ class GitMessageStore:
             fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
             if fetched.returncode != 0:
                 continue
+
+            # Authority-bearing reservations are never reparented by generic
+            # participant delivery, even through a later explicit push().
+            remote_tip = self._git("rev-parse", "FETCH_HEAD").stdout.strip()
+            for path, commit in self._history().items():
+                message = self._load(path, commit)
+                if (message["type"] == "execution_receipt"
+                        and message["receipt"]["status"] == "uncertain"
+                        and commit != remote_tip
+                        and not self.is_strict_ancestor(commit, remote_tip)):
+                    raise PushRaceError("a provisional reservation cannot use generic Git rebase")
 
             # Transport bookkeeping identity only - it carries no approval
             # authority. Without it a participant checkout with no global Git

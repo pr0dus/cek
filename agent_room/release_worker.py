@@ -29,9 +29,13 @@ def run():
     store = GitMessageStore(item['room'], branch='agent-room', remote='origin',
                             trust=TrustPolicy.load(custody.TRUST_POLICY))
     if operation == 'reserve':
-        return release.reserve(store, ticket['request_id'], workdir=item['workspace'], signer=signer)
+        return release.reserve(store, ticket['request_id'], workdir=item['workspace'], signer=signer,
+                               checkpoint_path=item['checkpoint'],
+                               state_path=f'{item["state"]}/release-reservation.json')
     return release.reconcile(store, ticket['request_id'], status=ticket['status'],
-                             result=ticket['result'], signer=signer)
+                             result=ticket['result'], signer=signer, workdir=item['workspace'],
+                             checkpoint_path=item['checkpoint'],
+                             state_path=f'{item["state"]}/release-reservation.json')
 
 
 def main(argv=None):

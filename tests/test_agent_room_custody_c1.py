@@ -317,7 +317,9 @@ def test_release_fixed_manual_dispatch(monkeypatch, operation):
     assert calls[:2] == [('guard', 'release-recorder'), ('ticket', '/etc/agent-room/release-request.json')]
     assert calls[2] == ('signer', item['signing_key'], {'signer': 'release-recorder', 'key_id': 'release-recorder-1'})
     assert calls[3][0] == operation and calls[3][1] == ('store', 'request')
-    if operation == 'reserve': assert calls[3][2]['workdir'] == item['workspace']
+    assert calls[3][2]['workdir'] == item['workspace']
+    assert calls[3][2]['checkpoint_path'] == item['checkpoint']
+    assert calls[3][2]['state_path'] == f'{item["state"]}/release-reservation.json'
 
 
 @pytest.mark.parametrize('ticket', [None, [], {'operation': 'command'},

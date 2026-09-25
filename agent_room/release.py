@@ -361,10 +361,10 @@ def assert_transition(state: dict, status: str) -> None:
         )
 
 
-def _write_receipt(store, request: dict, *, status: str, result: dict,
+def _receipt_envelope(store, request: dict, *, status: str, result: dict,
                    decision_id: str, receipt_id: str | None = None,
                    signer=None) -> dict:
-    """Append one receipt. The caller must already hold the writer lock."""
+    """Build/sign a receipt, without writing it. Caller holds the writer lock."""
     if status not in RECEIPT_STATUS:
         raise ReleaseError(
             f"receipt status must be one of {sorted(RECEIPT_STATUS)}, got "
@@ -415,9 +415,15 @@ def _write_receipt(store, request: dict, *, status: str, result: dict,
             )
         envelope = auth.sign_envelope(envelope, signer,
                                       room_id=store.room_id())
-    written = store.append_receipt(canonical.seal(envelope))
-    written["receipt_id"] = receipt["receipt_id"]
-    written["receipt_status"] = status
+    return canonical.seal(envelope)
+
+
+def _write_receipt(store, request: dict, **kwargs) -> dict:
+    """Local reservation or terminal reconciliation; no remote reservation rebase."""
+    envelope = _receipt_envelope(store, request, **kwargs)
+    written = store.append_receipt(envelope)
+    written["receipt_id"] = envelope["receipt"]["receipt_id"]
+    written["receipt_status"] = envelope["receipt"]["status"]
     return written
 
 
@@ -555,7 +561,7 @@ def authorise(store, request_message_id: str, *, workdir) -> dict:
 
 
 def reserve(store, request_message_id: str, *, workdir, signer=None,
-            result: dict | None = None) -> dict:
+            result: dict | None = None, checkpoint_path=None, state_path=None) -> dict:
     """The operator-facing command: recheck and consume the nonce, atomically.
 
     This is the *only* thing that precedes a manual action. It runs the final
@@ -567,6 +573,12 @@ def reserve(store, request_message_id: str, *, workdir, signer=None,
     reconcile — the safe direction. Consuming the nonce afterwards would leave
     the whole duration of the side effect as a window for a second release.
     """
+    if store.remote is not None:
+        from .release_delivery import RemoteReservation
+        return RemoteReservation(store, checkpoint_path=checkpoint_path,
+                                 state_path=state_path).reserve(
+            request_message_id, workdir=workdir, signer=signer, result=result)
+    # Explicitly local-only semantics, not production-qualified release.
     # One critical section over check-and-consume. The append inside takes the
     # same lock, which is why it is re-entrant within a store instance.
     with store.writer_lock():
@@ -591,13 +603,27 @@ def reserve(store, request_message_id: str, *, workdir, signer=None,
 
 
 def reconcile(store, request_message_id: str, *, status: str, result: dict,
-              receipt_id: str | None = None, signer=None) -> dict:
+              receipt_id: str | None = None, signer=None, checkpoint_path=None,
+              state_path=None, workdir=None) -> dict:
     """Record what actually happened. Resolves a reserved action.
 
     Deliberately does not re-derive current state: by the time this is called
     the world has moved *because* the action was performed, and re-measuring
     would refuse every honest report of a completed action.
     """
+    if store.remote is not None:
+        from .release_delivery import RemoteReservation
+        if workdir is None:
+            raise ReleaseError('remote reconciliation requires the fixed target workdir')
+        return RemoteReservation(store, checkpoint_path=checkpoint_path,
+                                 state_path=state_path).reconcile(
+            request_message_id, workdir=workdir, status=status, result=result,
+            receipt_id=receipt_id, signer=signer)
+    return _reconcile_local(store, request_message_id, status=status, result=result,
+                            receipt_id=receipt_id, signer=signer)
+
+
+def _reconcile_local(store, request_message_id, *, status, result, receipt_id=None, signer=None):
     if status in RECEIPT_UNRESOLVED:
         raise ReleaseError(
             f"reconciling with {status!r} would leave the action unresolved; "
