@@ -11,10 +11,10 @@ Two rules shape the design.
 
 **A fetched head is not a trusted head.** `git pull`, or fetch-then-reset,
 installs the remote's answer and verifies afterwards — by which time the local
-branch has already become whatever arrived. Here a candidate lands on a
-*separate local ref*, is verified there in full against the S2 trust policy
-and checkpoint, and is installed only if it passes. A candidate that fails
-leaves the room exactly where it was.
+branch has already become whatever arrived. Here a candidate is ingested in a
+bounded private quarantine and verified against the S2 trust policy and
+checkpoint. Only then is its bounded object graph promoted to a separate
+candidate ref. A rejected candidate cannot pollute the persistent object store.
 
 **Delivery is a compare-and-swap.** A supervisor response reviewed against
 head H must not be rebased onto H+1 and pushed as though it still applied.
@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import canonical
 from .errors import AgentRoomError
+from . import protected_state
 from .process import run_bounded, sanitised_env
 from .transport_state import private_directory, private_lock, check_file, STATE_LOCK, StateError
 
@@ -51,9 +52,8 @@ HARDENED_GIT_CONFIG = (
     "-c", "advice.detachedHead=false",
 )
 
-#: Where a fetched-but-unverified room head is parked. A real local branch, so
-#: the ordinary store can be pointed at it for verification, and one nobody
-#: checks out.
+#: Where the quarantine-verified candidate is parked for the caller's final
+#: exact-tip recheck before installation. Nobody checks out this branch.
 CANDIDATE_SUFFIX = "-candidate"
 
 #: How many times delivery may be reconstructed when the remote moved but the
@@ -129,8 +129,8 @@ def run_git(workdir, *args: str, check: bool = True):
                           GIT_ASKPASS="/bin/false"),
         max_output_bytes=MAX_GIT_OUTPUT_BYTES,
     )
-    if result.timed_out:
-        raise SyncError(f"git {args[0]} timed out in {workdir}")
+    if result.timed_out or result.output_limited:
+        raise SyncError(f"git {args[0]} time/output bound exceeded in {workdir}")
     if check and result.returncode != 0:
         raise SyncError(
             f"git {' '.join(args[:3])} failed ({result.returncode}): "
@@ -165,8 +165,12 @@ class Anchor:
                 except FileNotFoundError:
                     return None
                 with os.fdopen(fd, 'rb') as handle:
-                    check_file(handle.fileno())
-                    return handle.read()
+                    if check_file(handle.fileno()).st_size > 16 * 1024 * 1024:
+                        raise StateError('protected state exceeds 16 MiB limit; explicit maintenance required')
+                    raw = handle.read(16 * 1024 * 1024 + 1)
+                    if len(raw) > 16 * 1024 * 1024:
+                        raise StateError('protected state grew beyond read limit')
+                    return raw
         except FileNotFoundError:
             # The only "not initialised yet" there is.
             return None
@@ -183,12 +187,15 @@ class Anchor:
 
     def _decode(self, raw):
         if raw is None:
-            return {"kind": self.kind, "created_at": _now_iso()}
+            initial = {"kind": self.kind, "created_at": _now_iso()}
+            if self.kind == 'processed-ledger':
+                initial.update(requests={}, pending_results={}, uncertain_imports={})
+            return initial
         document = canonical.strict_loads(raw)
-        if not isinstance(document, dict) or document.get("kind") != self.kind:
-            raise SyncError(f"{self.path} is not a {self.kind} anchor")
-        if type(document.get('revision', 0)) is not int or document.get('revision', 0) < 0:
-            raise SyncError('invalid transport state revision')
+        try:
+            protected_state.validate(document, self.kind)
+        except protected_state.ProtectedStateError as exc:
+            raise SyncError(str(exc)) from exc
         return document
 
     def save(self) -> None:
@@ -200,8 +207,10 @@ class Anchor:
                 raise SyncError('stale transport state object; reload before mutation')
             previous = self._decode(raw)
             if self.kind == 'processed-ledger':
-                completed = previous.get('requests') or {}
-                proposed = self.document.get('requests') or {}
+                completed = previous['requests']
+                proposed = self.document.get('requests')
+                if not isinstance(proposed, dict):
+                    raise SyncError('invalid protected requests map')
                 if any(proposed.get(k) != v for k, v in completed.items()):
                     raise SyncError('completed request records cannot be removed or changed')
             self._write(previous)
@@ -209,6 +218,8 @@ class Anchor:
     def _write(self, previous):
         """Caller owns STATE_LOCK and has rechecked current durable state."""
         self.document['revision'] = previous.get('revision', 0) + 1
+        self.document['updated_at'] = _now_iso()
+        protected_state.validate(self.document, self.kind)
         with private_directory(self.path.parent) as directory:
             tmp = f'.state-{secrets.token_hex(16)}.tmp'
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
@@ -244,11 +255,11 @@ class Anchor:
             tip = control.current_tip()
             if not tip or control.genesis() != genesis:
                 raise SyncError('control genesis does not match the pinned root')
-            if current.get('genesis', genesis) != genesis:
+            if raw is not None and current['genesis'] != genesis:
                 raise SyncError('persisted control genesis changed')
             if remote is not None and remote.required_remote_tip() != tip:
                 raise SyncError('control tip is not the observed authoritative remote head')
-            accepted = current.get('last_accepted_tip')
+            accepted = current['last_accepted_tip'] if raw is not None else None
             if accepted and accepted != tip:
                 result = control._git('merge-base', '--is-ancestor', accepted, tip, check=False)
                 if result.returncode != 0:
@@ -272,8 +283,13 @@ class Anchor:
 class _Remote:
     """Shared fetch/observe plumbing for one fixed branch on one fixed remote."""
 
-    def __init__(self, workdir, remote: str, branch: str) -> None:
+    def __init__(self, workdir, remote: str, branch: str, *, trust=None,
+                 checkpoint_path=None, genesis=None, anchor_path=None) -> None:
         self.workdir = Path(workdir)
+        self.trust = trust
+        self.checkpoint_path = checkpoint_path
+        self.genesis = genesis
+        self.anchor_path = anchor_path
         self.remote = _validate(remote, REMOTE_RE, "remote")
         self.branch = _validate(branch, REF_NAME_RE, "branch")
         self.ref = f"refs/heads/{self.branch}"
@@ -304,27 +320,21 @@ class _Remote:
         return tip
 
     def fetch_candidate(self, candidate_branch: str) -> str:
-        """Park the remote head on a separate local ref. Verify it there.
+        """Verify in bounded quarantine, then promote to a separate ref.
 
-        Deliberately not `git pull`: installing first and checking afterwards
-        means the local branch has already become whatever arrived.
+        Callers still recheck before moving their working branch/checkpoint.
         """
         _validate(candidate_branch, REF_NAME_RE, "candidate branch")
-        result = run_git(
-            self.workdir, "fetch", "--no-tags", "--prune", "--quiet",
-            self.remote,
-            f"+{self.ref}:refs/heads/{candidate_branch}", check=False)
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", "replace").strip()
-            # Only ls-remote's documented no-match status establishes absence;
-            # an authentication/network error containing "not found" does not.
+        from .git_ingestion import fetch_verified, IngestionError
+        self.required_remote_tip()
+        try:
+            return fetch_verified(self.workdir, self.remote, self.ref,
+                                  f'refs/heads/{candidate_branch}', self._verify_quarantine)
+        except IngestionError as exc:
+            # Missing is proven only by exact ls-remote no-match, never by a
+            # fetch diagnostic that might instead be an authentication error.
             self.required_remote_tip()
-            raise SyncError(f"fetch of {self.ref} failed: {stderr[:300]}")
-        observed = run_git(self.workdir, "rev-parse", "--verify",
-                           f"refs/heads/{candidate_branch}", check=False)
-        if observed.returncode != 0 or not OID_RE.fullmatch(_out(observed)):
-            raise SyncError(f"cannot resolve fetched candidate for {self.ref}")
-        return _out(observed)
+            raise CandidateRejected(str(exc)) from exc
 
     def is_ancestor(self, earlier: str, later: str) -> bool:
         result = run_git(self.workdir, "merge-base", "--is-ancestor",
@@ -337,6 +347,22 @@ class _Remote:
 
 class RoomRemote(_Remote):
     """The signed room branch: fetch, verify a candidate, install, push by lease."""
+
+    def _verify_quarantine(self, path, branch, tip):
+        from .checkpoint import TrustCheckpoint, RollbackRejected
+        from .gitstore import GitMessageStore
+        from .git_ingestion import verify_local_artifacts
+        if self.trust is None or self.checkpoint_path is None:
+            raise SyncError('room ingestion requires pinned trust and checkpoint')
+        checkpoint = TrustCheckpoint.load(self.checkpoint_path)
+        ancestry = run_git(path, 'rev-list', tip).stdout.decode().splitlines()
+        if checkpoint.document['last_accepted_tip'] not in ancestry:
+            raise RollbackRejected('candidate does not descend from the last accepted tip')
+        probe = GitMessageStore(path, branch=branch, trust=self.trust)
+        report = checkpoint.verify_candidate(probe)
+        verify_local_artifacts(GitMessageStore(self.workdir, branch=self.branch, trust=self.trust), probe)
+        if report['candidate_tip'] != tip:
+            raise SyncError('quarantine verification tip changed')
 
     def install(self, candidate_oid: str) -> str:
         """Fast-forward the working branch to an already-verified candidate.
@@ -392,7 +418,7 @@ class RoomRemote(_Remote):
         """Ask the remote what happened, rather than reading the exit code."""
         try:
             landed = self.contains_remotely(local)
-        except SyncError as exc:
+        except AgentRoomError as exc:
             raise AmbiguousDelivery(
                 f"the push of {self.ref} failed ({stderr[:120]}) and the "
                 f"remote could not be inspected ({exc}); whether the response "
@@ -425,6 +451,26 @@ class RoomRemote(_Remote):
 
 class ControlRemote(_Remote):
     """The untrusted control branch: bounded fetch in, bounded push out."""
+
+    def _verify_quarantine(self, path, branch, tip):
+        from .control_store import ControlStore, MAX_REQUEST_BYTES, MAX_RESULT_BYTES
+        if self.genesis is None or self.anchor_path is None:
+            raise SyncError('control ingestion requires genesis pinned out of band and anchor path')
+        anchor = Anchor(self.anchor_path, 'control-anchor')
+        if anchor._base_raw is not None and anchor.document['genesis'] != self.genesis:
+            raise SyncError('persisted control genesis changed')
+        probe = ControlStore(path, branch)
+        probe.verify_history()
+        if probe.genesis() != self.genesis:
+            raise SyncError('control genesis does not match pinned authority')
+        if anchor._base_raw is not None:
+            accepted = anchor.document['last_accepted_tip']
+            if run_git(path, 'merge-base', '--is-ancestor', accepted, tip, check=False).returncode != 0:
+                raise SyncError('control candidate does not descend from the accepted anchor; cannot regress')
+        for artifact, commit in probe._history().items():
+            size = int(_out(run_git(path, 'cat-file', '-s', f'{commit}:{artifact}')))
+            if size > min(MAX_REQUEST_BYTES, MAX_RESULT_BYTES):
+                raise SyncError('control payload exceeds ingestion limit')
 
     def push(self) -> dict:
         """Fast-forward-only push with an exact lease. Never discarding.

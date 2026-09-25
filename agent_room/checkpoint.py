@@ -130,6 +130,9 @@ class TrustCheckpoint:
 
     def _validate(self) -> None:
         document = self.document
+        from .protected_state import digest, timestamp, ProtectedStateError
+        if not isinstance(document, dict):
+            raise CheckpointError('checkpoint must be an object')
         version = document.get("checkpoint_schema_version")
         if type(version) is not int or version != CHECKPOINT_SCHEMA_VERSION:
             raise CheckpointError(
@@ -148,6 +151,15 @@ class TrustCheckpoint:
                     f"a checkpoint must contain no {name!r} field; it holds "
                     "public identities only"
                 )
+        if type(document.get('trust_generation')) is not int or document['trust_generation'] < 0:
+            raise CheckpointError('checkpoint requires a non-negative trust generation')
+        if not digest(document.get('trust_policy_sha256')):
+            raise CheckpointError('checkpoint requires pinned trust policy digest')
+        try:
+            timestamp(document.get('bootstrapped_at'))
+            timestamp(document.get('accepted_at'))
+        except ProtectedStateError as exc:
+            raise CheckpointError(str(exc)) from exc
 
     # -- persistence -------------------------------------------------------
     @classmethod
@@ -168,6 +180,7 @@ class TrustCheckpoint:
         return cls(document, path=path)
 
     def save(self, path=None) -> Path:
+        self._validate()
         target = Path(path or self.path)
         target.parent.mkdir(parents=True, exist_ok=True, mode=STATE_DIR_MODE)
         fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")

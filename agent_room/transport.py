@@ -373,14 +373,18 @@ class TransportWorker:
         if self.config.room_remote is None:
             return None
         return RoomRemote(self.config.room_workdir, self.config.room_remote,
-                          self.config.room_branch)
+                          self.config.room_branch,
+                          trust=TrustPolicy.load(self.config.trust_policy_path),
+                          checkpoint_path=self.config.checkpoint_path)
 
     def _control_remote(self) -> ControlRemote | None:
         if self.config.control_remote is None:
             return None
         return ControlRemote(self.config.control_workdir,
                              self.config.control_remote,
-                             self.config.control_branch)
+                             self.config.control_branch,
+                             genesis=self.config.control_genesis,
+                             anchor_path=Path(self.config.state_dir)/'control-anchor.json')
 
     def _boundary(self, store: GitMessageStore) -> SupervisorBoundary:
         room = AgentRoom(
@@ -416,7 +420,7 @@ class TransportWorker:
         un-auditable local divergence forward. If the remote turns out to have
         it after all, it stays and the ordinary sync installs it.
         """
-        if self._ledger().get("uncertain_imports"):
+        if self._ledger().document["uncertain_imports"]:
             raise TransportError("uncertain imports must be reconciled before room recovery")
         remote = self._room_remote()
         store = self._room_store()
@@ -554,7 +558,7 @@ class TransportWorker:
         this runs again after any sync that reset it.
         """
         ledger = self._ledger()
-        pending = dict(ledger.get("pending_results") or {})
+        pending = dict(ledger.document["pending_results"])
         for request_id, entry in pending.items():
             self._check_clock("materialising a result")
             try:
@@ -581,7 +585,7 @@ class TransportWorker:
         a remote that moved before the push lost the result entirely.
         """
         ledger = self._ledger()
-        if not (ledger.get("pending_results") or {}):
+        if not (ledger.document["pending_results"]):
             return []
         control = ControlStore(self.config.control_workdir,
                                self.config.control_branch)
@@ -620,7 +624,7 @@ class TransportWorker:
                          push_state: str) -> list:
         """Clear a result only against evidence, never against an exit code."""
         ledger = self._ledger()
-        pending = dict(ledger.get("pending_results") or {})
+        pending = dict(ledger.document["pending_results"])
         outcomes = []
         observed = None
         if remote is not None:
@@ -707,7 +711,7 @@ class TransportWorker:
         """
         remote = self._room_remote()
         document = params["response"]
-        if attempts == 0 and request_id in (self._ledger().get("uncertain_imports") or {}):
+        if attempts == 0 and request_id in (self._ledger().document["uncertain_imports"]):
             raise TransportError("request has an uncertain import; reconcile it before new work")
         self._check_clock("constructing a supervisor response")
         expected = store.current_tip()
@@ -718,7 +722,7 @@ class TransportWorker:
         # Durable before the first push, including the crash-after-acceptance
         # window. Only reconciliation or a proven stale refusal removes this.
         ledger = self._ledger()
-        uncertain = dict(ledger.get("uncertain_imports") or {})
+        uncertain = dict(ledger.document["uncertain_imports"])
         uncertain[request_id] = {
             "state": "uncertain_delivery", "request_id": request_id,
             "request_sha256": request_sha256, "params": params,
@@ -744,7 +748,7 @@ class TransportWorker:
             raise TransportError("an uncertain remote import cannot become local mode")
         if inspections >= MAX_DELIVERY_ATTEMPTS:
             raise AmbiguousDelivery("bounded remote reconciliation pass exhausted")
-        entry = self._ledger().get("uncertain_imports")[request_id]
+        entry = self._ledger().document["uncertain_imports"][request_id]
         self._check_clock("reconciling a supervisor response")
         local = self._room_store()
         candidate = remote.fetch_candidate(f"{self.config.room_branch}{CANDIDATE_SUFFIX}")
@@ -806,7 +810,7 @@ class TransportWorker:
     def reconcile_imports(self) -> list:
         """Finish all uncertain imports before recovery or any new request."""
         results = []
-        for request_id, entry in (self._ledger().get("uncertain_imports") or {}).items():
+        for request_id, entry in (self._ledger().document["uncertain_imports"]).items():
             try:
                 detail = self._deliver_uncertain_import(request_id)
                 status = "ok"
@@ -890,7 +894,7 @@ class TransportWorker:
         control = ControlStore(self.config.control_workdir,
                                self.config.control_branch)
         ledger = self._ledger()
-        done = ledger.get("requests") or {}
+        done = ledger.document["requests"]
 
         # Selection is against the service's own ledger, never against the
         # presence of a result file: both files on that branch are written by
@@ -926,13 +930,13 @@ class TransportWorker:
             "processed": processed,
             "remaining": max(len(pending) - processed, 0),
             "results": reconciled + summary,
-            "lifecycle": {"status": "uncertain_delivery" if self._ledger().get("uncertain_imports")
+            "lifecycle": {"status": "uncertain_delivery" if self._ledger().document["uncertain_imports"]
                           else "ok", **lifecycle},
         }
 
     def _process(self, control: ControlStore, entry: dict) -> dict:
         request_id = entry["request_id"]
-        if request_id in (self._ledger().get("uncertain_imports") or {}):
+        if request_id in (self._ledger().document["uncertain_imports"]):
             return {"request_id": request_id, "operation": "supervisor_import",
                     "status": "uncertain_delivery"}
         try:
@@ -964,7 +968,7 @@ class TransportWorker:
         except TransportRefused as exc:
             status, detail = "refused", {"error": _bounded(exc)}
         except AgentRoomError as exc:
-            if request_id in (self._ledger().get("uncertain_imports") or {}):
+            if request_id in (self._ledger().document["uncertain_imports"]):
                 return {"request_id": request_id, "operation": operation,
                         "status": "uncertain_delivery", "error": _bounded(exc)}
             status = "failed"
@@ -999,17 +1003,17 @@ class TransportWorker:
             "detail": detail,
         }
         ledger = self._ledger()
-        requests = dict(ledger.get("requests") or {})
+        requests = dict(ledger.document["requests"])
         requests[request_id] = {"operation": operation, "status": status,
                                 "at": result["completed_at"],
                                 "room_tip": store_tip}
-        pending = dict(ledger.get("pending_results") or {})
+        pending = dict(ledger.document["pending_results"])
         # `produced`: this service made it and has not proven it reached the
         # remote. It stays here through `materialised`, and leaves only on
         # `delivered` or a terminal `conflict`.
         pending[request_id] = {"document": result, "state": "produced",
                                "at": result["completed_at"]}
-        uncertain = dict(ledger.get("uncertain_imports") or {})
+        uncertain = dict(ledger.document["uncertain_imports"])
         uncertain.pop(request_id, None)
         ledger.set(requests=requests, pending_results=pending,
                    uncertain_imports=uncertain)

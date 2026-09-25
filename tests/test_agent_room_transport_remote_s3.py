@@ -339,7 +339,8 @@ def test_REMOTE_CONTEXT_RACE_OTHER_THREAD(net, monkeypatch):
 
 def test_REMOTE_REF_MOVES_DURING_IMPORT_is_caught_by_the_lease(net):
     """The lease itself, at the primitive: an exact expected OID or nothing."""
-    remote = RoomRemote(net["config"].room_workdir, "origin", "agent-room")
+    remote = RoomRemote(net["config"].room_workdir, "origin", "agent-room",
+                        trust=net['policy'], checkpoint_path=net['config'].checkpoint_path)
     net["other"].post(thread_id="t1", type="observation", body={"text": "x"})
     push_other(net)
     stale = net["room"].current_tip()

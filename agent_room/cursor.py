@@ -61,10 +61,12 @@ class ParticipantCursor:
         cursor that has been tampered with or truncated is worth noticing
         rather than quietly forgetting.
         """
-        if not self.path.exists():
-            return self._empty()
         try:
+            if self.path.is_symlink():
+                raise CursorStateError('cursor must not be a symlink')
             raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return self._empty()
         except OSError as exc:
             raise CursorStateError(f"cannot read {self.path}: {exc}") from exc
 
@@ -93,8 +95,6 @@ class ParticipantCursor:
                 f"{self.participant!r}"
             )
         acknowledged = state.get("acknowledged")
-        if acknowledged is None:
-            acknowledged = state["acknowledged"] = {}
         if not isinstance(acknowledged, dict):
             raise CursorStateError(
                 f"{self.path} has a malformed 'acknowledged' field: expected an "
@@ -110,6 +110,11 @@ class ParticipantCursor:
                     f"{self.path} has a malformed acknowledged entry for {key!r}: "
                     f"expected an object, got {type(entry).__name__}"
                 )
+            from .protected_state import timestamp, ProtectedStateError
+            try:
+                timestamp(entry.get('acknowledged_at'))
+            except ProtectedStateError as exc:
+                raise CursorStateError(str(exc)) from exc
         return state
 
     def _ensure_state_dir(self) -> None:
@@ -173,6 +178,8 @@ class ParticipantCursor:
         acknowledgement of a *different* message is preserved rather than
         clobbered by this process's stale copy.
         """
+        from .protected_state import timestamp
+        timestamp(at)
         with self._file_lock():
             self._state = self._load()
             self._state["acknowledged"][message_id] = {"acknowledged_at": at}

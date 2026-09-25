@@ -229,24 +229,32 @@ def test_CONTROL_ANCHOR_STALE_WRITER_rechecks_disk_and_pin(net):
 
 @pytest.mark.parametrize('field', ['pending_results', 'uncertain_imports', 'requests'])
 def test_stale_state_cannot_erase_new_item(tmp_path, field):
+    from tests.test_agent_room_c4_state import entry
+    from agent_room.ids import uuid7
+    a, b = uuid7(), uuid7()
+    def values(ids):
+        result = {field: {key: entry(field, key) for key in ids}}
+        if field == 'pending_results':
+            result['requests'] = {key: entry('requests', key) for key in (a, b)}
+        return result
     path = tmp_path/'state'/'processed.json'
     first = Anchor(path, 'processed-ledger')
-    first.set(**{field: {'a': {'state': 'pending'}}})
+    first.set(**values((a,)))
     stale = Anchor(path, 'processed-ledger')
     latest = Anchor(path, 'processed-ledger')
-    latest.set(**{field: {'a': {'state': 'pending'}, 'b': {'state': 'pending'}}})
+    latest.set(**values((a, b)))
     with private_lock(path.parent, WORKER_LOCK):
         with pytest.raises(SyncError, match='stale'):
             stale.set(**{field: {}})
-    assert set(Anchor(path, 'processed-ledger').get(field)) == {'a', 'b'}
+    assert set(Anchor(path, 'processed-ledger').get(field)) == {a, b}
     fresh = Anchor(path, 'processed-ledger')
     if field == 'requests':
         with pytest.raises(SyncError, match='completed'):
             fresh.set(requests={})
     else:
         # Clear precisely a (representing its proven delivery), retaining b.
-        fresh.set(**{field: {'b': {'state': 'pending'}}})
-        assert set(Anchor(path, 'processed-ledger').get(field)) == {'b'}
+        fresh.set(**values((b,)))
+        assert set(Anchor(path, 'processed-ledger').get(field)) == {b}
 
 
 @pytest.mark.parametrize('change', ['request-delete', 'result-delete', 'result-modify', 'addition'])

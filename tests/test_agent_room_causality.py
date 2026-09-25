@@ -213,6 +213,12 @@ def test_writer_refuses_to_push_on_top_of_corrupt_remote_history(tmp_path, bare_
     room_a = AgentRoom(first, "claude-code", None)
     room_a.post(thread_id="t1", type="observation", body={"text": "legitimate"})
 
+    path_b = tmp_path / "b"
+    git(tmp_path, "clone", "-q", str(bare_remote), str(path_b))
+    configure_identity(path_b)
+    git(path_b, "checkout", "-q", "agent-room")
+    accepted = first.current_tip()
+
     mid = uuid7()
     bad = room_a.build_envelope(thread_id="t1", type="observation",
                                 body={"text": "bad"}, message_id=mid)
@@ -220,24 +226,24 @@ def test_writer_refuses_to_push_on_top_of_corrupt_remote_history(tmp_path, bare_
     commit_at(first, first.message_path("t1", mid), canonical.seal(bad))
     git(first.workdir, "push", str(bare_remote), "agent-room:agent-room")
 
-    # Participant B cloned before that, writes its own message, and on push
-    # must fetch/rebase - and then refuse.
-    path_b = tmp_path / "b"
-    git(tmp_path, "clone", "-q", str(bare_remote), str(path_b))
-    configure_identity(path_b)
-    git(path_b, "checkout", "-q", "agent-room")
-    git(path_b, "reset", "-q", "--hard", "HEAD~1")     # before the bad commit
+    # C4 refuses in quarantine, BEFORE importing/rebasing corrupt history.
+    poisoned = first.current_tip()
     second = GitMessageStore(path_b, branch="agent-room", remote=str(bare_remote))
     room_b = AgentRoom(second, "openai-research", None)
 
     with pytest.raises((SchemaError, DeliveryError)) as exc:
         room_b.post(thread_id="t1", type="observation", body={"text": "mine"})
     if isinstance(exc.value, DeliveryError):
-        assert isinstance(exc.value.cause, SchemaError)
-        # Delivery failed *after* a successful rebase, so the reported commit
-        # must be the post-rebase SHA that actually holds the message.
+        from agent_room.errors import PushAmbiguous
+        assert isinstance(exc.value.cause, PushAmbiguous)
+        assert isinstance(exc.value.cause.recovery_error, SchemaError)
+        assert exc.value.pushed is None and not exc.value.pushed_known
+        # No rebase occurred. The receipt still identifies the actual surviving
+        # local commit, not a stale or hypothetical post-rebase SHA.
         assert exc.value.commit == second.current_add_commit(exc.value.path)
         assert second._git("cat-file", "-e", exc.value.commit).returncode == 0
+        assert second._git('rev-parse', 'HEAD^').stdout.strip() == accepted
+        assert second._git('cat-file', '-e', poisoned, check=False).returncode != 0
 
 
 def test_cli_verify_uses_the_full_gate(store, room, capsys):

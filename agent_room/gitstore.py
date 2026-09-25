@@ -1627,6 +1627,20 @@ class GitMessageStore:
         return result
 
     # -- push with bounded retry -------------------------------------------
+    def _fetch_verified_remote(self):
+        from .git_ingestion import fetch_verified, verify_local_artifacts
+        genesis = self.room_id()
+
+        def verify(path, branch, tip):
+            probe = GitMessageStore(path, branch=branch, trust=self.trust)
+            if probe.room_id() != genesis:
+                raise HistoryUnavailable('remote changed the room genesis')
+            probe.verify_store()
+            verify_local_artifacts(self, probe)
+
+        return fetch_verified(self.workdir, self.remote, self.ref,
+                              f'refs/heads/{self.branch}-delivery-candidate', verify)
+
     def push(self) -> dict:
         """Push with bounded fetch/rebase-or-retry. Never loops forever.
 
@@ -1667,14 +1681,10 @@ class GitMessageStore:
         # The remote moved. Our push may still have landed and been built on
         # by another writer, so fetch that exact ref and test ancestry rather
         # than assuming rejection.
-        fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
-        if fetched.returncode != 0:
-            return None, False, AgentRoomError(
-                f"reconciliation fetch of {self.ref} failed: {fetched.stderr.strip()}"
-            )
-        head = self._git("rev-parse", "FETCH_HEAD", check=False).stdout.strip()
-        if not head:
-            return None, False, AgentRoomError("reconciliation fetch produced no head")
+        try:
+            head = self._fetch_verified_remote()
+        except AgentRoomError as exc:
+            return None, False, exc
         try:
             if head == tip or self.is_strict_ancestor(tip, head):
                 return True, True, None
@@ -1736,13 +1746,13 @@ class GitMessageStore:
             # was something other than a race (a hook, permissions, a missing
             # branch) - retry within the bound and report that instead of
             # misattributing it to a failed rebase.
-            fetched = self._git("fetch", "-q", self.remote, self.ref, check=False)
-            if fetched.returncode != 0:
+            try:
+                remote_tip = self._fetch_verified_remote()
+            except AgentRoomError:
                 continue
 
             # Authority-bearing reservations are never reparented by generic
             # participant delivery, even through a later explicit push().
-            remote_tip = self._git("rev-parse", "FETCH_HEAD").stdout.strip()
             for path, commit in self._history().items():
                 message = self._load(path, commit)
                 if (message["type"] == "execution_receipt"
@@ -1757,7 +1767,7 @@ class GitMessageStore:
             rebase = self._git(
                 "-c", f"user.name={self.author[0]}",
                 "-c", f"user.email={self.author[1]}",
-                "rebase", "-q", "FETCH_HEAD", check=False)
+                "rebase", "-q", remote_tip, check=False)
             if rebase.returncode != 0:
                 self._git("rebase", "--abort", check=False)
                 raise PushRaceError(

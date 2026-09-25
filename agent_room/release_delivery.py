@@ -43,7 +43,8 @@ class RemoteReservation:
         self.store = store
         self.checkpoint_path = Path(checkpoint_path)
         self.state_path = Path(state_path)
-        self.remote = RoomRemote(store.workdir, store.remote, store.branch)
+        self.remote = RoomRemote(store.workdir, store.remote, store.branch,
+                                 trust=store.trust, checkpoint_path=self.checkpoint_path)
         self.candidate_branch = f'{store.branch}-release-candidate'
 
     def _observe(self):
