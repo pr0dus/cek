@@ -41,6 +41,7 @@ def write_raw(store, rel, text, message="out-of-band"):
 
 def flaky_git(monkeypatch, predicate, error=None):
     real_run = subprocess.run
+    real_bounded = agent_room.gitstore.run_bounded
 
     def run(cmd, **kwargs):
         if predicate(cmd):
@@ -48,6 +49,11 @@ def flaky_git(monkeypatch, predicate, error=None):
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(agent_room.gitstore.subprocess, "run", run)
+    def bounded(cmd, **kwargs):
+        if predicate(cmd):
+            raise (error or subprocess.TimeoutExpired(cmd, 60))
+        return real_bounded(cmd, **kwargs)
+    monkeypatch.setattr(agent_room.gitstore, 'run_bounded', bounded)
 
 
 def resealed_rewrite(store, posted, text="rewritten"):

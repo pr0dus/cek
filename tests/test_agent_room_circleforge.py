@@ -26,6 +26,7 @@ from agent_room.errors import (
 )
 from agent_room.cursor import ParticipantCursor
 from agent_room.ids import uuid7
+from agent_room.process import BoundedResult
 from tests.conftest_agent_room import configure_identity, git
 
 REPO = "pr0dus/concept-evolution-kernel"
@@ -54,6 +55,16 @@ def remote_contains(bare_remote, commit):
     return out.returncode == 0
 
 
+def fail_recovery(monkeypatch, *, timeout=True):
+    """Inject loss at the streaming runner, not the retired capture seam."""
+    def bounded(cmd, **kwargs):
+        assert 'ls-remote' in cmd
+        if timeout:
+            raise subprocess.TimeoutExpired(cmd, 60)
+        return BoundedResult(128, b'', b'fatal: unreachable')
+    monkeypatch.setattr(agent_room.gitstore, 'run_bounded', bounded)
+
+
 # ===== #12. delivery uncertainty when reconciliation is unavailable ========
 
 def test_accepted_push_with_lost_ack_and_failed_reconciliation_is_unknown(
@@ -79,6 +90,7 @@ def test_accepted_push_with_lost_ack_and_failed_reconciliation_is_unknown(
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(agent_room.gitstore.subprocess, "run", run)
+    fail_recovery(monkeypatch)
     with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "landed"})
     monkeypatch.undo()
@@ -110,6 +122,7 @@ def test_cli_exposes_the_same_unknown_delivery_state(tmp_path, bare_remote,
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(agent_room.gitstore.subprocess, "run", run)
+    fail_recovery(monkeypatch)
     code = main(["--repo", str(repo), "--participant", "claude-code",
                  "--remote", str(bare_remote),
                  "post", "--thread-id", "t1", "--type", "observation",
@@ -139,6 +152,7 @@ def test_retry_exhaustion_without_reconciliation_is_unknown(
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(agent_room.gitstore.subprocess, "run", run)
+    fail_recovery(monkeypatch, timeout=False)
     with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "x"})
     assert exc.value.pushed is None and exc.value.pushed_known is False

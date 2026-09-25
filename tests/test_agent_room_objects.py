@@ -229,6 +229,11 @@ def test_unsettleable_nonzero_push_is_unknown(tmp_path, bare_remote, monkeypatch
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(agent_room.gitstore.subprocess, "run", run)
+    # Recovery now streams output. Fail its actual runner as well as the
+    # ordinary push call, preserving the original unavailable-query scenario.
+    from agent_room.process import BoundedResult
+    monkeypatch.setattr(agent_room.gitstore, 'run_bounded',
+                        lambda *a, **k: BoundedResult(128, b'', b'fatal: unreachable'))
     with pytest.raises(DeliveryError) as exc:
         room.post(thread_id="t1", type="observation", body={"text": "x"})
     assert exc.value.pushed is None and exc.value.pushed_known is False

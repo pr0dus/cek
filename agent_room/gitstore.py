@@ -62,7 +62,7 @@ from .ids import is_uuid7
 from .namespace import NamespaceViolation
 from . import trust as trust_module
 from .trust import NoTrustPolicy
-from .process import sanitised_env
+from .process import run_bounded, sanitised_env
 from .custody import network_git_binding
 from .schema import DECISION_TYPES, THREAD_ID_RE, validate_envelope
 
@@ -202,15 +202,36 @@ class GitMessageStore:
         command = ["git", "--no-replace-objects", *HARDENED_GIT_CONFIG,
                    *network_options, *args]
         try:
-            proc = subprocess.run(
-                command,
-                cwd=self.workdir,
-                capture_output=True,
-                text=True,
-                timeout=GIT_TIMEOUT_SECONDS,
-                input=input,
-                env={**self._clean_env(), **network_env},
-            )
+            if args and args[0] == "ls-remote":
+                # Recovery sees untrusted advertisements *before* quarantine.
+                # Reuse the transport's streaming cap; never parse a truncated
+                # prefix as an empty or exact authoritative-ref observation.
+                from .remote_sync import MAX_GIT_OUTPUT_BYTES
+                result = run_bounded(
+                    command, cwd=self.workdir, timeout=GIT_TIMEOUT_SECONDS,
+                    input=None if input is None else input.encode("utf-8"),
+                    env={**self._clean_env(), **network_env},
+                    max_output_bytes=MAX_GIT_OUTPUT_BYTES,
+                )
+                if result.timed_out:
+                    raise subprocess.TimeoutExpired(command, GIT_TIMEOUT_SECONDS)
+                if result.output_limited:
+                    raise AgentRoomError("git ls-remote output bound exceeded")
+                proc = subprocess.CompletedProcess(
+                    command, result.returncode,
+                    result.stdout.decode("utf-8", "replace"),
+                    result.stderr.decode("utf-8", "replace"),
+                )
+            else:
+                proc = subprocess.run(
+                    command,
+                    cwd=self.workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                    input=input,
+                    env={**self._clean_env(), **network_env},
+                )
         except subprocess.TimeoutExpired as exc:
             raise GitTimeout(
                 f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s "
