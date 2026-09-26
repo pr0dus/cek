@@ -1,10 +1,9 @@
 """Authenticated wake markers for results produced by the narrow control worker.
 
-The control repository is untrusted.  A control-result wake is emitted only
-after the service-owned immutable copy of a result is byte-identical to the
-verified remote result.  The wake then points at a signed openai-research
-observation in the authoritative Agent Room; Git metadata remains only a
-doorbell.
+The control repository is untrusted. A wake is emitted only when the remote
+result bytes match the immutable digest recorded in the service-owned
+processed ledger. GitHub metadata remains only a doorbell; the authoritative
+wake target is a signed openai-research observation in Agent Room.
 """
 import hashlib
 import json
@@ -20,7 +19,7 @@ from .doorbell_protocol import from_control_result, require
 from .errors import AgentRoomError
 from .gitstore import GitMessageStore
 from .ids import is_uuid7
-from .remote_sync import CANDIDATE_SUFFIX, ControlRemote
+from .remote_sync import Anchor, CANDIDATE_SUFFIX, ControlRemote
 from .room import AgentRoom
 from .trust import TrustPolicy
 from .transport_state import private_directory
@@ -36,7 +35,7 @@ def _root(state_dir):
     return Path(state_dir) / ROOT_NAME
 
 
-def _read_at(root, subdir, name, *, limit=MAX_RESULT_BYTES):
+def _read_at(root, subdir, name, *, limit=4096):
     with private_directory(Path(root) / subdir) as directory:
         try:
             fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -55,7 +54,7 @@ def _write_once(root, subdir, name, raw):
             fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
                          os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         except FileExistsError:
-            existing = _read_at(root, subdir, name, limit=max(len(raw), MAX_RESULT_BYTES))
+            existing = _read_at(root, subdir, name, limit=max(len(raw), 4096))
             require(existing == raw, 'immutable control result state conflict')
             return
         with os.fdopen(fd, 'wb') as handle:
@@ -65,42 +64,8 @@ def _write_once(root, subdir, name, raw):
         os.fsync(directory)
 
 
-def _validate_result(result):
-    require(isinstance(result, dict), 'control result object')
-    require(is_uuid7(result.get('request_id')), 'control result request id')
-    require(result.get('status') in ('ok', 'refused', 'failed'), 'control result status')
-    require(isinstance(result.get('operation'), str)
-            and 1 <= len(result['operation']) <= 64, 'control result operation')
-    require(isinstance(result.get('completed_at'), str), 'control result timestamp')
-    require(isinstance(result.get('detail'), dict), 'control result detail')
-    raw = canonical.canonical_bytes(result)
-    require(len(raw) <= MAX_RESULT_BYTES, 'control result size')
-    return raw
-
-
-def record_produced(state_dir, result):
-    """Persist the exact service-produced bytes before the untrusted repo sees them."""
-    raw = _validate_result(result)
-    request_id = result['request_id']
-    _write_once(_root(state_dir), 'produced', request_id + '.json', raw)
-
-
-def _produced_ids(state_dir):
-    root = _root(state_dir)
-    with private_directory(root / 'produced') as directory:
-        names = sorted(os.listdir(directory))
-    require(len(names) <= MAX_RECORDS, 'control result history bound')
-    out = []
-    for name in names:
-        require(name.endswith('.json') and is_uuid7(name[:-5]),
-                'unexpected control result state file')
-        out.append(name[:-5])
-    return out
-
-
 def _is_delivered(state_dir, request_id):
-    return _read_at(_root(state_dir), 'delivered', request_id + '.json',
-                    limit=4096) is not None
+    return _read_at(_root(state_dir), 'delivered', request_id + '.json') is not None
 
 
 def _remote_results(config):
@@ -144,35 +109,51 @@ def _marker_report(config, result, result_sha256):
 
 
 def drain(config, doorbell_config, *, limit=MAX_PER_PASS):
-    """Emit wakes for remotely delivered service results not yet acknowledged."""
+    """Emit wakes for completed requests whose exact results are remote-visible."""
     require(config.control_remote is not None and config.room_remote is not None,
             'control result wake requires production remotes')
     doorbell_config = configuration(doorbell_config)
+    ledger = Anchor(Path(config.state_dir) / 'processed.json',
+                    'processed-ledger').document
+    completed = ledger.get('requests', {})
+    require(len(completed) <= MAX_RECORDS, 'control result history bound')
+    candidates = [
+        request_id for request_id, record in completed.items()
+        if record.get('result_sha256') is not None
+        and not _is_delivered(config.state_dir, request_id)
+    ]
+    if not candidates:
+        return []
+
     probe, history = _remote_results(config)
     transport = GitCommitPR(doorbell_config, 'openai-research',
                             Path(config.state_dir) / 'control-doorbell')
     results = []
-    for request_id in [r for r in _produced_ids(config.state_dir)
-                       if not _is_delivered(config.state_dir, r)][:limit]:
-        expected = _read_at(_root(config.state_dir), 'produced',
-                            request_id + '.json')
+    for request_id in sorted(candidates)[:limit]:
+        require(is_uuid7(request_id), 'control result request id')
         path = f"{RESULTS_DIR}/{request_id}.json"
         commit = history.get(path)
         if commit is None:
             continue
-        actual = probe._blob(path, commit)
-        require(actual == expected,
-                'remote control result differs from service-produced bytes')
-        result = canonical.strict_loads(expected)
-        raw = _validate_result(result)
+        raw = probe._blob(path, commit)
+        require(len(raw) <= MAX_RESULT_BYTES, 'remote control result too large')
         result_sha256 = hashlib.sha256(raw).hexdigest()
+        record = completed[request_id]
+        require(result_sha256 == record['result_sha256'],
+                'remote control result differs from service-produced digest')
+        result = canonical.strict_loads(raw)
+        require(result.get('request_id') == request_id
+                and result.get('status') == record['status']
+                and result.get('operation') == record['operation']
+                and result.get('completed_at') == record['at'],
+                'remote result/completion binding mismatch')
         store, report = _marker_report(config, result, result_sha256)
         event = from_control_result(store.room_id(), report)
         transport.check_target()
         receipt = transport.post(event)
         require(isinstance(receipt, str) and len(receipt) in (40, 64),
                 'control result doorbell delivery unresolved')
-        record = canonical.canonical_bytes({
+        delivered = canonical.canonical_bytes({
             'request_id': request_id,
             'result_sha256': result_sha256,
             'report_id': report['message_id'],
@@ -180,7 +161,7 @@ def drain(config, doorbell_config, *, limit=MAX_PER_PASS):
             'commit_oid': receipt,
         })
         _write_once(_root(config.state_dir), 'delivered',
-                    request_id + '.json', record)
+                    request_id + '.json', delivered)
         results.append({'request_id': request_id,
                         'event_id': event['event_id'],
                         'commit_oid': receipt})
@@ -201,7 +182,9 @@ def _production(action):
     custody.root_file(DEFAULT_DOORBELL_CONFIG)
     config = TransportConfig.load(DEFAULT_TRANSPORT_CONFIG)
     custody.check_transport(config, item)
-    doorbell = canonical.strict_loads(Path(DEFAULT_DOORBELL_CONFIG).read_text())
+    doorbell = canonical.strict_loads(
+        Path(DEFAULT_DOORBELL_CONFIG).read_text(encoding='utf-8'))
+    configuration(doorbell)
     custody.install_environment('openai-research', item)
     return enroll(config, doorbell) if action == 'enroll' else drain(config, doorbell)
 
@@ -215,8 +198,8 @@ def main(argv=None):
         return 2
     try:
         print(json.dumps(_production(args[0]), sort_keys=True))
-    except (AgentRoomError, OSError, ValueError) as exc:
-        print(f'{type(exc).__name__}: control result wake refused', file=sys.stderr)
+    except (AgentRoomError, OSError, ValueError):
+        print('control result wake refused', file=sys.stderr)
         return 1
     return 0
 
