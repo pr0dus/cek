@@ -8,9 +8,12 @@ from .protected_state import digest, oid, timestamp
 
 PREFIX = 'agent-room-terminal-v1/'
 ROLES = ('claude-code', 'codex')
-KINDS = ('end_report', 'task_complete', 'implementation_complete',
-         'verification_complete', 'blocked', 'unexpected_finding',
-         'disagreement', 'human_required')
+EVENT_ROLES = ROLES + ('openai-research',)
+TERMINAL_KINDS = ('end_report', 'task_complete', 'implementation_complete',
+                  'verification_complete', 'blocked', 'unexpected_finding',
+                  'disagreement', 'human_required')
+KINDS = TERMINAL_KINDS + ('control_result',)
+CONTROL_RESULT_FORMAT = 'agent-room-control-result-v1'
 FIELDS = {'protocol', 'schema_version', 'event_id', 'room_id', 'report_id',
           'role', 'event_kind', 'timestamp', 'envelope_sha256'}
 MAX_EVENT_BYTES = 1024
@@ -35,7 +38,7 @@ def terminal_kind(message):
     if not isinstance(fmt, str) or not fmt.startswith(PREFIX):
         return None
     kind = fmt[len(PREFIX):]
-    require(kind in KINDS, 'unknown terminal marker')
+    require(kind in TERMINAL_KINDS, 'unknown terminal marker')
     return kind
 
 
@@ -50,7 +53,7 @@ def validate_event(event):
     require(type(event['schema_version']) is int and event['schema_version'] == 1,
             'doorbell version')
     require(oid(event['room_id']) and is_uuid7(event['report_id']), 'doorbell identity')
-    require(event['role'] in ROLES and event['event_kind'] in KINDS, 'doorbell role/kind')
+    require(event['role'] in EVENT_ROLES and event['event_kind'] in KINDS, 'doorbell role/kind')
     require(digest(event['envelope_sha256']), 'doorbell digest')
     timestamp(event['timestamp'])
     require(event['event_id'] == event_identity(event['room_id'], event['report_id'],
@@ -75,6 +78,35 @@ def from_report(room_id, report):
     return validate_event(event)
 
 
+def from_control_result(room_id, report):
+    """Bind a wake to one authenticated service-produced control result marker."""
+    require(isinstance(report, dict) and report.get('type') == 'observation',
+            'control result report type')
+    require(report.get('sender') == {'agent': 'openai-research'},
+            'control result signer role')
+    require(report.get('recipient') == {'agent': 'openai-research'},
+            'control result recipient')
+    body = report.get('body')
+    require(isinstance(body, dict) and set(body) == {
+        'format', 'request_id', 'result_sha256', 'status', 'operation'
+    }, 'control result body fields')
+    require(body['format'] == CONTROL_RESULT_FORMAT, 'control result format')
+    require(is_uuid7(body['request_id']) and report.get('message_id') == body['request_id'],
+            'control result request binding')
+    require(digest(body['result_sha256']), 'control result digest')
+    require(body['status'] in ('ok', 'refused', 'failed'), 'control result status')
+    require(isinstance(body['operation'], str) and 1 <= len(body['operation']) <= 64,
+            'control result operation')
+    event = dict(protocol='agent-room-doorbell', schema_version=1,
+                 room_id=room_id, report_id=report['message_id'],
+                 role='openai-research', event_kind='control_result',
+                 timestamp=report['timestamp'],
+                 envelope_sha256=report[canonical.DIGEST_FIELD])
+    event['event_id'] = event_identity(room_id, event['report_id'],
+                                       event['envelope_sha256'])
+    return validate_event(event)
+
+
 def encode(event):
     return canonical.canonical_text(validate_event(event))
 
@@ -96,7 +128,10 @@ def verify_notice(raw, store, checkpoint):
     tip = store.current_tip()
     require(store.room_id() == event['room_id'], 'wrong room')
     report = store.resolve_message(event['report_id'])
-    require(report is not None and from_report(store.room_id(), report) == event,
+    expected = (from_control_result(store.room_id(), report)
+                if report is not None and event['event_kind'] == 'control_result'
+                else from_report(store.room_id(), report) if report is not None else None)
+    require(report is not None and expected == event,
             'missing or mismatched authoritative report')
     require(store.current_tip() == tip, 'room changed during report verification')
     return report
