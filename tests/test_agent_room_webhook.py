@@ -58,3 +58,10 @@ def test_wake_runner_coalesces_when_pending(monkeypatch):
     runner.queue = queue.Queue(maxsize=1)
     assert runner.wake() == "accepted"
     assert runner.wake() == "coalesced"
+
+
+def test_accepts_signed_ping_without_control_wake():
+    raw = json.dumps({"repository": {"full_name": wh.EXPECTED_REPOSITORY}},
+                     separators=(",", ":")).encode()
+    doc = wh.validate_ping(headers(raw, event="ping"), raw, SECRET)
+    assert doc["repository"]["full_name"] == wh.EXPECTED_REPOSITORY
