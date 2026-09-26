@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 
 from .doorbell import configuration, MAX_RECORDS
-from .doorbell_protocol import DoorbellError, ROLES, decode, encode, require
+from .doorbell_protocol import DoorbellError, EVENT_ROLES, decode, encode, require
 from .errors import AgentRoomError
 from .git_ingestion import command, fetch_verified, storage
 from .protected_state import oid
@@ -30,7 +30,7 @@ class GitCommitPR:
 
     def __init__(self, config, role, state_dir):
         self.config = configuration(config)
-        require(self.config.get('transport') == 'pr-commit' and role in ROLES,
+        require(self.config.get('transport') == 'pr-commit' and role in EVENT_ROLES,
                 'commit doorbell configuration/role')
         self.role = role
         self.root = Path(state_dir)
