@@ -9,10 +9,10 @@ from .protected_state import digest, oid, timestamp
 PREFIX = 'agent-room-terminal-v1/'
 ROLES = ('claude-code', 'codex')
 EVENT_ROLES = ROLES + ('openai-research',)
-TERMINAL_KINDS = ('end_report', 'task_complete', 'implementation_complete',
-                  'verification_complete', 'blocked', 'unexpected_finding',
-                  'disagreement', 'human_required')
-KINDS = TERMINAL_KINDS + ('control_result',)
+KINDS = ('end_report', 'task_complete', 'implementation_complete',
+         'verification_complete', 'blocked', 'unexpected_finding',
+         'disagreement', 'human_required')
+EVENT_KINDS = KINDS + ('control_result',)
 CONTROL_RESULT_FORMAT = 'agent-room-control-result-v1'
 FIELDS = {'protocol', 'schema_version', 'event_id', 'room_id', 'report_id',
           'role', 'event_kind', 'timestamp', 'envelope_sha256'}
@@ -38,7 +38,7 @@ def terminal_kind(message):
     if not isinstance(fmt, str) or not fmt.startswith(PREFIX):
         return None
     kind = fmt[len(PREFIX):]
-    require(kind in TERMINAL_KINDS, 'unknown terminal marker')
+    require(kind in KINDS, 'unknown terminal marker')
     return kind
 
 
@@ -53,7 +53,7 @@ def validate_event(event):
     require(type(event['schema_version']) is int and event['schema_version'] == 1,
             'doorbell version')
     require(oid(event['room_id']) and is_uuid7(event['report_id']), 'doorbell identity')
-    require(event['role'] in EVENT_ROLES and event['event_kind'] in KINDS, 'doorbell role/kind')
+    require(event['role'] in EVENT_ROLES and event['event_kind'] in EVENT_KINDS, 'doorbell role/kind')
     require(digest(event['envelope_sha256']), 'doorbell digest')
     timestamp(event['timestamp'])
     require(event['event_id'] == event_identity(event['room_id'], event['report_id'],
