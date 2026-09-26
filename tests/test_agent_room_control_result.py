@@ -23,17 +23,19 @@ def _result(request_id=None):
     }
 
 
-def test_service_result_copy_is_write_once(tmp_path):
-    state = tmp_path / "state"
-    state.mkdir(mode=0o700)
-    result = _result()
-    cr.record_produced(state, result)
-    cr.record_produced(state, result)
-    changed = dict(result)
-    changed["status"] = "failed"
+def test_completed_record_binds_exact_result_digest():
+    from agent_room import protected_state
+    entry = {
+        "operation": "status",
+        "status": "ok",
+        "at": "2026-09-26T07:00:00Z",
+        "room_tip": "b" * 40,
+        "result_sha256": "c" * 64,
+    }
+    protected_state.completed(entry)
+    entry["result_sha256"] = "not-a-digest"
     with pytest.raises(AgentRoomError):
-        cr.record_produced(state, changed)
-
+        protected_state.completed(entry)
 
 def test_control_result_wake_is_bound_to_signed_report_identity():
     request_id = uuid7()
