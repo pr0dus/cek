@@ -1,0 +1,85 @@
+{
+  "schema": "agent-room-work-trust-v1",
+  "room_id": "919cf25a70267065a83e085381702242f6c554fd",
+  "generation": 1,
+  "canonical_json": "UTF-8 JSON, object keys sorted lexicographically, separators ',' and ':', ensure_ascii=false, no NaN/Infinity, no insignificant whitespace",
+  "envelope_digest": "SHA256(canonical_json(envelope with only envelope_sha256 removed))",
+  "signature_payload": {
+    "domain": "agent-room.v1.envelope",
+    "formula": "canonical_json({domain:'agent-room.v1.envelope',auth:auth-with-signature-removed,envelope:envelope-with-auth-and-envelope_sha256-removed})",
+    "auth_schema_version": 2,
+    "method": "ed25519"
+  },
+  "keys": {
+    "claude-code-1": {
+      "role": "claude-code",
+      "spki_der_b64": "MCowBQYDK2VwAyEAnhrpXCZoioQIR+czsfO/Ednp2G+zs0qrCss3z3ntSFo="
+    },
+    "codex-1": {
+      "role": "codex",
+      "spki_der_b64": "MCowBQYDK2VwAyEAn/R4oe82th09Mf1BBFz58BgZnN6k9dSoN/ze44n/cSA="
+    },
+    "openai-research-1": {
+      "role": "openai-research",
+      "spki_der_b64": "MCowBQYDK2VwAyEAnus8XVHOdkJ3G0vobM7mrovyl6KcWXpay9LWHxTVt6M="
+    },
+    "coordinator-1": {
+      "role": "coordinator",
+      "spki_der_b64": "MCowBQYDK2VwAyEAyZtquOaQ4OEVDRcBX4agRLM4da/1bL9UHcIL/sw0e4A="
+    },
+    "release-recorder-1": {
+      "role": "release-recorder",
+      "spki_der_b64": "MCowBQYDK2VwAyEApIpfQXk/5ljhjMSXk5bbQ9/0R0++3OvoQgAnRb1vSX0="
+    }
+  },
+  "control_result": {
+    "marker_path": "branch agent-room: .agent-room/messages/control-result-<request_id>/<request_id>.json",
+    "result_path": "branch agent-room-control: .agent-room-control/results/<request_id>.json",
+    "required_marker": {
+      "type": "observation",
+      "sender_agent": "openai-research",
+      "recipient_agent": "openai-research",
+      "body_format": "agent-room-control-result-v1"
+    },
+    "verify": [
+      "marker message_id == request_id == wake.report_id",
+      "marker envelope_sha256 == wake.envelope_sha256",
+      "marker auth room_id == fixed room_id, signer=openai-research, key_id=openai-research-1, method=ed25519, auth_schema_version=2, domain=agent-room.v1.envelope",
+      "verify marker envelope digest and Ed25519 signature",
+      "SHA256(exact UTF-8 bytes of result file) == marker.body.result_sha256",
+      "result.status == marker.body.status and result.operation == marker.body.operation"
+    ],
+    "recursion_rule": "NEVER issue supervisor_export for role=openai-research or event_kind=control_result. Verify control_result directly using this config."
+  },
+  "coding_terminal": {
+    "allowed_roles": [
+      "claude-code",
+      "codex"
+    ],
+    "allowed_event_kinds": [
+      "end_report",
+      "task_complete",
+      "implementation_complete",
+      "verification_complete",
+      "blocked",
+      "unexpected_finding",
+      "disagreement",
+      "human_required"
+    ],
+    "rule": "An untrusted coding wake may trigger one bounded supervisor_export for wake.report_id. When its control_result arrives, verify that result directly; verify every signed envelope relied on in result.detail.packet with the pinned key matching auth.key_id/role before reasoning."
+  },
+  "control_request": {
+    "fields": [
+      "control_schema_version",
+      "created_at",
+      "operation",
+      "params",
+      "request_id"
+    ],
+    "version": 1,
+    "created_at": "exact YYYY-MM-DDTHH:MM:SSZ whole-second UTC; no fractional seconds or offsets",
+    "request_id": "canonical lowercase UUIDv7",
+    "export_params": "exactly {'message_id':'<target UUIDv7>'}",
+    "import_params": "exactly {'response':{'packet_schema_version':1,'target_message_id':'<target>','context_sha256':'<exported context>','response':{'type':'<allowed reviewer type>','body':<object>}}}"
+  }
+}
