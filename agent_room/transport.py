@@ -1002,6 +1002,12 @@ class TransportWorker:
             "room_tip": store_tip,
             "detail": detail,
         }
+        if self.config.control_remote is not None:
+            # Immutable service-owned bytes used later to authenticate the
+            # metadata-only result wake. The untrusted control branch cannot
+            # choose what the supervisor role signs.
+            from .control_result import record_produced
+            record_produced(self.config.state_dir, result)
         ledger = self._ledger()
         requests = dict(ledger.document["requests"])
         requests[request_id] = {"operation": operation, "status": status,
