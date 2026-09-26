@@ -1,4 +1,11 @@
-# Supervisor doorbell v1 — inactive integration candidate
+# Supervisor doorbell v1 — dormant PR-comment fallback
+
+The reviewed PR-comment design below is preserved as the dormant fallback.
+The preferred, still inactive transport is now documented in
+[AGENT_ROOM_DOORBELL_GIT.md](AGENT_ROOM_DOORBELL_GIT.md). The metadata schema,
+terminal routing, report signing, supervisor verification and authority rules
+below are shared unchanged. API credentials and comment triggers described
+below apply **only** when explicitly switching to this fallback.
 
 This additive successor is based on accepted S4 commit
 `5c52443760b0d74449ad2c041d7e8bdf86802df3`. It does not change/install that

@@ -1,8 +1,8 @@
-"""Bounded PR notification delivery. Never publishes report text or retries POST.
+"""Verified-report wake orchestration and the dormant PR-comment adapter.
 
-GitHub comment creation has no idempotency key. Persist an uncertain intent
-before POST and reconcile only by GET after any ambiguous result/crash. This
-chooses an explicit stuck notification over a duplicate-producing retry loop.
+Report selection, signing and verification are independent of WakeTransport.
+The reviewed comment adapter never retries an ambiguous POST; the Git adapter
+may retry only through its immutable-artifact/exact-lease reconciliation.
 """
 import http.client
 import json
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+from typing import Protocol
 
 from . import canonical
 from .errors import AgentRoomError
@@ -24,18 +25,45 @@ MAX_LEDGER_BYTES = 3 * 1024 * 1024
 
 
 def configuration(value):
-    require(isinstance(value, dict) and set(value) == {
-        'repository', 'pull_number', 'pull_node_id', 'actor_ids'}, 'doorbell config fields')
+    commit = isinstance(value, dict) and value.get('transport') == 'pr-commit'
+    fields = {'repository', 'pull_number', 'pull_node_id'}
+    fields |= {'transport', 'branch', 'bootstrap_tip'} if commit else {'actor_ids'}
+    require(isinstance(value, dict) and set(value) == fields, 'doorbell config fields')
     require(isinstance(value['repository'], str) and re.fullmatch(
         r'[A-Za-z0-9-]+/[A-Za-z0-9_.-]+', value['repository']) is not None,
         'doorbell repository')
     require(type(value['pull_number']) is int and value['pull_number'] > 0, 'doorbell PR')
     require(isinstance(value['pull_node_id'], str) and re.fullmatch(
         r'[A-Za-z0-9_=-]{1,128}', value['pull_node_id']) is not None, 'doorbell PR node')
+    if commit:
+        from .protected_state import oid
+        require(value['branch'] == 'supervisor-doorbell-v1', 'fixed doorbell branch required')
+        require(oid(value['bootstrap_tip']), 'doorbell bootstrap tip')
+        return json.loads(canonical.canonical_text(value))
     require(isinstance(value['actor_ids'], dict) and set(value['actor_ids']) == set(ROLES),
             'doorbell actors')
     require(all(type(v) is int and v > 0 for v in value['actor_ids'].values()), 'doorbell actor IDs')
     return json.loads(canonical.canonical_text(value))
+
+
+def receipt_field(config):
+    return 'commit_oid' if config.get('transport') == 'pr-commit' else 'comment_id'
+
+
+def valid_receipt(config, value):
+    from .protected_state import oid
+    return oid(value) if receipt_field(config) == 'commit_oid' else type(value) is int and value > 0
+
+
+class WakeTransport(Protocol):
+    """Metadata-only adapter. Opaque receipt, or unresolved; never invokes a model.
+
+    post attempts initial delivery; find reconciles an uncertain intent. Only a
+    transport with immutable remote identity may safely retry during find.
+    """
+    def check_target(self) -> None: ...
+    def post(self, event): ...
+    def find(self, event): ...
 
 
 class GitHubPR:
@@ -158,15 +186,15 @@ class DeliveryLedger:
                 and canonical.canonical_bytes(doc['identity']) == canonical.canonical_bytes(self.identity),
                 'ledger identity/version')
         require(isinstance(doc['events'], dict) and len(doc['events']) <= MAX_RECORDS, 'ledger bounds')
+        field = receipt_field(self.identity['config'])
         for key, entry in doc['events'].items():
-            require(isinstance(entry, dict) and set(entry) == {'event', 'state', 'comment_id'}, 'ledger entry')
+            require(isinstance(entry, dict) and set(entry) == {'event', 'state', field}, 'ledger entry')
             event = decode(encode(entry['event']))
             require(key == event['event_id'] and event['role'] == self.identity['role']
                     and event['room_id'] == self.identity['room_id'], 'ledger event identity')
             require(entry['state'] in ('uncertain', 'delivered'), 'ledger delivery state')
-            require((entry['state'] == 'uncertain' and entry['comment_id'] is None)
-                    or (entry['state'] == 'delivered' and type(entry['comment_id']) is int
-                        and entry['comment_id'] > 0), 'ledger receipt')
+            require((entry['state'] == 'uncertain' and entry[field] is None)
+                    or (entry['state'] == 'delivered' and valid_receipt(self.identity['config'], entry[field])), 'ledger receipt')
 
     def save(self, doc):
         # Caller holds WORKER_LOCK across read/verify/network/write.
@@ -193,9 +221,9 @@ class DeliveryLedger:
 
 
 class Doorbell:
-    def __init__(self, store, checkpoint, state_dir, config, role, github):
+    def __init__(self, store, checkpoint, state_dir, config, role, github: WakeTransport):
         require(store.trust is not None and role in ROLES, 'authenticated coding role required')
-        self.store, self.checkpoint, self.role, self.github = store, checkpoint, role, github
+        self.store, self.checkpoint, self.role, self.transport = store, checkpoint, role, github
         self.config = configuration(config)
         self.ledger = DeliveryLedger(state_dir, dict(room_id=store.room_id(), role=role, config=self.config))
 
@@ -222,32 +250,33 @@ class Doorbell:
             eligible = [e for e in events if doc['events'].get(e['event_id'], {}).get('state') != 'delivered']
             if not eligible:
                 return {'status': 'idle', 'events': []}
-            self.github.check_target()
+            self.transport.check_target()
             results = []
+            field = receipt_field(self.config)
             for event in eligible[:MAX_EVENTS_PER_PASS]:
                 key = event['event_id']
                 old = doc['events'].get(key)
                 if old is not None:
                     require(old['event'] == event, 'changed event binding')
                     try:
-                        cid = self.github.find(event)
+                        cid = self.transport.find(event)
                     except DoorbellError:
                         cid = None
                 else:
                     require(len(doc['events']) < MAX_RECORDS, 'doorbell history bound; explicit maintenance')
-                    # Durable intent MUST precede the single potentially ambiguous POST.
-                    doc['events'][key] = dict(event=event, state='uncertain', comment_id=None)
+                    # Durable intent precedes any potentially ambiguous transport write.
+                    doc['events'][key] = dict(event=event, state='uncertain', **{field: None})
                     self.ledger.save(doc)
                     try:
-                        cid = self.github.post(event)
+                        cid = self.transport.post(event)
                     except DoorbellError:
                         cid = None
                 if cid is None:
                     results.append({'event_id': key, 'state': 'uncertain'})
                     break
-                require(type(cid) is int and cid > 0, 'invalid delivery receipt')
-                doc['events'][key].update(state='delivered', comment_id=cid)
+                require(valid_receipt(self.config, cid), 'invalid delivery receipt')
+                doc['events'][key].update(state='delivered', **{field: cid})
                 self.ledger.save(doc)
-                results.append({'event_id': key, 'state': 'delivered', 'comment_id': cid})
+                results.append({'event_id': key, 'state': 'delivered', field: cid})
             return {'status': 'uncertain' if results[-1]['state'] == 'uncertain' else 'delivered',
                     'events': results, 'remaining': len(eligible) - len(results)}

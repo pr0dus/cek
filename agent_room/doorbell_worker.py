@@ -26,6 +26,18 @@ def prepare(role):
     worker_config = custody.root_json(f'/etc/agent-room/{role}.json')
     custody.install_environment(role, item)
     room = role_worker.room_for(role, item, worker_config)
+    state = Path(item['state']) / 'doorbell'
+    if config.get('transport') == 'pr-commit':
+        from .doorbell_git import GitCommitPR
+        adapter = GitCommitPR(config, role, state)
+    else:
+        adapter = comment_adapter(config, role, item)
+    checkpoint = TrustCheckpoint.load(item['checkpoint'])
+    return Doorbell(room.store, checkpoint, state, config, role, adapter)
+
+
+def comment_adapter(config, role, item):
+    """Reviewed dormant fallback; selected only by explicit comment config."""
     credential = Path(item['state_root']) / 'keys' / 'doorbell.token'
     custody.private_path(credential, os.geteuid())
     fd = os.open(credential, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -37,9 +49,7 @@ def prepare(role):
         token = data.decode('ascii').removesuffix('\n')
     except UnicodeError:
         raise DoorbellError('doorbell credential encoding') from None
-    checkpoint = TrustCheckpoint.load(item['checkpoint'])
-    return Doorbell(room.store, checkpoint, Path(item['state']) / 'doorbell', config, role,
-                    GitHubPR(config, role, token))
+    return GitHubPR(config, role, token)
 
 
 def run(role, mode='turn'):
@@ -47,6 +57,11 @@ def run(role, mode='turn'):
     doorbell = prepare(role)
     if mode == 'enroll':
         doorbell.checkpoint.verify_candidate(doorbell.store)
+        if doorbell.config.get('transport') == 'pr-commit':
+            from .transport_state import private_lock, WORKER_LOCK
+            with private_lock(doorbell.ledger.root, WORKER_LOCK):
+                require(not (doorbell.ledger.root / 'ledger.json').exists(), 'ledger already enrolled')
+                doorbell.transport.enroll()
         doorbell.ledger.initialise()
         return {'status': 'enrolled', 'model_invoked': False}
     # Missing/corrupt notification state fails BEFORE invoking a participant.
