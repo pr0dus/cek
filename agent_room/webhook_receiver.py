@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import queue
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -17,6 +18,8 @@ from pathlib import Path
 from . import canonical, custody
 from .transport import TransportConfig, TransportWorker
 from .transport_worker import DEFAULT_CONFIG
+from .control_result import DEFAULT_DOORBELL_CONFIG, drain as drain_control_results
+from .doorbell import configuration as doorbell_configuration
 from .errors import AgentRoomError
 
 LISTEN_HOST = "192.168.2.47"
@@ -55,10 +58,9 @@ def verify_signature(signature: str | None, body: bytes, secret: bytes) -> None:
     _require(hmac.compare_digest(supplied, expected), "webhook signature mismatch")
 
 
-def validate_delivery(headers, body: bytes, secret: bytes) -> dict:
+def _signed_document(headers, body: bytes, secret: bytes) -> dict:
     _require(isinstance(body, (bytes, bytearray)), "webhook body type")
     _require(len(body) <= MAX_BODY_BYTES, "webhook body too large")
-    _require(headers.get("X-GitHub-Event") == "push", "wrong GitHub event")
     verify_signature(headers.get("X-Hub-Signature-256"), bytes(body), secret)
     try:
         document = canonical.strict_loads(bytes(body).decode("utf-8"))
@@ -69,20 +71,35 @@ def validate_delivery(headers, body: bytes, secret: bytes) -> dict:
     _require(isinstance(repository, dict)
              and repository.get("full_name") == EXPECTED_REPOSITORY,
              "wrong webhook repository")
+    return document
+
+
+def validate_delivery(headers, body: bytes, secret: bytes) -> dict:
+    _require(headers.get("X-GitHub-Event") == "push", "wrong GitHub event")
+    document = _signed_document(headers, body, secret)
     _require(document.get("ref") == EXPECTED_REF, "wrong webhook ref")
     return document
+
+
+def validate_ping(headers, body: bytes, secret: bytes) -> dict:
+    _require(headers.get("X-GitHub-Event") == "ping", "wrong GitHub event")
+    return _signed_document(headers, body, secret)
 
 
 class WakeRunner:
     """Coalesce concurrent pushes while guaranteeing a later reconciliation pass."""
 
-    def __init__(self, config: TransportConfig):
+    def __init__(self, config: TransportConfig, doorbell_config: dict):
         self.config = config
+        self.doorbell_config = doorbell_configuration(doorbell_config)
         self.queue = queue.Queue(maxsize=1)
         self.thread = threading.Thread(target=self._loop,
                                        name="agent-room-control-wake",
                                        daemon=True)
         self.thread.start()
+        # One reconciliation pass at service start closes the only crash
+        # window after an HTTP 202: the durable control branch is the queue.
+        self.wake()
 
     def wake(self) -> str:
         try:
@@ -96,15 +113,25 @@ class WakeRunner:
             self.queue.get()
             try:
                 summary = TransportWorker(self.config).run()
+                status = summary.get("lifecycle", {}).get("status")
+                if status != "ok":
+                    raise RuntimeError("narrow transport lifecycle did not settle")
+                wakes = drain_control_results(self.config, self.doorbell_config)
                 print(json.dumps({"event": "control-wake-complete",
-                                  "status": summary.get("lifecycle", {}).get("status"),
+                                  "status": status,
                                   "processed": summary.get("processed"),
-                                  "remaining": summary.get("remaining")},
+                                  "remaining": summary.get("remaining"),
+                                  "result_wakes": len(wakes)},
                                  sort_keys=True), flush=True)
+                if (summary.get("remaining") or 0) > 0:
+                    self.wake()
             except Exception as exc:  # noqa: BLE001 - journal gets type only
                 print(json.dumps({"event": "control-wake-failed",
                                   "error_type": type(exc).__name__},
                                  sort_keys=True), flush=True)
+                # The control branch is durable. A systemd restart performs a
+                # startup reconciliation pass; never silently drop a 202 wake.
+                os._exit(1)
             finally:
                 self.queue.task_done()
 
@@ -146,6 +173,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(400, {"status": "bad_request"})
             return
         try:
+            event = self.headers.get("X-GitHub-Event")
+            if event == "ping":
+                validate_ping(self.headers, body, self.server.secret)
+                self._reply(200, {"status": "pong"})
+                return
             validate_delivery(self.headers, body, self.server.secret)
         except WebhookRefused:
             self._reply(403, {"status": "refused"})
@@ -168,9 +200,13 @@ def main() -> int:
     custody.root_file(DEFAULT_CONFIG)
     config = TransportConfig.load(DEFAULT_CONFIG)
     custody.check_transport(config, item)
+    custody.root_file(DEFAULT_DOORBELL_CONFIG)
+    doorbell_config = canonical.strict_loads(
+        Path(DEFAULT_DOORBELL_CONFIG).read_text(encoding="utf-8"))
+    doorbell_configuration(doorbell_config)
     custody.install_environment("openai-research", item)
     secret = load_secret()
-    runner = WakeRunner(config)
+    runner = WakeRunner(config, doorbell_config)
     server = AgentRoomWebhookServer((LISTEN_HOST, LISTEN_PORT), _Handler,
                                     secret=secret, runner=runner)
     print(json.dumps({"event": "agent-room-webhook-listening",
