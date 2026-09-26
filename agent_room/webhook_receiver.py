@@ -17,6 +17,7 @@ from pathlib import Path
 from . import canonical, custody
 from .transport import TransportConfig, TransportWorker
 from .transport_worker import DEFAULT_CONFIG
+from .errors import AgentRoomError
 
 LISTEN_HOST = "192.168.2.47"
 LISTEN_PORT = 8787
@@ -61,7 +62,7 @@ def validate_delivery(headers, body: bytes, secret: bytes) -> dict:
     verify_signature(headers.get("X-Hub-Signature-256"), bytes(body), secret)
     try:
         document = canonical.strict_loads(bytes(body).decode("utf-8"))
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, AgentRoomError) as exc:
         raise WebhookRefused("invalid webhook JSON") from exc
     _require(isinstance(document, dict), "webhook root must be an object")
     repository = document.get("repository")
