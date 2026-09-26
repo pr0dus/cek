@@ -62,6 +62,8 @@ def completed(entry):
     require(entry.get('status') in ('ok', 'refused', 'failed'), 'status')
     timestamp(entry.get('at'))
     require('room_tip' in entry and (entry['room_tip'] is None or oid(entry['room_tip'])), 'room_tip')
+    if 'result_sha256' in entry:
+        require(digest(entry['result_sha256']), 'result_sha256')
 
 
 def pending(entry, request_id):
@@ -117,6 +119,11 @@ def processed_ledger(document):
         require(all(result[a] == record[b] for a, b in (
             ('operation', 'operation'), ('status', 'status'), ('completed_at', 'at'),
             ('room_tip', 'room_tip'))), 'result/completion mismatch')
+        if record.get('result_sha256') is not None:
+            from . import canonical
+            import hashlib
+            require(hashlib.sha256(canonical.canonical_bytes(result)).hexdigest()
+                    == record['result_sha256'], 'result digest mismatch')
 
 
 def release_journal(document):
