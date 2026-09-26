@@ -31,6 +31,7 @@ pretend otherwise: it authenticates the channel's effects, not its author.
 """
 
 import datetime as dt
+import hashlib
 import json
 import re
 import time
@@ -1002,17 +1003,13 @@ class TransportWorker:
             "room_tip": store_tip,
             "detail": detail,
         }
-        if self.config.control_remote is not None:
-            # Immutable service-owned bytes used later to authenticate the
-            # metadata-only result wake. The untrusted control branch cannot
-            # choose what the supervisor role signs.
-            from .control_result import record_produced
-            record_produced(self.config.state_dir, result)
         ledger = self._ledger()
         requests = dict(ledger.document["requests"])
         requests[request_id] = {"operation": operation, "status": status,
                                 "at": result["completed_at"],
-                                "room_tip": store_tip}
+                                "room_tip": store_tip,
+                                "result_sha256": hashlib.sha256(
+                                    canonical.canonical_bytes(result)).hexdigest()}
         pending = dict(ledger.document["pending_results"])
         # `produced`: this service made it and has not proven it reached the
         # remote. It stays here through `materialised`, and leaves only on
