@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Room fixed Claude task wake
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/agent-room/current
+Environment=PYTHONPATH=/opt/agent-room/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -s -m agent_room.task_dispatch claude-code
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1260
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

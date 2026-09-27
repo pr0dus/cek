@@ -1,0 +1,15 @@
+# Root-selected instances: codex and claude only. No request-selected identity.
+[Unit]
+Description=Agent Room owner-authorized home view for %i
+Before=agent-room-%i.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /run/agent-room-home-%i
+ExecStart=/usr/bin/bindfs -f --force-user=agentroom-%i --force-group=agentroom-%i --perms=u+rwX:g-rwx:o-rwx --create-for-user=pr0 --create-for-group=pr0 --chown-deny --chgrp-deny --xattr-ro --multithreaded --enable-lock-forwarding -o nosuid,nodev /home/pr0 /run/agent-room-home-%i
+ExecStartPost=/usr/bin/timeout 10 /bin/sh -c 'until /usr/bin/mountpoint -q /run/agent-room-home-%i; do /usr/bin/sleep 0.1; done'
+ExecStop=/usr/bin/umount /run/agent-room-home-%i
+Restart=no
+NoNewPrivileges=yes

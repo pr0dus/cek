@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Room durable typed-task wake for Claude
+
+[Path]
+PathExists=/var/lib/agent-room/state/task-wake-claude-code
+PathExists=/var/lib/agent-room-claude/state/task-more
+Unit=agent-room-dispatch-claude.service
+
+[Install]
+WantedBy=multi-user.target

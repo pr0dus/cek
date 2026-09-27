@@ -1,5 +1,8 @@
 {
   "key_id": "codex-1",
+  "enabled": false,
+  "owner_home": true,
+  "model": "gpt-6-astra",
   "room_branch": "agent-room",
   "room_remote": "origin"
 }

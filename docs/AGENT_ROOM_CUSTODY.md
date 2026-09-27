@@ -150,3 +150,8 @@ The implementation test suite explicitly skips the actual cross-UID canary:
 **NOT TESTABLE UNTIL DEPLOYMENT**. It never uses sudo/user creation to fake it.
 Current `pr0 → NOPASSWD: ALL` is an unchanged, separate activation blocker.
 Even perfect per-UID permissions do not survive arbitrary root/kernel access.
+# Current owner-home policy
+
+Issue 17 supersedes coding-worker `/home/pr0` denial. See
+`AGENT_ROOM_OWNER_HOME.md` and `AGENT_ROOM_TASK_DISPATCH.md`. Sibling role custody
+outside home remains required; old home-denial evidence remains historical.

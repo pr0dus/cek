@@ -41,9 +41,8 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_SANDBOX = "read-only"
 
 #: The only sandbox policies a participant turn may use. `danger-full-access`
-#: is deliberately absent: an Agent Room turn never needs it, and offering it
-#: at the library boundary would make the safety claim depend on the CLI
-#: parser rather than on the API.
+#: is deliberately absent from ordinary turns. Issue 17's separately explicit
+#: owner_home policy uses external systemd confinement and a fixed working root.
 ALLOWED_SANDBOXES = ("read-only", "workspace-write")
 
 #: Audit marker in `sender.via`, distinguishing an automatic turn from a reply
@@ -172,7 +171,13 @@ class CodexInvoker:
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
         sandbox: str = DEFAULT_SANDBOX,
         tool_profile=tool_profiles.NONE,
+        owner_home: bool = False,
     ) -> None:
+        if type(owner_home) is not bool:
+            raise CodexAdapterError('owner_home must be an explicit boolean')
+        if owner_home and cwd != '/home/pr0':
+            raise CodexAdapterError('owner-home execution has one fixed working root')
+        self.owner_home = owner_home
         if sandbox not in ALLOWED_SANDBOXES:
             raise CodexAdapterError(
                 f"sandbox {sandbox!r} is not permitted for a participant turn; "
@@ -191,13 +196,17 @@ class CodexInvoker:
         resolved = shutil.which(self.executable) or self.executable
         args = [
             resolved, "exec", "-",
-            "--sandbox", self.sandbox,
+            "--sandbox", 'danger-full-access' if self.owner_home else self.sandbox,
             "--skip-git-repo-check",
             "--ephemeral",
             "--output-schema", schema_path,
             "--output-last-message", output_path,
             "--ignore-user-config",
         ]
+        if self.owner_home:
+            # OS namespace is the authority for the owner-authorized home.
+            # workspace-write protects .git/.codex and cannot promise full home.
+            args += ['--ignore-rules', '-c', 'approval_policy="never"']
         if self.model:
             args += ["--model", self.model]
         if self.cwd:

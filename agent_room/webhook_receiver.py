@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -29,6 +31,10 @@ SECRET_PATH = "/etc/agent-room/webhook.secret"
 EXPECTED_REPOSITORY = "pr0dus/agent-room-transport"
 EXPECTED_REF = "refs/heads/agent-room-control"
 MAX_BODY_BYTES = 64 * 1024
+# One request per connection, with a total deadline (not a resettable idle
+# timeout). Even a peer sending one byte just before each timeout is bounded.
+REQUEST_TIMEOUT_SECONDS = 10.0
+MAX_REQUEST_BYTES = MAX_BODY_BYTES + 16 * 1024
 
 
 class WebhookRefused(ValueError):
@@ -136,14 +142,59 @@ class WakeRunner:
                 self.queue.task_done()
 
 
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, connection, deadline):
+        super().__init__()
+        self.connection = connection
+        self.deadline = deadline
+        self.remaining = MAX_REQUEST_BYTES
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining_time = self.deadline - time.monotonic()
+        if remaining_time <= 0:
+            raise TimeoutError('webhook request deadline')
+        if self.remaining <= 0:
+            raise WebhookRefused('webhook request byte limit')
+        self.connection.settimeout(remaining_time)
+        count = self.connection.recv_into(buffer, min(len(buffer), self.remaining))
+        self.remaining -= count
+        return count
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AgentRoomWebhook/1"
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        self.deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+        super().setup()
+        self.rfile.close()
+        self.rfile = io.BufferedReader(_DeadlineReader(self.connection, self.deadline))
+
+    def handle(self):
+        # Deliberately no keep-alive loop. HTTPServer is serial, so the
+        # connection/thread bound is one, with a small fixed accept backlog.
+        try:
+            self.handle_one_request()
+        except (OSError, WebhookRefused):
+            self.close_connection = True
+
+    def handle_expect_100(self):
+        self._reply(417, {'status': 'expectation_failed'})
+        return False
 
     def log_message(self, fmt, *args):  # no payload/header logging
         return
 
     def _reply(self, status: int, document: dict) -> None:
+        self.close_connection = True
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        self.connection.settimeout(remaining)
         body = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -159,12 +210,17 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path != WEBHOOK_PATH:
             self._reply(404, {"status": "not_found"})
             return
-        raw_length = self.headers.get("Content-Length")
-        try:
-            length = int(raw_length)
-        except (TypeError, ValueError):
+        lengths = self.headers.get_all('Content-Length', [])
+        if (self.headers.get_all('Transfer-Encoding')
+                or len(lengths) != 1
+                or not lengths[0].isascii()
+                or not lengths[0].isdigit()
+                or len(lengths[0]) > 6
+                or any(len(self.headers.get_all(name, [])) != 1 for name in
+                       ('X-GitHub-Event', 'X-Hub-Signature-256'))):
             self._reply(400, {"status": "bad_request"})
             return
+        length = int(lengths[0])
         if length < 0 or length > MAX_BODY_BYTES:
             self._reply(413, {"status": "too_large"})
             return
@@ -188,6 +244,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 class AgentRoomWebhookServer(HTTPServer):
     allow_reuse_address = True
+    request_queue_size = 8
 
     def __init__(self, address, handler, *, secret: bytes, runner: WakeRunner):
         self.secret = secret

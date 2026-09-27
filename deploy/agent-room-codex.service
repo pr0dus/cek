@@ -3,6 +3,8 @@
 [Unit]
 Description=Agent Room codex isolated one-shot
 After=network-online.target
+Requires=agent-room-home-view@codex.service
+After=agent-room-home-view@codex.service
 
 [Service]
 Type=oneshot
@@ -10,7 +12,7 @@ User=agentroom-codex
 Group=agentroom-codex
 UMask=0077
 WorkingDirectory=/opt/agent-room/current
-ExecStart=/usr/bin/python3 -s -m agent_room.role_worker codex
+ExecStart=/usr/bin/python3 -s -m agent_room.doorbell_worker codex
 Environment=PYTHONPATH=/opt/agent-room/current
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONNOUSERSITE=1
@@ -20,7 +22,8 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=tmpfs
+BindPaths=/run/agent-room-home-codex:/home/pr0
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateMounts=yes
@@ -37,7 +40,7 @@ TimeoutStopSec=30
 StateDirectory=agent-room-codex
 StateDirectoryMode=0700
 ReadOnlyPaths=/opt/agent-room /etc/agent-room
-InaccessiblePaths=/home/pr0 /var/lib/agent-room-claude /var/lib/agent-room /var/lib/agent-room-coordinator /var/lib/agent-room-release
+InaccessiblePaths=/var/lib/agent-room-claude /var/lib/agent-room /var/lib/agent-room-coordinator /var/lib/agent-room-release
 InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

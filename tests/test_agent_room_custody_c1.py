@@ -204,7 +204,8 @@ def test_templates_match_custody(role):
     for setting in (f'User={item["user"]}', f'Group={item["group"]}',
                     f'StateDirectory={Path(item["state_root"]).name}',
                     'UMask=0077', 'NoNewPrivileges=yes', 'CapabilityBoundingSet=',
-                    'AmbientCapabilities=', 'ProtectSystem=strict', 'ProtectHome=yes',
+                    'AmbientCapabilities=', 'ProtectSystem=strict',
+                    'ProtectHome=tmpfs' if role in ('codex', 'claude-code') else 'ProtectHome=yes',
                     'PrivateTmp=yes', 'PrivateDevices=yes', 'ProtectProc=invisible',
                     'ProcSubset=pid', 'RestrictSUIDSGID=yes', 'LockPersonality=yes',
                     'Delegate=no', 'KillMode=control-group'):
@@ -251,6 +252,9 @@ def test_actual_adapter_wiring_is_after_guard_and_role_local(monkeypatch, role):
     events = []
     item = c.layout(role)
     config = {'key_id': f'{role}-1', 'room_branch': 'agent-room', 'room_remote': 'origin'}
+    config['enabled'] = True
+    config['owner_home'] = True
+    if role == 'codex': config['model'] = 'gpt-6-astra'
     monkeypatch.setattr(c, 'guard', lambda r: events.append(('guard', r)) or item)
     monkeypatch.setattr(c, 'root_json', lambda path: events.append(('config', path)) or config)
     monkeypatch.setattr(c, 'install_environment', lambda r, i: events.append(('environment', r)))
@@ -258,12 +262,17 @@ def test_actual_adapter_wiring_is_after_guard_and_role_local(monkeypatch, role):
     monkeypatch.setattr(role_worker, 'room_for', lambda r, i, cfg: events.append(('room', r)) or 'room')
 
     class Invoker:
-        def __init__(self, executable, *, cwd):
+        def __init__(self, executable, *, cwd, **kwargs):
+            assert kwargs == ({'model': 'gpt-6-astra', 'owner_home': True}
+                              if role == 'codex' else {'owner_home': True})
             events.append(('client', executable, cwd))
 
     class Adapter:
-        def __init__(self, room, invoker): assert room == 'room'
-        def run_turn(self): return {'one_turn': True}
+        def __init__(self, room, invoker, *, turn_timeout):
+            assert room == 'room'
+            assert turn_timeout == 0
+
+    monkeypatch.setattr(role_worker, 'run_verified_turn', lambda adapter, item: {'one_turn': True})
 
     module = claude if role == 'claude-code' else codex
     monkeypatch.setattr(module, 'ClaudeInvoker' if role == 'claude-code' else 'CodexInvoker', Invoker)
@@ -271,12 +280,13 @@ def test_actual_adapter_wiring_is_after_guard_and_role_local(monkeypatch, role):
     assert role_worker.run(role) == {'one_turn': True}
     assert events == [('guard', role), ('config', f'/etc/agent-room/{role}.json'),
                       ('environment', role), ('room', role), ('root_file', item['client']),
-                      ('client', item['client'], item['workspace'])]
+                      ('client', item['client'], '/home/pr0')]
 
 
 @pytest.mark.parametrize('extra', ['role', 'uid', 'signer', 'signing_key', 'workspace', 'command', 'ignore_isolation'])
 def test_role_config_cannot_select_custody(extra):
-    config = {'key_id': 'codex-1', 'room_branch': 'agent-room', 'room_remote': 'origin', extra: 'evil'}
+    config = {'key_id': 'codex-1', 'room_branch': 'agent-room', 'room_remote': 'origin',
+              'enabled': True, 'model': 'gpt-6-astra', extra: 'evil'}
     with pytest.raises(c.CustodyError): role_worker.room_for('codex', c.layout('codex'), config)
 
 

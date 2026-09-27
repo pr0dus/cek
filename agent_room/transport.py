@@ -74,7 +74,7 @@ from .transport_state import private_lock, WORKER_LOCK
 
 #: Every operation an untrusted writer may name. Adding to this list is a
 #: security decision, not a convenience one.
-OPERATIONS = ("supervisor_export", "supervisor_import", "status")
+OPERATIONS = ("supervisor_export", "supervisor_import", "status", "task_submit")
 
 #: Exactly the top-level fields a request may carry. Anything else is refused
 #: rather than ignored: an ignored field is a field somebody is trying.
@@ -249,6 +249,12 @@ def validate_request(document) -> dict:
         _no_params(params, "status")
     elif operation == "supervisor_export":
         _export_params(params)
+    elif operation == 'task_submit':
+        from .tasks import validate
+        try:
+            validate(params)
+        except AgentRoomError as exc:
+            raise TransportRefused(str(exc)) from exc
     else:
         _import_params(params)
     return document
@@ -681,6 +687,60 @@ class TransportWorker:
         return "conflict"
 
     # -- operations --------------------------------------------------------
+    def _op_task_submit(self, store, params):
+        from . import tasks, auth
+        from .ids import uuid7
+        tasks.validate(params)
+        journal = tasks.Journal(Path(self.config.state_dir) / 'tasks')
+        document = journal.load()
+        tasks.require(document['room_id'] == store.room_id(), 'submission room mismatch')
+        key = params['task_id']
+        identity = hashlib.sha256(canonical.canonical_bytes(params)).hexdigest()
+        record = document['records'].get(key)
+        if record is None:
+            tasks.require(len(document['records']) < tasks.MAX_TASKS, 'submission capacity')
+            room = self._boundary(store).room
+            envelope = room.build_envelope(
+                thread_id='task-' + key, type='question',
+                body={'format': tasks.FORMAT, 'text': canonical.canonical_text(params)},
+                recipient={'agent': params['recipient']}, reply_requested=True,
+                sender={'via': 'agent-room-task-submit-v1'}, message_id=uuid7())
+            envelope = canonical.seal(auth.sign_envelope(envelope, room.signer,
+                                                         room_id=store.room_id()))
+            record = {'identity': identity, 'phase': 'output',
+                      'message_id': envelope['message_id'],
+                      'response_id': envelope['message_id'], 'payload': envelope}
+            document['records'][key] = record
+            journal.save(document)
+        tasks.require(record['identity'] == identity, 'task ID reused with different content')
+        existing = store.resolve_message(record['message_id'])
+        if existing is None:
+            store.append(record['payload'])
+        else:
+            tasks.require(existing == record['payload'], 'task artifact mismatch')
+        remote = self._room_remote()
+        if remote is not None:
+            remote.push()
+        self._accept_after_delivery(store)
+        record['phase'] = 'settled'
+        journal.save(document)
+        # A wake hint only; worker independently verifies the signed room.
+        tasks.wake(Path(self.config.state_dir) / ('task-wake-' + params['recipient']))
+        return {'task_id': key, 'message_id': record['message_id'],
+                'envelope_sha256': record['payload'][canonical.DIGEST_FIELD],
+                'status': 'submitted', 'model_invoked': False}
+
+    def reconcile_tasks(self):
+        from .tasks import Journal
+        root = Path(self.config.state_dir) / 'tasks'
+        if not root.exists():
+            return  # explicit deployment enrollment; task_submit still fails closed
+        journal = Journal(root)
+        for entry in journal.load()['records'].values():
+            if entry['phase'] != 'settled':
+                params = canonical.strict_loads(entry['payload']['body']['text'])
+                self._op_task_submit(self._room_store(), params)
+
     def _op_status(self, store: GitMessageStore, _params: dict) -> dict:
         checkpoint = TrustCheckpoint.load(self.config.checkpoint_path)
         return {
@@ -880,6 +940,7 @@ class TransportWorker:
                 "reconciled": reconciled,
                 "delivered": self.deliver_results(),
             }
+            self.reconcile_tasks()
         except AgentRoomError as exc:
             # A synchronisation failure is not a per-request result: it is a
             # statement that nothing about this room's state can be trusted
@@ -959,6 +1020,7 @@ class TransportWorker:
                 "status": self._op_status,
                 "supervisor_export": self._op_supervisor_export,
                 "supervisor_import": self._op_supervisor_import,
+                "task_submit": self._op_task_submit,
             }[operation]
             if operation == "supervisor_import":
                 detail = handler(store, validated["params"], request_id=request_id,
@@ -969,6 +1031,12 @@ class TransportWorker:
         except TransportRefused as exc:
             status, detail = "refused", {"error": _bounded(exc)}
         except AgentRoomError as exc:
+            if operation == 'task_submit':
+                # Submission intent may already be durable or delivered. Keep
+                # the request unprocessed for exact-ID reconciliation; never
+                # label ambiguous delivery as a completed failed request.
+                return {'request_id': request_id, 'operation': operation,
+                        'status': 'uncertain_delivery', 'error': _bounded(exc)}
             if request_id in (self._ledger().document["uncertain_imports"]):
                 return {"request_id": request_id, "operation": operation,
                         "status": "uncertain_delivery", "error": _bounded(exc)}

@@ -68,7 +68,11 @@ class ClaudeInvoker:
         model: str | None = None,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
         tool_profile=tool_profiles.NONE,
+        owner_home: bool = False,
     ) -> None:
+        if type(owner_home) is not bool or (owner_home and cwd != '/home/pr0'):
+            raise ClaudeAdapterError('owner-home execution has one fixed working root')
+        self.owner_home = owner_home
         self.executable = executable
         self.cwd = cwd
         self.model = model
@@ -84,8 +88,12 @@ class ClaudeInvoker:
             "--output-format", "json",
             "--json-schema", json.dumps(RESPONSE_SCHEMA),
             "--strict-mcp-config",
-            "--restricted",
         ]
+        if self.owner_home:
+            args += ['--safe-mode', '--permission-mode', 'bypassPermissions',
+                     '--no-session-persistence']
+        else:
+            args += ['--restricted']
         if self.model:
             args += ["--model", self.model]
         return args + list(self.tool_profile.claude_arguments())

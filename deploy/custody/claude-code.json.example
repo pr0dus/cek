@@ -1,5 +1,7 @@
 {
   "key_id": "claude-code-1",
+  "enabled": false,
+  "owner_home": true,
   "room_branch": "agent-room",
   "room_remote": "origin"
 }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Room durable typed-task wake for Codex
+
+[Path]
+PathExists=/var/lib/agent-room/state/task-wake-codex
+PathExists=/var/lib/agent-room-codex/state/task-more
+Unit=agent-room-dispatch-codex.service
+
+[Install]
+WantedBy=multi-user.target
