@@ -720,7 +720,11 @@ class TransportWorker:
             tasks.require(existing == record['payload'], 'task artifact mismatch')
         remote = self._room_remote()
         if remote is not None:
-            remote.push()
+            expected = TrustCheckpoint.load(self.config.checkpoint_path).document['last_accepted_tip']
+            tasks.require(store.current_tip() == expected or
+                          store.is_strict_ancestor(expected, store.current_tip()),
+                          'task delivery must extend the verified checkpoint')
+            remote.push_with_lease(expected)
         self._accept_after_delivery(store)
         record['phase'] = 'settled'
         journal.save(document)

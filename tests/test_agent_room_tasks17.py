@@ -11,6 +11,7 @@ from agent_room.ids import uuid7
 from agent_room.tasks import Journal, validate, extract, execute, FORMAT
 from agent_room.transport import TransportWorker, validate_request
 from tests.test_agent_room_transport_s3 import env, request_document
+from tests.test_agent_room_transport_remote_s3 import net
 
 
 def task():
@@ -148,3 +149,39 @@ def test_submission_recovery_same_identity_after_push_failure(env, monkeypatch):
     w.reconcile_tasks()
     assert j.load()['records'][params['task_id']]['phase']=='settled'
     assert sum(m['message_id']==record['message_id'] for m in env['room'].iter_messages())==1
+
+
+def test_real_remote_submission_and_same_id_recovery(net):
+    enrolled(net)
+    w=TransportWorker(net['config'])
+    params=task()
+    first=w._op_task_submit(net['room'],params)
+    remote=w._room_remote()
+    assert remote.required_remote_tip()==net['room'].current_tip()
+    assert w._op_task_submit(net['room'],params)==first
+    assert sum(m['message_id']==first['message_id'] for m in net['room'].iter_messages())==1
+
+
+def test_real_remote_task_movement_is_reconciled_with_same_envelope(net,monkeypatch):
+    from agent_room.remote_sync import RoomRemote
+    from tests.conftest_agent_room import git
+    enrolled(net)
+    w=TransportWorker(net['config'])
+    params=task()
+    original=RoomRemote.push_with_lease
+    moved=[]
+    def concurrent(remote,expected):
+        if not moved:
+            net['other'].post(thread_id='concurrent',type='observation',body={'text':'unrelated'})
+            git(net['other_room'].workdir,'push','-q','origin','agent-room')
+            moved.append(True)
+        return original(remote,expected)
+    monkeypatch.setattr(RoomRemote,'push_with_lease',concurrent)
+    with pytest.raises(AgentRoomError): w._op_task_submit(net['room'],params)
+    journal=Journal(Path(net['config'].state_dir)/'tasks')
+    before=journal.load()['records'][params['task_id']]
+    assert before['phase']=='output'
+    w.recover_room(); w.sync_room(); w.reconcile_tasks()
+    after=journal.load()['records'][params['task_id']]
+    assert after['phase']=='settled' and after['payload']==before['payload']
+    assert w._room_remote().required_remote_tip()==net['room'].current_tip()
