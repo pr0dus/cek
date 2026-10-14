@@ -146,6 +146,11 @@ class ClaudeInvoker:
             raise ClaudeAdapterError(
                 f"claude reported an error: {str(envelope.get('result'))[:500]}"
             )
+        if "structured_output" in envelope:
+            structured = envelope["structured_output"]
+            if not isinstance(structured, dict):
+                raise MalformedResponse("claude structured output must be an object")
+            return json.dumps(structured, ensure_ascii=False)
         result = envelope.get("result")
         if not isinstance(result, str):
             raise MalformedResponse(

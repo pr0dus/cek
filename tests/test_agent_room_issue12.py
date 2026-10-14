@@ -109,3 +109,22 @@ def test_admitted_uncertain_intent_not_replayed_and_hold_preserves_it(env):
     assert execute(a,j)['status']=='uncertain' and len(calls)==1
     a.task_admission=admission(task())
     assert execute(a,j)['status']=='idle' and j.load()==before and len(calls)==1
+
+
+@pytest.mark.parametrize('structured', [None, [], 'text', {'type':'observation','body':{'text':'review'}}])
+def test_claude_schema_channel_not_plain_result(monkeypatch,structured):
+    from types import SimpleNamespace
+    from agent_room import claude_participant as cp
+    raw=json.dumps({'is_error':False,'result':'','structured_output':structured}).encode()
+    monkeypatch.setattr(cp,'run_bounded',lambda *a,**k:SimpleNamespace(timed_out=False,output_limited=False,returncode=0,stderr=b'',stdout=raw))
+    if isinstance(structured,dict):assert json.loads(cp.ClaudeInvoker()('prompt'))==structured
+    else:
+        with pytest.raises(AgentRoomError):cp.ClaudeInvoker()('prompt')
+
+
+def test_claude_schema_channel_cannot_mask_client_error(monkeypatch):
+    from types import SimpleNamespace
+    from agent_room import claude_participant as cp
+    raw=json.dumps({'is_error':True,'result':'auth failed','structured_output':{'type':'observation','body':{'text':'forged success'}}}).encode()
+    monkeypatch.setattr(cp,'run_bounded',lambda *a,**k:SimpleNamespace(timed_out=False,output_limited=False,returncode=0,stderr=b'',stdout=raw))
+    with pytest.raises(AgentRoomError):cp.ClaudeInvoker()('prompt')
