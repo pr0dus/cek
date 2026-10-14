@@ -117,9 +117,11 @@ def test_default_clients_remain_restricted_owner_home_is_explicit():
     assert CodexInvoker().command('/s','/o')[3:5] == ['--sandbox','read-only']
     c=CodexInvoker(cwd='/home/pr0',owner_home=True).command('/s','/o')
     assert c[c.index('--sandbox')+1]=='danger-full-access'
-    assert '--ignore-user-config' in c and '--ignore-rules' in c
+    assert '--ignore-user-config' in c and '--ignore-rules' not in c
+    assert 'approval_policy="on-request"' in c
     cl=ClaudeInvoker(cwd='/home/pr0',owner_home=True).command()
     assert '--safe-mode' in cl and '--restricted' not in cl
+    assert 'bypassPermissions' not in cl and cl[cl.index('--permission-mode')+1]=='manual'
     for cls in (ClaudeInvoker,CodexInvoker):
         with pytest.raises(AgentRoomError): cls(cwd='/tmp',owner_home=True)
 

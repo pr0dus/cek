@@ -162,6 +162,8 @@ def run(role):
         from .codex_participant import CodexInvoker, CodexParticipant
         adapter = CodexParticipant(room, CodexInvoker(str(executable), cwd='/home/pr0', owner_home=True,
                                                      model=CODEX_MODEL), turn_timeout=0)
+    from . import task_admission
+    adapter.task_admission = task_admission.load()
     return run_verified_turn(adapter, item)
 
 

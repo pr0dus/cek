@@ -118,7 +118,10 @@ class WakeRunner:
         while True:
             self.queue.get()
             try:
-                summary = TransportWorker(self.config).run()
+                from . import task_admission
+                worker = TransportWorker(self.config)
+                worker.task_admission = task_admission.load()
+                summary = worker.run()
                 status = summary.get("lifecycle", {}).get("status")
                 if status != "ok":
                     raise RuntimeError("narrow transport lifecycle did not settle")

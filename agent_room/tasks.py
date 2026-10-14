@@ -152,6 +152,11 @@ def execute(adapter, journal):
         task = extract(message, adapter.participant)
         if task is None:
             continue
+        admission = getattr(adapter, 'task_admission', None)
+        if admission is not None:
+            from .task_admission import task_allowed
+            if not task_allowed(admission, task):
+                continue  # held without journal/cursor mutation or model call
         key = work_identity(store.room_id(), adapter.participant, message)
         if document['records'].get(key, {}).get('phase') != 'settled':
             selected = (message, task, key)

@@ -44,6 +44,12 @@ CONTROL_GENESIS = "README.agent-room-control.md"
 REQUESTS_DIR = ".agent-room-control/requests"
 RESULTS_DIR = ".agent-room-control/results"
 
+# One inert historical annotation, not a protocol artifact or authority.
+# Exact add-commit pins ancestry as well as bytes; no generic extension point.
+HISTORICAL_ANNOTATION = ".agent-room-control/reconciliations/01a0f242-30fd-7a8b-b23d-2c94f9a15a2b.json"
+HISTORICAL_BLOB = "73ec2faab7def557b4c667baff460d08b7a3a1f0"
+HISTORICAL_ADD = "11af23202aac257354aea1701941941c751ea6cc"
+
 REQUEST_RE = re.compile(
     r"\A" + re.escape(REQUESTS_DIR) + r"/([0-9a-f-]+)\.json\Z")
 RESULT_RE = re.compile(
@@ -90,6 +96,8 @@ def _now_iso() -> str:
 
 def classify(path: str) -> str | None:
     """"genesis", "request", "result", or None for anything undefined."""
+    if path == HISTORICAL_ANNOTATION:
+        return "annotation"
     if path == CONTROL_GENESIS:
         return "genesis"
     match = REQUEST_RE.match(path)
@@ -186,6 +194,10 @@ class ControlStore:
                 raise ControlNamespaceViolation(
                     f"{path!r} is a {object_type} with mode {mode}; control "
                     "artifacts are plain non-executable files")
+            if kind == "annotation":
+                if fields[2] != HISTORICAL_BLOB:
+                    raise ControlNamespaceViolation("historical annotation bytes changed")
+                continue  # never a request/result; never parsed or counted
             counts[kind] += 1
         return counts
 
@@ -220,6 +232,10 @@ class ControlStore:
             if kind is None:
                 raise ControlNamespaceViolation(
                     f"commit {commit} touches undefined path {path!r}")
+            if kind == "annotation":
+                if status != "A" or commit != HISTORICAL_ADD:
+                    raise ControlAppendOnlyViolation("historical annotation outside exact provenance")
+                continue
             if kind == "genesis":
                 if not status.startswith("A") or genesis_seen:
                     raise ControlAppendOnlyViolation(

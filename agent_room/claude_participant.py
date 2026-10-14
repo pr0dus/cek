@@ -90,8 +90,13 @@ class ClaudeInvoker:
             "--strict-mcp-config",
         ]
         if self.owner_home:
-            args += ['--safe-mode', '--permission-mode', 'bypassPermissions',
-                     '--no-session-persistence']
+            args += ['--safe-mode', '--permission-mode', 'manual',
+                     '--permission-prompts', 'none', '--no-session-persistence',
+                     '--allowedTools', 'WebFetch(domain:upwork.com)',
+                     'WebFetch(domain:www.upwork.com)',
+                     'WebFetch(domain:support.upwork.com)',
+                     'WebFetch(domain:www.webfx.com)',
+                     'WebFetch(domain:www.lyfemarketing.com)']
         else:
             args += ['--restricted']
         if self.model:

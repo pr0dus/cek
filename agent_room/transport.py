@@ -347,6 +347,7 @@ class TransportWorker:
     def __init__(self, config: TransportConfig) -> None:
         self.config = config
         self._deadline = None
+        self.task_admission = None
 
     # -- bounds ------------------------------------------------------------
     def _start_clock(self) -> None:
@@ -691,6 +692,10 @@ class TransportWorker:
         from . import tasks, auth
         from .ids import uuid7
         tasks.validate(params)
+        if self.task_admission is not None:
+            from .task_admission import task_allowed
+            if not task_allowed(self.task_admission, params):
+                raise TransportRefused('task held by exact-content admission')
         journal = tasks.Journal(Path(self.config.state_dir) / 'tasks')
         document = journal.load()
         tasks.require(document['room_id'] == store.room_id(), 'submission room mismatch')
@@ -743,6 +748,10 @@ class TransportWorker:
         for entry in journal.load()['records'].values():
             if entry['phase'] != 'settled':
                 params = canonical.strict_loads(entry['payload']['body']['text'])
+                if self.task_admission is not None:
+                    from .task_admission import task_allowed
+                    if not task_allowed(self.task_admission, params):
+                        continue  # unresolved historical delivery stays held
                 self._op_task_submit(self._room_store(), params)
 
     def _op_status(self, store: GitMessageStore, _params: dict) -> dict:
@@ -975,6 +984,20 @@ class TransportWorker:
                 f"{MAX_PENDING_REQUESTS} backlog limit; a writer cannot make "
                 "the worker take on an unbounded queue")
 
+        held = []
+        if self.task_admission is not None:
+            from .task_admission import request_allowed
+            admitted = []
+            for entry in unprocessed:
+                if entry['request_id'] not in self.task_admission['requests']:
+                    held.append(entry['request_id'])
+                    continue
+                _, raw_sha256 = control.read_request(entry)
+                if request_allowed(self.task_admission, entry['request_id'], raw_sha256):
+                    admitted.append(entry)
+                else:
+                    held.append(entry['request_id'])
+            unprocessed = admitted
         processed, summary = 0, []
         for entry in unprocessed:
             if processed >= self.config.max_requests_per_run:
@@ -992,6 +1015,7 @@ class TransportWorker:
             lifecycle["delivered"] = (lifecycle["delivered"]
                                       + self.deliver_results())
         return {
+            "held_request_ids": held,
             "pending": len(pending),
             "processed": processed,
             "remaining": max(len(pending) - processed, 0),

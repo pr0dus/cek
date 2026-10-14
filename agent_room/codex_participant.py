@@ -206,7 +206,7 @@ class CodexInvoker:
         if self.owner_home:
             # OS namespace is the authority for the owner-authorized home.
             # workspace-write protects .git/.codex and cannot promise full home.
-            args += ['--ignore-rules', '-c', 'approval_policy="never"']
+            args += ['-c', 'approval_policy="on-request"']
         if self.model:
             args += ["--model", self.model]
         if self.cwd:

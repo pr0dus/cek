@@ -28,7 +28,9 @@ by the view subject to their actual filesystem availability. No ioctl forwarding
 The production invokers opt into the fixed `/home/pr0` working root. Codex's
 workspace-write sandbox is insufficient for full home (.git/.codex exclusions),
 so this explicit policy uses external systemd confinement and danger-full-access,
-with user config/rules ignored. Claude uses safe-mode and bypassPermissions under
+with user config ignored, ordinary exec rules retained and on-request approvals.
+Claude uses safe-mode and manual permissions (unanswerable prompts denied),
+with only fixed Upwork/WebFX/LYFE public WebFetch domains allowed, under
 the same OS boundary; Claude enablement remains independent and disabled during
 permission qualification. Default library invocations remain restricted.
 

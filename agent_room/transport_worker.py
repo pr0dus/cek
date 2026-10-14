@@ -32,7 +32,10 @@ def main(argv=None) -> int:
         config = TransportConfig.load(config_path)
         custody.check_transport(config, item)
         custody.install_environment('openai-research', item)
-        summary = TransportWorker(config).run()
+        from . import task_admission
+        worker = TransportWorker(config)
+        worker.task_admission = task_admission.load()
+        summary = worker.run()
     except Exception as exc:                          # noqa: BLE001
         # One line, no traceback, no paths beyond the config: the journal of
         # an unattended service is not a place to leak state.
